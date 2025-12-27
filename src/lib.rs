@@ -12,3 +12,6 @@ pub mod connectors;
 
 // 4. Business Logic (The "Brains")
 pub mod strategy;
+
+// 5. Multi-Strategy Engine (The "Orchestrator")
+pub mod engine;

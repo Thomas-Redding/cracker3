@@ -1,11 +1,14 @@
+// src/connectors/polymarket.rs
+
 use crate::models::{MarketEvent, Order, OrderId};
-use crate::traits::{ExecutionClient, MarketStream};
+use crate::traits::{ExecutionClient, MarketStream, SharedExecutionClient};
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use log::{error, info, warn};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -237,7 +240,7 @@ impl PolymarketActor {
                     .books
                     .entry(pc.asset_id.clone())
                     .or_insert_with(LocalOrderBook::new);
-                
+
                 for change in pc.price_changes {
                     book.apply_delta(change);
                 }
@@ -256,7 +259,7 @@ impl PolymarketActor {
                     best_ask: book.get_best_ask(),
                     delta: None, // Poly doesn't give greeks directly
                 };
-                
+
                 let _ = self.tx.send(event).await;
             }
         }
@@ -266,20 +269,39 @@ impl PolymarketActor {
 // --- Execution Stub ---
 // Note: Real Poly trading requires EIP-712 signing (complex).
 // This is a placeholder structure matching your interface.
+
+/// Polymarket execution client.
+/// 
+/// Clone + thread-safe for sharing across strategies.
+#[derive(Clone)]
 pub struct PolymarketExec {
+    inner: Arc<PolymarketExecInner>,
+}
+
+struct PolymarketExecInner {
     api_key: String,
 }
 
 impl PolymarketExec {
     pub async fn new(api_key: String) -> Self {
-        Self { api_key }
+        Self {
+            inner: Arc::new(PolymarketExecInner { api_key }),
+        }
+    }
+
+    /// Wraps this client in an Arc for use as SharedExecutionClient.
+    pub fn shared(self) -> SharedExecutionClient {
+        Arc::new(self)
     }
 }
 
 #[async_trait]
 impl ExecutionClient for PolymarketExec {
-    async fn place_order(&mut self, _order: Order) -> Result<OrderId, String> {
-        info!("POLY EXEC: (Stub) Placing order with key {}", self.api_key);
+    async fn place_order(&self, _order: Order) -> Result<OrderId, String> {
+        info!(
+            "POLY EXEC: (Stub) Placing order with key {}",
+            self.inner.api_key
+        );
         Ok("poly_fake_id".to_string())
     }
 }
