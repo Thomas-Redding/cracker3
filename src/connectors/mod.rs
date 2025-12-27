@@ -2,3 +2,4 @@
 
 pub mod deribit;
 pub mod backtest;
+pub mod polymarket;
