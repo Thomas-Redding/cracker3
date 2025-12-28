@@ -191,7 +191,7 @@ The `MarketCatalog` trait enables strategies to discover markets dynamically. Th
 ### Usage Example
 
 ```rust
-use crate::catalog::{MarketCatalog, PolymarketCatalog};
+use crate::catalog::{MarketCatalog, PolymarketCatalog, TokenInfo};
 
 // Create catalog (loads from cache, auto-refreshes if stale)
 let catalog = PolymarketCatalog::new(None).await;
@@ -199,24 +199,32 @@ let catalog = PolymarketCatalog::new(None).await;
 // Search by text (weighted: slug 8x, question 4x, tags 2x, description 1x)
 let results = catalog.search("bitcoin price december", 10);
 for r in results {
-    println!("{}: {} (score: {})", r.market.slug.unwrap_or_default(), 
-             r.market.question.unwrap_or_default(), r.score);
+    println!("{}: {}", r.market.slug.unwrap_or_default(), r.score);
 }
 
 // Find by exact slug
-if let Some(market) = catalog.find_by_slug("will-bitcoin-be-above-100000-on-december-31") {
-    println!("Token IDs: {:?}", market.token_ids);
+if let Some(market) = catalog.find_by_slug("will-bitcoin-be-above-100000") {
+    // Get tokens by outcome name (not array index!)
+    if let Some(yes) = market.yes_token() {
+        println!("YES token: {}", yes.token_id);
+    }
+    if let Some(no) = market.no_token() {
+        println!("NO token: {}", no.token_id);
+    }
 }
 
 // Find by regex pattern (useful for recurring market patterns)
-let btc_markets = catalog.find_by_slug_regex(r"^will-bitcoin-be-above-\d+-on-")?;
-for market in btc_markets {
-    // Subscribe to each market's tokens...
+let btc_markets = catalog.find_by_slug_regex(r"^will-bitcoin-be-above-\d+")?;
+
+// For multi-outcome markets (e.g., elections), use token_by_outcome
+if let Some(market) = catalog.find_by_slug("who-will-win-2024-election") {
+    if let Some(trump) = market.token_by_outcome("Trump") {
+        println!("Trump token: {}", trump.token_id);
+    }
 }
 
 // Manual refresh (runs in background by default if cache is >1 day old)
 let count = catalog.refresh().await?;
-println!("Loaded {} markets", count);
 ```
 
 ### Available Methods
@@ -233,3 +241,11 @@ println!("Loaded {} markets", count);
 | `last_updated()` | Unix timestamp of last refresh |
 
 The catalog caches to `polymarket_markets.jsonl` and auto-refreshes in the background when the cache is older than 1 day.
+
+### Key Types
+
+- **`TokenInfo`** — A token with its `token_id` and `outcome` (e.g., "Yes", "No", "Trump")
+- **`MarketInfo`** — Market metadata with `tokens: Vec<TokenInfo>` preserving outcome associations
+- **`MarketCatalog`** — Trait for market discovery (search, regex, lookup)
+
+The catalog caches to `polymarket_markets.jsonl` and auto-refreshes when the cache is older than 1 day.
