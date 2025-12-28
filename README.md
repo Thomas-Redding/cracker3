@@ -34,43 +34,49 @@ cargo run -- --mode live-poly
 
 The system uses a **MarketRouter** to fan out market events to multiple strategies:
 
+```mermaid
+graph TD
+    subgraph Connectors
+        DS[DeribitStream]
+        PS[PolymarketStream]
+        BS[BacktestStream]
+    end
+
+    subgraph Engine
+        MR[MarketRouter<br/>Aggregates subscriptions<br/>Routes events by instrument]
+    end
+
+    subgraph Strategies
+        S1[GammaScalp<br/>BTC options]
+        S2[MomentumStrategy<br/>ETH options]
+    end
+
+    subgraph Execution
+        SEC[SharedExecutionClient<br/>Arc&lt;dyn ExecutionClient&gt;]
+        DE[DeribitExec]
+        PE[PolymarketExec]
+        ME[MockExec]
+    end
+
+    DS -->|MarketEvent| MR
+    PS -->|MarketEvent| MR
+    BS -->|MarketEvent| MR
+
+    MR -->|on_event| S1
+    MR -->|on_event| S2
+
+    S1 --> SEC
+    S2 --> SEC
+    SEC --> DE
+    SEC --> PE
+    SEC --> ME
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                         main.rs                              │
-│  1. Create SharedExecutionClient (Arc<dyn ExecutionClient>) │
-│  2. Create strategies with their instruments                 │
-│  3. Aggregate all subscriptions                              │
-│  4. Create ONE stream with superset of instruments           │
-│  5. Create MarketRouter and run()                            │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      MarketRouter                            │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │ routing_table: HashMap<Instrument, Vec<StrategyIdx>>│    │
-│  └─────────────────────────────────────────────────────┘    │
-│                              │                               │
-│         stream.next() ───────┤                               │
-│                              ▼                               │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │ For each interested strategy: tokio::spawn(on_event) │   │
-│  └──────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-              │                                │
-              ▼                                ▼
-   ┌──────────────────┐            ┌──────────────────┐
-   │   GammaScalp     │            │ MomentumStrategy │
-   │  (BTC options)   │            │   (ETH options)  │
-   └──────────────────┘            └──────────────────┘
-              │                                │
-              └───────────┬────────────────────┘
-                          ▼
-              ┌──────────────────────┐
-              │ SharedExecutionClient│
-              │   (Arc<DeribitExec>) │
-              └──────────────────────┘
-```
+
+**Flow:**
+1. Each strategy declares `required_subscriptions()` (e.g., `["BTC-29MAR24-60000-C"]`)
+2. `MarketRouter` aggregates all subscriptions and creates ONE stream per exchange
+3. Incoming `MarketEvent`s are routed only to strategies that subscribed to that instrument
+4. Strategies share a `SharedExecutionClient` (`Arc<dyn ExecutionClient>`) for thread-safe order placement
 
 ## 📁 Project Structure
 
