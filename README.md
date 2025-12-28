@@ -48,11 +48,7 @@ Unit tests cover:
 * **Unified Interface:** Strategies are agnostic to the environment—same code runs in production and backtests.
 * **Async-First:** Built on `Tokio` and `async-trait` for non-blocking I/O.
 * **Exchange Support:** Native integration for Deribit, Derive (options/futures), and Polymarket (prediction markets).
-<<<<<<< HEAD
-* **Market Discovery:** Search markets by slug, description, or regex via `MarketCatalog` trait with proper outcome-to-token mapping.
-=======
 * **Market Discovery:** Search markets by slug, description, or regex patterns via `MarketCatalog` trait.
->>>>>>> d96eaf9 (x)
 * **Shared Execution:** Thread-safe execution clients (`SharedExecutionClient`) allow strategies to share connections.
 * **Type Safety:** Strong typing for Greeks (`delta`, `gamma`) and Order types prevents logic errors.
 
