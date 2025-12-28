@@ -457,7 +457,7 @@ fn format_timestamp(ts: i64) -> String {
     }
     chrono::DateTime::from_timestamp(ts, 0)
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_else(|| format!("{}s ago", ts))
+        .unwrap_or_else(|| format!("unix:{}", ts))
 }
 
 #[cfg(test)]
