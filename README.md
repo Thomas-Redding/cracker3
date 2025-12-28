@@ -30,6 +30,7 @@ cargo run -- --mode live-derive
 * **Unified Interface:** Strategies are agnostic to the environment—same code runs in production and backtests.
 * **Async-First:** Built on `Tokio` and `async-trait` for non-blocking I/O.
 * **Exchange Support:** Native integration for Deribit, Derive (options/futures), and Polymarket (prediction markets).
+* **Market Discovery:** Search markets by slug, description, or regex patterns via `MarketCatalog` trait.
 * **Shared Execution:** Thread-safe execution clients (`SharedExecutionClient`) allow strategies to share connections.
 * **Type Safety:** Strong typing for Greeks (`delta`, `gamma`) and Order types prevents logic errors.
 
@@ -95,6 +96,9 @@ src/
 ├── traits.rs            # Strategy, MarketStream, ExecutionClient traits
 ├── engine/
 │   └── mod.rs           # MarketRouter (pub/sub event distribution)
+├── catalog/
+│   ├── mod.rs           # MarketCatalog trait + shared types
+│   └── polymarket.rs    # Polymarket market discovery
 ├── strategy/
 │   ├── gamma_scalp.rs   # Delta-based hedging strategy
 │   └── momentum.rs      # Price momentum strategy
@@ -161,3 +165,53 @@ impl ExecutionClient for MyExchangeExec {
 ```
 
 The `MarketRouter` works with any `MarketStream` implementation.
+
+## 🔍 Market Discovery with Catalogs
+
+The `MarketCatalog` trait enables strategies to discover markets dynamically. This is useful for strategies that need to find new markets as they're created (e.g., daily BTC price prediction markets on Polymarket).
+
+### Usage Example
+
+```rust
+use crate::catalog::{MarketCatalog, PolymarketCatalog};
+
+// Create catalog (loads from cache, auto-refreshes if stale)
+let catalog = PolymarketCatalog::new(None).await;
+
+// Search by text (weighted: slug 8x, question 4x, tags 2x, description 1x)
+let results = catalog.search("bitcoin price december", 10);
+for r in results {
+    println!("{}: {} (score: {})", r.market.slug.unwrap_or_default(), 
+             r.market.question.unwrap_or_default(), r.score);
+}
+
+// Find by exact slug
+if let Some(market) = catalog.find_by_slug("will-bitcoin-be-above-100000-on-december-31") {
+    println!("Token IDs: {:?}", market.token_ids);
+}
+
+// Find by regex pattern (useful for recurring market patterns)
+let btc_markets = catalog.find_by_slug_regex(r"^will-bitcoin-be-above-\d+-on-")?;
+for market in btc_markets {
+    // Subscribe to each market's tokens...
+}
+
+// Manual refresh (runs in background by default if cache is >1 day old)
+let count = catalog.refresh().await?;
+println!("Loaded {} markets", count);
+```
+
+### Available Methods
+
+| Method | Description |
+|--------|-------------|
+| `search(query, limit)` | Weighted text search across slug, question, tags, description |
+| `find_by_slug(slug)` | Exact slug match |
+| `find_by_slug_regex(pattern)` | Regex match on slugs |
+| `find_by_token_id(token_id)` | Find market containing a token ID |
+| `get(id)` | Get market by condition_id |
+| `all()` | Get all cached markets |
+| `refresh()` | Fetch fresh data from exchange API |
+| `last_updated()` | Unix timestamp of last refresh |
+
+The catalog caches to `polymarket_markets.jsonl` and auto-refreshes in the background when the cache is older than 1 day.
