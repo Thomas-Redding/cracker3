@@ -284,14 +284,16 @@ impl MarketCatalog for PolymarketCatalog {
                 info!("PolymarketCatalog: Fetching page {}...", page);
             }
 
-            let url = match &next_cursor {
-                Some(cursor) => format!("{}/markets?next_cursor={}", POLYMARKET_CLOB_URL, cursor),
-                None => format!("{}/markets", POLYMARKET_CLOB_URL),
-            };
+            let url = format!("{}/markets", POLYMARKET_CLOB_URL);
 
-            let response = self
-                .http_client
-                .get(&url)
+            let mut request = self.http_client.get(&url);
+            if let Some(cursor) = &next_cursor {
+                // Use .query() for proper URL encoding of base64 cursors
+                // (which may contain +, /, = characters)
+                request = request.query(&[("next_cursor", cursor)]);
+            }
+
+            let response = request
                 .send()
                 .await
                 .map_err(|e| format!("HTTP request failed: {}", e))?;
