@@ -23,6 +23,24 @@ cargo run -- --mode live-poly
 cargo run -- --mode live-derive
 ```
 
+## 🧪 Testing
+
+```bash
+# Run all tests
+cargo test
+
+# Run connector tests only
+cargo test --lib connectors::
+
+# Run with output
+cargo test -- --nocapture
+```
+
+Unit tests cover:
+- **Polymarket**: Order book logic (`LocalOrderBook`), JSON deserialization, snapshot/delta flows
+- **Deribit**: IV normalization, ticker parsing, Greeks handling
+- **Derive**: Instrument filtering
+
 ## 🚀 Features
 
 * **Multi-Strategy Engine:** Run multiple strategies concurrently, each declaring which instruments it needs.

@@ -188,3 +188,272 @@ impl ExecutionClient for DeribitExec {
         Ok("ord_12345".to_string())
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::Greeks;
+
+    // -------------------------------------------------------------------------
+    // IV Normalization Tests
+    // -------------------------------------------------------------------------
+
+    mod normalize_ivs {
+        use super::*;
+
+        #[test]
+        fn normalizes_all_iv_fields() {
+            let mut data = DeribitTickerData {
+                instrument_name: "BTC-29MAR24-60000-C".to_string(),
+                timestamp: 1703782800000,
+                best_bid_price: Some(0.05),
+                best_ask_price: Some(0.06),
+                greeks: None,
+                mark_iv: Some(65.0),
+                bid_iv: Some(62.0),
+                ask_iv: Some(68.0),
+            };
+
+            DeribitActor::normalize_ivs(&mut data);
+
+            assert_eq!(data.mark_iv, Some(0.65));
+            assert_eq!(data.bid_iv, Some(0.62));
+            assert_eq!(data.ask_iv, Some(0.68));
+        }
+
+        #[test]
+        fn handles_none_iv_fields() {
+            let mut data = DeribitTickerData {
+                instrument_name: "BTC-PERPETUAL".to_string(),
+                timestamp: 1703782800000,
+                best_bid_price: Some(43000.0),
+                best_ask_price: Some(43001.0),
+                greeks: None,
+                mark_iv: None,
+                bid_iv: None,
+                ask_iv: None,
+            };
+
+            DeribitActor::normalize_ivs(&mut data);
+
+            assert_eq!(data.mark_iv, None);
+            assert_eq!(data.bid_iv, None);
+            assert_eq!(data.ask_iv, None);
+        }
+
+        #[test]
+        fn handles_partial_iv_fields() {
+            let mut data = DeribitTickerData {
+                instrument_name: "BTC-29MAR24-60000-C".to_string(),
+                timestamp: 1703782800000,
+                best_bid_price: None,
+                best_ask_price: None,
+                greeks: None,
+                mark_iv: Some(50.0),
+                bid_iv: None,
+                ask_iv: Some(55.0),
+            };
+
+            DeribitActor::normalize_ivs(&mut data);
+
+            assert_eq!(data.mark_iv, Some(0.50));
+            assert_eq!(data.bid_iv, None);
+            assert_eq!(data.ask_iv, Some(0.55));
+        }
+
+        #[test]
+        fn handles_zero_iv() {
+            let mut data = DeribitTickerData {
+                instrument_name: "BTC-29MAR24-60000-C".to_string(),
+                timestamp: 1703782800000,
+                best_bid_price: None,
+                best_ask_price: None,
+                greeks: None,
+                mark_iv: Some(0.0),
+                bid_iv: Some(0.0),
+                ask_iv: Some(0.0),
+            };
+
+            DeribitActor::normalize_ivs(&mut data);
+
+            assert_eq!(data.mark_iv, Some(0.0));
+            assert_eq!(data.bid_iv, Some(0.0));
+            assert_eq!(data.ask_iv, Some(0.0));
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // JSON Deserialization Tests
+    // -------------------------------------------------------------------------
+
+    mod deserialization {
+        use super::*;
+
+        #[test]
+        fn parse_ticker_subscription_response() {
+            let json = r#"{
+                "jsonrpc": "2.0",
+                "method": "subscription",
+                "params": {
+                    "channel": "ticker.BTC-29MAR24-60000-C.100ms",
+                    "data": {
+                        "instrument_name": "BTC-29MAR24-60000-C",
+                        "timestamp": 1703782800000,
+                        "best_bid_price": 0.0520,
+                        "best_ask_price": 0.0540,
+                        "mark_iv": 65.5,
+                        "bid_iv": 64.0,
+                        "ask_iv": 67.0,
+                        "greeks": {
+                            "delta": 0.55,
+                            "gamma": 0.0001,
+                            "theta": -50.0,
+                            "vega": 120.0
+                        }
+                    }
+                }
+            }"#;
+
+            let response: DeribitResponse = serde_json::from_str(json).unwrap();
+            assert_eq!(response.method, Some("subscription".to_string()));
+
+            let params = response.params.unwrap();
+            assert_eq!(params.channel, "ticker.BTC-29MAR24-60000-C.100ms");
+
+            let data = params.data;
+            assert_eq!(data.instrument_name, "BTC-29MAR24-60000-C");
+            assert_eq!(data.timestamp, 1703782800000);
+            assert_eq!(data.best_bid_price, Some(0.0520));
+            assert_eq!(data.best_ask_price, Some(0.0540));
+            assert_eq!(data.mark_iv, Some(65.5));
+            assert_eq!(data.bid_iv, Some(64.0));
+            assert_eq!(data.ask_iv, Some(67.0));
+
+            let greeks = data.greeks.unwrap();
+            assert_eq!(greeks.delta, Some(0.55));
+            assert_eq!(greeks.gamma, Some(0.0001));
+            assert_eq!(greeks.theta, Some(-50.0));
+            assert_eq!(greeks.vega, Some(120.0));
+        }
+
+        #[test]
+        fn parse_perpetual_ticker_no_greeks() {
+            let json = r#"{
+                "jsonrpc": "2.0",
+                "method": "subscription",
+                "params": {
+                    "channel": "ticker.BTC-PERPETUAL.100ms",
+                    "data": {
+                        "instrument_name": "BTC-PERPETUAL",
+                        "timestamp": 1703782800000,
+                        "best_bid_price": 43250.5,
+                        "best_ask_price": 43251.0
+                    }
+                }
+            }"#;
+
+            let response: DeribitResponse = serde_json::from_str(json).unwrap();
+            let data = response.params.unwrap().data;
+
+            assert_eq!(data.instrument_name, "BTC-PERPETUAL");
+            assert_eq!(data.best_bid_price, Some(43250.5));
+            assert_eq!(data.best_ask_price, Some(43251.0));
+            assert!(data.greeks.is_none());
+            assert!(data.mark_iv.is_none());
+        }
+
+        #[test]
+        fn parse_response_without_params() {
+            // Subscription confirmation response (no params.data)
+            let json = r#"{
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": ["ticker.BTC-PERPETUAL.100ms"]
+            }"#;
+
+            let response: DeribitResponse = serde_json::from_str(json).unwrap();
+            assert!(response.params.is_none());
+            assert!(response.method.is_none());
+        }
+
+        #[test]
+        fn parse_greeks_with_nulls() {
+            let json = r#"{
+                "delta": 0.45,
+                "gamma": null,
+                "theta": -25.0,
+                "vega": null
+            }"#;
+
+            let greeks: Greeks = serde_json::from_str(json).unwrap();
+            assert_eq!(greeks.delta, Some(0.45));
+            assert_eq!(greeks.gamma, None);
+            assert_eq!(greeks.theta, Some(-25.0));
+            assert_eq!(greeks.vega, None);
+        }
+
+        #[test]
+        fn parse_ticker_with_null_prices() {
+            let json = r#"{
+                "instrument_name": "BTC-29MAR24-100000-C",
+                "timestamp": 1703782800000,
+                "best_bid_price": null,
+                "best_ask_price": null,
+                "mark_iv": 80.0
+            }"#;
+
+            let data: DeribitTickerData = serde_json::from_str(json).unwrap();
+            assert_eq!(data.instrument_name, "BTC-29MAR24-100000-C");
+            assert!(data.best_bid_price.is_none());
+            assert!(data.best_ask_price.is_none());
+            assert_eq!(data.mark_iv, Some(80.0));
+        }
+
+        #[test]
+        fn parse_negative_theta() {
+            // Options typically have negative theta (time decay)
+            let json = r#"{
+                "delta": 0.50,
+                "gamma": 0.0002,
+                "theta": -125.5,
+                "vega": 200.0
+            }"#;
+
+            let greeks: Greeks = serde_json::from_str(json).unwrap();
+            assert_eq!(greeks.theta, Some(-125.5));
+        }
+
+        #[test]
+        fn parse_deep_itm_option() {
+            // Deep in-the-money call with delta near 1.0
+            let json = r#"{
+                "jsonrpc": "2.0",
+                "method": "subscription",
+                "params": {
+                    "channel": "ticker.BTC-29MAR24-30000-C.100ms",
+                    "data": {
+                        "instrument_name": "BTC-29MAR24-30000-C",
+                        "timestamp": 1703782800000,
+                        "best_bid_price": 0.3100,
+                        "best_ask_price": 0.3150,
+                        "mark_iv": 45.0,
+                        "greeks": {
+                            "delta": 0.95,
+                            "gamma": 0.00005,
+                            "theta": -10.0,
+                            "vega": 25.0
+                        }
+                    }
+                }
+            }"#;
+
+            let response: DeribitResponse = serde_json::from_str(json).unwrap();
+            let greeks = response.params.unwrap().data.greeks.unwrap();
+            assert_eq!(greeks.delta, Some(0.95));
+        }
+    }
+}
