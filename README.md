@@ -18,6 +18,9 @@ DERIBIT_KEY=your_api_key cargo run -- --mode live-deribit
 
 # Live trading on Polymarket
 cargo run -- --mode live-poly
+
+# Live trading on Derive
+cargo run -- --mode live-derive
 ```
 
 ## 🚀 Features
@@ -26,7 +29,7 @@ cargo run -- --mode live-poly
 * **Subscription Aggregation:** One WebSocket connection per exchange with automatic subscription merging.
 * **Unified Interface:** Strategies are agnostic to the environment—same code runs in production and backtests.
 * **Async-First:** Built on `Tokio` and `async-trait` for non-blocking I/O.
-* **Exchange Support:** Native integration for Deribit (options/futures) and Polymarket (prediction markets).
+* **Exchange Support:** Native integration for Deribit, Derive (options/futures), and Polymarket (prediction markets).
 * **Shared Execution:** Thread-safe execution clients (`SharedExecutionClient`) allow strategies to share connections.
 * **Type Safety:** Strong typing for Greeks (`delta`, `gamma`) and Order types prevents logic errors.
 
@@ -38,6 +41,7 @@ The system uses a **MarketRouter** to fan out market events to multiple strategi
 graph TD
     subgraph Connectors
         DS[DeribitStream]
+        DRS[DeriveStream]
         PS[PolymarketStream]
         BS[BacktestStream]
     end
@@ -54,11 +58,13 @@ graph TD
     subgraph Execution
         SEC[SharedExecutionClient<br/>Arc&lt;dyn ExecutionClient&gt;]
         DE[DeribitExec]
+        DRE[DeriveExec]
         PE[PolymarketExec]
         ME[MockExec]
     end
 
     DS -->|MarketEvent| MR
+    DRS -->|MarketEvent| MR
     PS -->|MarketEvent| MR
     BS -->|MarketEvent| MR
 
@@ -68,6 +74,7 @@ graph TD
     S1 --> SEC
     S2 --> SEC
     SEC --> DE
+    SEC --> DRE
     SEC --> PE
     SEC --> ME
 ```
@@ -93,6 +100,7 @@ src/
 │   └── momentum.rs      # Price momentum strategy
 └── connectors/
     ├── deribit.rs       # Deribit WebSocket + REST
+    ├── derive.rs        # Derive (Lyra) WebSocket + REST
     ├── polymarket.rs    # Polymarket CLOB WebSocket
     └── backtest.rs      # Mock stream/exec for backtesting
 ```
