@@ -12,6 +12,20 @@ use std::sync::Arc;
 
 // Re-export for convenience
 pub use polymarket::PolymarketCatalog;
+// TokenInfo and MarketInfo are already public via this module
+
+/// A tradeable token within a market.
+/// 
+/// For Polymarket, each condition_id has exactly two tokens representing
+/// the two sides of the bet. The `outcome` field identifies what each token
+/// represents (e.g., "Yes"/"No" or "Trump"/"Harris").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenInfo {
+    /// The token ID used for trading
+    pub token_id: String,
+    /// The outcome this token represents (e.g., "Yes", "No", "Trump", "Harris")
+    pub outcome: Option<String>,
+}
 
 /// Metadata about a tradeable market.
 /// Generic enough to work across exchanges, with exchange-specific data in `extra`.
@@ -27,10 +41,44 @@ pub struct MarketInfo {
     pub description: Option<String>,
     /// Categorization tags
     pub tags: Option<Vec<String>>,
-    /// Token IDs for trading (YES/NO tokens for Polymarket)
-    pub token_ids: Vec<String>,
+    /// Tokens for trading, with their associated outcomes
+    pub tokens: Vec<TokenInfo>,
     /// Exchange-specific fields (neg_risk_market_id, end_date, etc.)
     pub extra: serde_json::Value,
+}
+
+impl MarketInfo {
+    /// Get all token IDs (convenience method, loses outcome association).
+    pub fn token_ids(&self) -> Vec<&str> {
+        self.tokens.iter().map(|t| t.token_id.as_str()).collect()
+    }
+
+    /// Find a token by its outcome name (case-insensitive).
+    /// 
+    /// # Example
+    /// ```ignore
+    /// let yes_token = market.token_by_outcome("Yes");
+    /// let no_token = market.token_by_outcome("No");
+    /// ```
+    pub fn token_by_outcome(&self, outcome: &str) -> Option<&TokenInfo> {
+        let outcome_lower = outcome.to_lowercase();
+        self.tokens.iter().find(|t| {
+            t.outcome
+                .as_ref()
+                .map(|o| o.to_lowercase() == outcome_lower)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Get the "Yes" token if it exists.
+    pub fn yes_token(&self) -> Option<&TokenInfo> {
+        self.token_by_outcome("Yes")
+    }
+
+    /// Get the "No" token if it exists.
+    pub fn no_token(&self) -> Option<&TokenInfo> {
+        self.token_by_outcome("No")
+    }
 }
 
 /// Search result with relevance scoring.

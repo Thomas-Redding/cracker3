@@ -3,7 +3,7 @@
 // Polymarket market catalog implementation.
 // Fetches and caches market metadata from Polymarket's CLOB API.
 
-use super::{MarketCatalog, MarketInfo, SearchResult};
+use super::{MarketCatalog, MarketInfo, SearchResult, TokenInfo};
 use async_trait::async_trait;
 use log::{error, info, warn};
 use regex::Regex;
@@ -203,33 +203,49 @@ impl PolymarketCatalog {
 
     /// Convert API market to our generic MarketInfo.
     fn convert_market(api_market: PolymarketApiMarket) -> MarketInfo {
+        let tokens = api_market
+            .tokens
+            .iter()
+            .map(|t| TokenInfo {
+                token_id: t.token_id.clone(),
+                outcome: t.outcome.clone(),
+            })
+            .collect();
+
         MarketInfo {
             id: api_market.condition_id,
             slug: api_market.market_slug,
             question: api_market.question,
             description: api_market.description,
             tags: api_market.tags,
-            token_ids: api_market.tokens.iter().map(|t| t.token_id.clone()).collect(),
+            tokens,
             extra: serde_json::json!({
                 "neg_risk_market_id": api_market.neg_risk_market_id,
                 "end_date_iso": api_market.end_date_iso,
                 "active": api_market.active,
                 "closed": api_market.closed,
-                "tokens": api_market.tokens,
             }),
         }
     }
 
-    /// Get token IDs for a market by condition_id.
-    /// Returns (YES token, NO token) if the market exists.
-    pub async fn get_token_ids(&self, condition_id: &str) -> Option<(String, String)> {
+    /// Get tokens for a market by condition_id.
+    /// Returns the full token info including outcomes.
+    pub async fn get_tokens(&self, condition_id: &str) -> Option<Vec<TokenInfo>> {
+        let state = self.inner.read().await;
+        state.markets.get(condition_id).map(|m| m.tokens.clone())
+    }
+
+    /// Get a specific token by condition_id and outcome name.
+    /// 
+    /// # Example
+    /// ```ignore
+    /// let yes_token = catalog.get_token_by_outcome("condition123", "Yes").await;
+    /// let trump_token = catalog.get_token_by_outcome("condition456", "Trump").await;
+    /// ```
+    pub async fn get_token_by_outcome(&self, condition_id: &str, outcome: &str) -> Option<TokenInfo> {
         let state = self.inner.read().await;
         state.markets.get(condition_id).and_then(|m| {
-            if m.token_ids.len() >= 2 {
-                Some((m.token_ids[0].clone(), m.token_ids[1].clone()))
-            } else {
-                None
-            }
+            m.token_by_outcome(outcome).cloned()
         })
     }
 
@@ -407,7 +423,7 @@ impl MarketCatalog for PolymarketCatalog {
         state
             .markets
             .values()
-            .find(|m| m.token_ids.contains(&token_id.to_string()))
+            .find(|m| m.tokens.iter().any(|t| t.token_id == token_id))
             .cloned()
     }
 
