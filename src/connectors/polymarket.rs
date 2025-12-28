@@ -122,10 +122,13 @@ impl LocalOrderBook {
             return false;
         };
 
-        let map = if change.side == "BUY" {
-            &mut self.bids
-        } else {
-            &mut self.asks
+        let map = match change.side.as_str() {
+            "BUY" => &mut self.bids,
+            "SELL" => &mut self.asks,
+            _ => {
+                warn!("Unknown side in delta: {:?} - expected BUY or SELL", change.side);
+                return false;
+            }
         };
 
         if size == 0.0 {
