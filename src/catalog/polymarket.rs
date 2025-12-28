@@ -11,9 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
 
 const POLYMARKET_CLOB_URL: &str = "https://clob.polymarket.com";
 const DEFAULT_CACHE_PATH: &str = "polymarket_markets.jsonl";
@@ -74,7 +73,10 @@ impl Default for CatalogState {
 
 /// Polymarket market catalog.
 /// 
-/// Thread-safe via internal RwLock. Clone to share across tasks.
+/// Thread-safe via internal RwLock. Uses std::sync::RwLock (not tokio) because:
+/// - Read operations are fast hashmap lookups (no I/O)
+/// - Write lock is held only briefly to swap in new state
+/// - Safe to call sync trait methods from async context without blocking runtime
 pub struct PolymarketCatalog {
     inner: RwLock<CatalogState>,
     cache_path: String,
@@ -139,8 +141,8 @@ impl PolymarketCatalog {
     }
 
     /// Check if the catalog cache is stale.
-    pub async fn is_stale(&self) -> bool {
-        let state = self.inner.read().await;
+    pub fn is_stale(&self) -> bool {
+        let state = self.inner.read().unwrap();
         self.is_stale_internal(state.last_updated)
     }
 
@@ -178,8 +180,8 @@ impl PolymarketCatalog {
         })
     }
 
-    async fn save_to_disk(&self) -> Result<(), String> {
-        let state = self.inner.read().await;
+    fn save_to_disk(&self) -> Result<(), String> {
+        let state = self.inner.read().unwrap();
         
         let mut file = File::create(&self.cache_path)
             .map_err(|e| format!("Failed to create cache file: {}", e))?;
@@ -230,8 +232,8 @@ impl PolymarketCatalog {
 
     /// Get tokens for a market by condition_id.
     /// Returns the full token info including outcomes.
-    pub async fn get_tokens(&self, condition_id: &str) -> Option<Vec<TokenInfo>> {
-        let state = self.inner.read().await;
+    pub fn get_tokens(&self, condition_id: &str) -> Option<Vec<TokenInfo>> {
+        let state = self.inner.read().unwrap();
         state.markets.get(condition_id).map(|m| m.tokens.clone())
     }
 
@@ -239,19 +241,19 @@ impl PolymarketCatalog {
     /// 
     /// # Example
     /// ```ignore
-    /// let yes_token = catalog.get_token_by_outcome("condition123", "Yes").await;
-    /// let trump_token = catalog.get_token_by_outcome("condition456", "Trump").await;
+    /// let yes_token = catalog.get_token_by_outcome("condition123", "Yes");
+    /// let trump_token = catalog.get_token_by_outcome("condition456", "Trump");
     /// ```
-    pub async fn get_token_by_outcome(&self, condition_id: &str, outcome: &str) -> Option<TokenInfo> {
-        let state = self.inner.read().await;
+    pub fn get_token_by_outcome(&self, condition_id: &str, outcome: &str) -> Option<TokenInfo> {
+        let state = self.inner.read().unwrap();
         state.markets.get(condition_id).and_then(|m| {
             m.token_by_outcome(outcome).cloned()
         })
     }
 
     /// Find markets by neg_risk_market_id.
-    pub async fn find_by_neg_risk_market_id(&self, neg_risk_market_id: &str) -> Vec<MarketInfo> {
-        let state = self.inner.read().await;
+    pub fn find_by_neg_risk_market_id(&self, neg_risk_market_id: &str) -> Vec<MarketInfo> {
+        let state = self.inner.read().unwrap();
         state
             .markets
             .values()
@@ -328,15 +330,15 @@ impl MarketCatalog for PolymarketCatalog {
             .unwrap()
             .as_secs() as i64;
 
-        // Update state
+        // Update state - brief lock, just swapping in the new data
         {
-            let mut state = self.inner.write().await;
+            let mut state = self.inner.write().unwrap();
             state.markets = all_markets;
             state.last_updated = now;
         }
 
-        // Save to disk
-        if let Err(e) = self.save_to_disk().await {
+        // Save to disk (also uses brief read lock)
+        if let Err(e) = self.save_to_disk() {
             error!("PolymarketCatalog: Failed to save cache: {}", e);
         } else {
             info!("PolymarketCatalog: Saved {} markets to cache", count);
@@ -346,9 +348,7 @@ impl MarketCatalog for PolymarketCatalog {
     }
 
     fn search(&self, query: &str, limit: usize) -> Vec<SearchResult> {
-        // We need to block on the async read - this is a sync method
-        // In practice, the lock should be uncontended for reads
-        let state = futures::executor::block_on(self.inner.read());
+        let state = self.inner.read().unwrap();
         
         let query_lower = query.to_lowercase();
         let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
@@ -393,7 +393,7 @@ impl MarketCatalog for PolymarketCatalog {
     }
 
     fn find_by_slug(&self, slug: &str) -> Option<MarketInfo> {
-        let state = futures::executor::block_on(self.inner.read());
+        let state = self.inner.read().unwrap();
         state
             .markets
             .values()
@@ -403,7 +403,7 @@ impl MarketCatalog for PolymarketCatalog {
 
     fn find_by_slug_regex(&self, pattern: &str) -> Result<Vec<MarketInfo>, String> {
         let regex = Regex::new(pattern).map_err(|e| format!("Invalid regex: {}", e))?;
-        let state = futures::executor::block_on(self.inner.read());
+        let state = self.inner.read().unwrap();
         
         Ok(state
             .markets
@@ -419,7 +419,7 @@ impl MarketCatalog for PolymarketCatalog {
     }
 
     fn find_by_token_id(&self, token_id: &str) -> Option<MarketInfo> {
-        let state = futures::executor::block_on(self.inner.read());
+        let state = self.inner.read().unwrap();
         state
             .markets
             .values()
@@ -428,22 +428,22 @@ impl MarketCatalog for PolymarketCatalog {
     }
 
     fn get(&self, id: &str) -> Option<MarketInfo> {
-        let state = futures::executor::block_on(self.inner.read());
+        let state = self.inner.read().unwrap();
         state.markets.get(id).cloned()
     }
 
     fn all(&self) -> Vec<MarketInfo> {
-        let state = futures::executor::block_on(self.inner.read());
+        let state = self.inner.read().unwrap();
         state.markets.values().cloned().collect()
     }
 
     fn last_updated(&self) -> i64 {
-        let state = futures::executor::block_on(self.inner.read());
+        let state = self.inner.read().unwrap();
         state.last_updated
     }
 
     fn len(&self) -> usize {
-        let state = futures::executor::block_on(self.inner.read());
+        let state = self.inner.read().unwrap();
         state.markets.len()
     }
 }
