@@ -76,9 +76,10 @@ impl LocalOrderBook {
         }
     }
 
-    fn price_to_key(p: &str) -> u64 {
-        let f: f64 = p.parse().unwrap_or(0.0);
-        (f * 1000.0).round() as u64
+    /// Parses a price string to an integer key (price * 1000).
+    /// Returns None if parsing fails.
+    fn price_to_key(p: &str) -> Option<u64> {
+        p.parse::<f64>().ok().map(|f| (f * 1000.0).round() as u64)
     }
 
     fn set_snapshot(&mut self, data: PolyBook) {
@@ -86,20 +87,41 @@ impl LocalOrderBook {
         self.asks.clear();
 
         for item in data.bids {
-            let key = Self::price_to_key(&item.price);
-            let size: f64 = item.size.parse().unwrap_or(0.0);
+            let Some(key) = Self::price_to_key(&item.price) else {
+                warn!("Malformed bid price in snapshot: {:?}", item.price);
+                continue;
+            };
+            let Ok(size) = item.size.parse::<f64>() else {
+                warn!("Malformed bid size in snapshot: {:?}", item.size);
+                continue;
+            };
             self.bids.insert(key, size);
         }
         for item in data.asks {
-            let key = Self::price_to_key(&item.price);
-            let size: f64 = item.size.parse().unwrap_or(0.0);
+            let Some(key) = Self::price_to_key(&item.price) else {
+                warn!("Malformed ask price in snapshot: {:?}", item.price);
+                continue;
+            };
+            let Ok(size) = item.size.parse::<f64>() else {
+                warn!("Malformed ask size in snapshot: {:?}", item.size);
+                continue;
+            };
             self.asks.insert(key, size);
         }
     }
 
-    fn apply_delta(&mut self, change: PriceChangeItem) {
-        let key = Self::price_to_key(&change.price);
-        let size: f64 = change.size.parse().unwrap_or(0.0);
+    /// Applies a price level delta to the order book.
+    /// Returns false if the delta was malformed and could not be applied.
+    fn apply_delta(&mut self, change: PriceChangeItem) -> bool {
+        let Some(key) = Self::price_to_key(&change.price) else {
+            warn!("Malformed price in delta: {:?}", change.price);
+            return false;
+        };
+        let Ok(size) = change.size.parse::<f64>() else {
+            warn!("Malformed size in delta: {:?} - skipping update to preserve book integrity", change.size);
+            return false;
+        };
+
         let map = if change.side == "BUY" {
             &mut self.bids
         } else {
@@ -111,6 +133,7 @@ impl LocalOrderBook {
         } else {
             map.insert(key, size);
         }
+        true
     }
 
     fn get_best_bid(&self) -> Option<f64> {
