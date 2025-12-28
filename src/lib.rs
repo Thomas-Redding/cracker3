@@ -10,8 +10,11 @@ pub mod traits;
 // 3. Adapters (The "Plumbing")
 pub mod connectors;
 
-// 4. Business Logic (The "Brains")
+// 4. Market Discovery (The "Catalog")
+pub mod catalog;
+
+// 5. Business Logic (The "Brains")
 pub mod strategy;
 
-// 5. Multi-Strategy Engine (The "Orchestrator")
+// 6. Multi-Strategy Engine (The "Orchestrator")
 pub mod engine;
