@@ -1,11 +1,12 @@
 // src/connectors/deribit.rs
 
-use crate::models::{DeribitResponse, DeribitTickerData, MarketEvent};
-use crate::traits::{MarketStream, ExecutionClient};
+use crate::models::{DeribitResponse, DeribitTickerData, MarketEvent, Order, OrderId};
+use crate::traits::{ExecutionClient, MarketStream, SharedExecutionClient};
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -96,7 +97,7 @@ impl DeribitActor {
                                 if let Ok(parsed) = serde_json::from_str::<DeribitResponse>(&text) {
                                     if let Some(params) = parsed.params {
                                         let mut data = params.data;
-                                        
+
                                         // Logic from your Python code: Normalize IVs
                                         Self::normalize_ivs(&mut data);
 
@@ -135,31 +136,55 @@ impl DeribitActor {
 
     fn normalize_ivs(data: &mut DeribitTickerData) {
         // Python: return None if iv is None else iv / 100.0
-        if let Some(iv) = data.mark_iv { data.mark_iv = Some(iv / 100.0); }
-        if let Some(iv) = data.bid_iv { data.bid_iv = Some(iv / 100.0); }
-        if let Some(iv) = data.ask_iv { data.ask_iv = Some(iv / 100.0); }
+        if let Some(iv) = data.mark_iv {
+            data.mark_iv = Some(iv / 100.0);
+        }
+        if let Some(iv) = data.bid_iv {
+            data.bid_iv = Some(iv / 100.0);
+        }
+        if let Some(iv) = data.ask_iv {
+            data.ask_iv = Some(iv / 100.0);
+        }
     }
 }
 
-// A dummy client for now, wrapping a hypothetical HTTP client
+/// Deribit execution client.
+/// 
+/// This is Clone + thread-safe, allowing multiple strategies to share one connection.
+/// Internal state is protected by a Mutex.
+#[derive(Clone)]
 pub struct DeribitExec {
+    inner: Arc<DeribitExecInner>,
+}
+
+struct DeribitExecInner {
     api_key: String,
-    // http_client: reqwest::Client, 
+    // In a real implementation:
+    // http_client: reqwest::Client,
+    // order_count: Mutex<u64>,
 }
 
 impl DeribitExec {
     pub async fn new(api_key: String) -> Self {
-        Self { api_key }
+        Self {
+            inner: Arc::new(DeribitExecInner { api_key }),
+        }
+    }
+
+    /// Wraps this client in an Arc for use as SharedExecutionClient.
+    pub fn shared(self) -> SharedExecutionClient {
+        Arc::new(self)
     }
 }
 
-use crate::models::{Order, OrderId};
-
 #[async_trait]
 impl ExecutionClient for DeribitExec {
-    async fn place_order(&mut self, _order: Order) -> Result<OrderId, String> {
-        // In real code: self.http_client.post(".../buy")...
-        println!("LIVE TRADING: Order placed on Deribit with key {}", self.api_key);
+    async fn place_order(&self, _order: Order) -> Result<OrderId, String> {
+        // In real code: self.inner.http_client.post(".../buy")...
+        info!(
+            "LIVE TRADING: Order placed on Deribit with key {}",
+            self.inner.api_key
+        );
         Ok("ord_12345".to_string())
     }
 }
