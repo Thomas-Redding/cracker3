@@ -177,37 +177,43 @@ impl Engine {
         self.routing_table = new_routing;
     }
 
-    /// Runs the engine, processing events from all streams.
+    /// Runs the engine, processing events from all streams concurrently.
     pub async fn run(mut self) {
         info!("Engine: Starting event loop with {} exchanges", self.streams.len());
 
         // Initial subscription refresh
         self.refresh_subscriptions().await;
 
-        // Collect events first, then route them
-        // For simplicity, we process one exchange at a time
-        // A production implementation would use tokio::select! across all streams
-        loop {
-            let mut any_event = false;
+        // Create a channel for all streams to send events to
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(Exchange, MarketEvent)>(1000);
 
-            // Collect events from all streams
-            let mut events = Vec::new();
-            for (_exchange, stream) in &mut self.streams {
-                if let Some(event) = stream.next().await {
-                    any_event = true;
-                    events.push(event);
+        // Spawn a task for each stream to forward events to the channel
+        let mut stream_handles = Vec::new();
+        for (exchange, mut stream) in self.streams.drain() {
+            let tx = tx.clone();
+            let handle = tokio::spawn(async move {
+                while let Some(event) = stream.next().await {
+                    if tx.send((exchange, event)).await.is_err() {
+                        // Channel closed, stop this stream
+                        break;
+                    }
                 }
-            }
+                info!("Engine: Stream for {:?} ended", exchange);
+            });
+            stream_handles.push(handle);
+        }
 
-            // Route all collected events
-            for event in events {
-                self.route_event(event).await;
-            }
+        // Drop our sender so the channel closes when all stream tasks finish
+        drop(tx);
 
-            if !any_event {
-                // All streams returned None (EOF for backtests, or disconnected)
-                break;
-            }
+        // Process events as they arrive from any stream
+        while let Some((_exchange, event)) = rx.recv().await {
+            self.route_event(event).await;
+        }
+
+        // Wait for all stream tasks to complete
+        for handle in stream_handles {
+            let _ = handle.await;
         }
 
         info!("Engine: Event loop ended.");
