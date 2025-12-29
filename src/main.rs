@@ -3,6 +3,7 @@
 use clap::Parser;
 use std::sync::Arc;
 use trading_bot::connectors::{backtest, deribit, polymarket};
+use trading_bot::dashboard::DashboardServer;
 use trading_bot::engine::MarketRouter;
 use trading_bot::models::MarketEvent;
 use trading_bot::strategy::{GammaScalp, MomentumStrategy};
@@ -24,6 +25,10 @@ struct Args {
     /// Speed multiplier for realtime playback (e.g., 2.0 = 2x speed)
     #[arg(long, default_value = "1.0")]
     speed: f64,
+
+    /// Enable the web dashboard on the specified port
+    #[arg(long)]
+    dashboard: Option<u16>,
 }
 
 #[tokio::main]
@@ -33,24 +38,45 @@ async fn main() {
 
     match args.mode.as_str() {
         "live-deribit" => {
-            run_deribit_multi_strategy().await;
+            run_deribit_multi_strategy(args.dashboard).await;
         }
         "live-poly" => {
-            run_polymarket_multi_strategy().await;
+            run_polymarket_multi_strategy(args.dashboard).await;
         }
         "backtest" => {
-            run_backtest().await;
+            run_backtest(args.dashboard).await;
         }
         "historical-backtest" => {
             let file_path = args.file.expect("--file is required for historical-backtest mode");
-            run_historical_backtest(&file_path, args.realtime, args.speed).await;
+            run_historical_backtest(&file_path, args.realtime, args.speed, args.dashboard).await;
         }
         _ => println!("Unknown mode. Use: live-deribit, live-poly, backtest, or historical-backtest"),
     }
 }
 
+/// Helper function to start the dashboard server in the background.
+/// Returns a function that blocks until Ctrl+C (for use after backtest completes).
+fn start_dashboard(strategies: Vec<Arc<dyn Strategy>>, port: u16) {
+    let dashboard = DashboardServer::new(strategies, port);
+    tokio::spawn(async move {
+        if let Err(e) = dashboard.run().await {
+            eprintln!("Dashboard server error: {}", e);
+        }
+    });
+    println!("Dashboard available at http://localhost:{}", port);
+}
+
+/// Waits for Ctrl+C, keeping the dashboard alive after backtest completes.
+async fn wait_for_shutdown() {
+    println!("Dashboard still running. Press Ctrl+C to exit.");
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to listen for Ctrl+C");
+    println!("\nShutting down...");
+}
+
 /// Runs multiple strategies on Deribit using a single WebSocket connection.
-async fn run_deribit_multi_strategy() {
+async fn run_deribit_multi_strategy(dashboard_port: Option<u16>) {
     println!("Starting Multi-Strategy Deribit Engine...");
 
     let api_key = std::env::var("DERIBIT_KEY").expect("DERIBIT_KEY required for live trading");
@@ -76,19 +102,24 @@ async fn run_deribit_multi_strategy() {
     // 3. Build the engine and aggregate subscriptions
     let strategies: Vec<Arc<dyn Strategy>> = vec![gamma_scalp_btc, momentum_eth];
 
+    // 4. Start dashboard if requested
+    if let Some(port) = dashboard_port {
+        start_dashboard(strategies.clone(), port);
+    }
+
     let all_instruments = MarketRouter::<deribit::DeribitStream>::aggregate_subscriptions(&strategies);
     println!("Aggregated subscriptions: {:?}", all_instruments);
 
-    // 4. Create the stream with the superset of all instruments
+    // 5. Create the stream with the superset of all instruments
     let stream = deribit::DeribitStream::new(all_instruments).await;
 
-    // 5. Create and run the router
+    // 6. Create and run the router
     let router = MarketRouter::new(stream, strategies);
     router.run().await;
 }
 
 /// Runs multiple strategies on Polymarket using a single WebSocket connection.
-async fn run_polymarket_multi_strategy() {
+async fn run_polymarket_multi_strategy(dashboard_port: Option<u16>) {
     println!("Starting Multi-Strategy Polymarket Engine...");
 
     // Example token IDs
@@ -118,20 +149,25 @@ async fn run_polymarket_multi_strategy() {
     // 3. Build strategies list
     let strategies: Vec<Arc<dyn Strategy>> = vec![gamma_scalp, momentum];
 
+    // 4. Start dashboard if requested
+    if let Some(port) = dashboard_port {
+        start_dashboard(strategies.clone(), port);
+    }
+
     let all_tokens =
         MarketRouter::<polymarket::PolymarketStream>::aggregate_subscriptions(&strategies);
     println!("Aggregated token subscriptions: {:?}", all_tokens);
 
-    // 4. Create stream with all tokens
+    // 5. Create stream with all tokens
     let stream = polymarket::PolymarketStream::new(all_tokens).await;
 
-    // 5. Run
+    // 6. Run
     let router = MarketRouter::new(stream, strategies);
     router.run().await;
 }
 
 /// Runs a backtest with multiple strategies.
-async fn run_backtest() {
+async fn run_backtest(dashboard_port: Option<u16>) {
     println!("Starting Multi-Strategy Backtest...");
 
     // 1. Create mock data with events for different instruments
@@ -187,17 +223,27 @@ async fn run_backtest() {
 
     let strategies: Vec<Arc<dyn Strategy>> = vec![gamma_scalp, momentum];
 
-    // 4. Create backtest stream and run
+    // 4. Start dashboard if requested
+    if let Some(port) = dashboard_port {
+        start_dashboard(strategies.clone(), port);
+    }
+
+    // 5. Create backtest stream and run
     let stream = backtest::BacktestStream::new(mock_data);
     let router = MarketRouter::new(stream, strategies);
     router.run().await;
 
     println!("\nBacktest complete!");
     // In a real implementation, you would analyze exec.get_fills() here
+
+    // Keep dashboard alive after backtest completes
+    if dashboard_port.is_some() {
+        wait_for_shutdown().await;
+    }
 }
 
 /// Runs a backtest using historical data from a JSONL file.
-async fn run_historical_backtest(file_path: &str, realtime: bool, speed: f64) {
+async fn run_historical_backtest(file_path: &str, realtime: bool, speed: f64, dashboard_port: Option<u16>) {
     println!("Starting Historical Backtest from file: {}", file_path);
 
     // 1. Create playback configuration
@@ -238,9 +284,19 @@ async fn run_historical_backtest(file_path: &str, realtime: bool, speed: f64) {
 
     let strategies: Vec<Arc<dyn Strategy>> = vec![gamma_scalp, momentum];
 
-    // 5. Run the backtest
+    // 5. Start dashboard if requested
+    if let Some(port) = dashboard_port {
+        start_dashboard(strategies.clone(), port);
+    }
+
+    // 6. Run the backtest
     let router = MarketRouter::new(stream, strategies);
     router.run().await;
 
     println!("\nHistorical backtest complete!");
+
+    // Keep dashboard alive after backtest completes
+    if dashboard_port.is_some() {
+        wait_for_shutdown().await;
+    }
 }
