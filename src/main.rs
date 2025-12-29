@@ -1,5 +1,6 @@
 // src/main.rs
 
+use chrono::Utc;
 use clap::Parser;
 use std::sync::Arc;
 use trading_bot::connectors::{backtest, deribit, polymarket};
@@ -113,7 +114,15 @@ async fn run_deribit_multi_strategy(dashboard_port: Option<u16>) {
     // 5. Create the stream with the superset of all instruments
     let stream = deribit::DeribitStream::new(all_instruments).await;
 
-    // 6. Create and run the router
+    // 6. Wrap with RecordingStream to save events to disk
+    let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
+    let recording_path = format!("recordings/deribit_{}.jsonl", timestamp);
+    std::fs::create_dir_all("recordings").expect("Failed to create recordings directory");
+    let stream = backtest::RecordingStream::new(stream, &recording_path)
+        .expect("Failed to create recording stream");
+    println!("Recording to: {}", recording_path);
+
+    // 7. Create and run the router
     let router = MarketRouter::new(stream, strategies);
     router.run().await;
 }
@@ -161,7 +170,15 @@ async fn run_polymarket_multi_strategy(dashboard_port: Option<u16>) {
     // 5. Create stream with all tokens
     let stream = polymarket::PolymarketStream::new(all_tokens).await;
 
-    // 6. Run
+    // 6. Wrap with RecordingStream to save events to disk
+    let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
+    let recording_path = format!("recordings/polymarket_{}.jsonl", timestamp);
+    std::fs::create_dir_all("recordings").expect("Failed to create recordings directory");
+    let stream = backtest::RecordingStream::new(stream, &recording_path)
+        .expect("Failed to create recording stream");
+    println!("Recording to: {}", recording_path);
+
+    // 7. Run
     let router = MarketRouter::new(stream, strategies);
     router.run().await;
 }
