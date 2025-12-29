@@ -1,16 +1,40 @@
 // src/traits.rs
 
 use async_trait::async_trait;
-use crate::models::{MarketEvent, Order, OrderId};
+use crate::models::{Exchange, Instrument, MarketEvent, Order, OrderId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// A stream of market events from an exchange.
-/// This is still used internally by the Engine to receive raw events.
+/// 
+/// Supports dynamic subscription management for adding/removing instruments
+/// at runtime without reconnecting.
 #[async_trait]
 pub trait MarketStream: Send + Unpin {
+    /// Receive the next market event from the stream.
     async fn next(&mut self) -> Option<MarketEvent>;
+
+    /// Subscribe to additional instruments.
+    /// 
+    /// The stream will start receiving events for these instruments.
+    /// Instruments not matching this stream's exchange are ignored.
+    async fn subscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+        // Default implementation does nothing
+        let _ = instruments;
+        Ok(())
+    }
+
+    /// Unsubscribe from instruments.
+    /// 
+    /// The stream will stop receiving events for these instruments.
+    /// Instruments not matching this stream's exchange are ignored.
+    async fn unsubscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+        // Default implementation does nothing
+        let _ = instruments;
+        Ok(())
+    }
 }
 
 /// Execution client for placing orders.
@@ -21,25 +45,107 @@ pub trait ExecutionClient: Send + Sync {
     // ... cancel, get_positions, etc.
 }
 
-/// The core Strategy trait for the multi-strategy engine.
-/// Each strategy declares its interests and reacts to market events.
-#[async_trait]
-pub trait Strategy: Dashboard + Send + Sync {
-    /// Returns the name of this strategy (for logging).
-    fn name(&self) -> &str;
-
-    /// Returns the list of instruments/tokens this strategy needs to receive events for.
-    /// The engine will aggregate these across all strategies to build the subscription list.
-    fn required_subscriptions(&self) -> Vec<String>;
-
-    /// Called by the engine when a market event arrives for an instrument this strategy watches.
-    /// The strategy should process the event and optionally place orders via the exec client.
-    async fn on_event(&self, event: MarketEvent);
-}
-
 /// Wrapper to make any ExecutionClient shareable across strategies.
 /// Strategies receive an Arc<dyn ExecutionClient> so multiple can share one connection.
 pub type SharedExecutionClient = Arc<dyn ExecutionClient>;
+
+// =============================================================================
+// Execution Router
+// =============================================================================
+
+/// Routes orders to the appropriate exchange based on instrument type.
+/// 
+/// Strategies hold an `Arc<ExecutionRouter>` instead of a single `SharedExecutionClient`,
+/// allowing them to place orders on any exchange they've declared via `required_exchanges()`.
+pub struct ExecutionRouter {
+    clients: std::collections::HashMap<Exchange, SharedExecutionClient>,
+}
+
+impl ExecutionRouter {
+    /// Creates a new ExecutionRouter with the given clients.
+    pub fn new(clients: std::collections::HashMap<Exchange, SharedExecutionClient>) -> Self {
+        Self { clients }
+    }
+
+    /// Creates an empty ExecutionRouter (useful for backtesting with MockExec).
+    pub fn empty() -> Self {
+        Self {
+            clients: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Adds a client for an exchange.
+    pub fn with_client(mut self, exchange: Exchange, client: SharedExecutionClient) -> Self {
+        self.clients.insert(exchange, client);
+        self
+    }
+
+    /// Places an order, routing to the appropriate exchange based on instrument.
+    pub async fn place_order(&self, order: Order) -> Result<OrderId, String> {
+        let exchange = order.instrument.exchange();
+        self.clients
+            .get(&exchange)
+            .ok_or_else(|| format!("No execution client for {:?}", exchange))?
+            .place_order(order)
+            .await
+    }
+
+    /// Returns true if this router has a client for the given exchange.
+    pub fn has_exchange(&self, exchange: Exchange) -> bool {
+        self.clients.contains_key(&exchange)
+    }
+
+    /// Returns the set of exchanges this router can handle.
+    pub fn exchanges(&self) -> HashSet<Exchange> {
+        self.clients.keys().copied().collect()
+    }
+}
+
+/// Shared ExecutionRouter for use across strategies.
+pub type SharedExecutionRouter = Arc<ExecutionRouter>;
+
+// =============================================================================
+// Strategy Trait
+// =============================================================================
+
+/// The core Strategy trait for the multi-strategy engine.
+/// 
+/// Strategies declare which exchanges they need (statically) and which instruments
+/// they want to subscribe to (dynamically via catalog queries).
+#[async_trait]
+pub trait Strategy: Dashboard + Send + Sync {
+    /// Returns the name of this strategy (for logging and identification).
+    fn name(&self) -> &str;
+
+    /// Static: which exchanges this strategy needs connections to.
+    /// 
+    /// This doesn't change at runtime. The engine uses this to determine
+    /// which exchange connections to establish.
+    fn required_exchanges(&self) -> HashSet<Exchange>;
+
+    /// Dynamic: discover instruments to subscribe to.
+    /// 
+    /// Called periodically by the engine to allow strategies to update
+    /// their subscriptions based on catalog queries, market conditions, etc.
+    /// 
+    /// The default implementation returns an empty set (no subscriptions).
+    async fn discover_subscriptions(&self) -> Vec<Instrument> {
+        Vec::new()
+    }
+
+    /// Legacy: returns static list of instruments.
+    /// 
+    /// For backwards compatibility. New strategies should use
+    /// `discover_subscriptions()` instead.
+    #[deprecated(note = "Use discover_subscriptions() instead")]
+    fn required_subscriptions(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Called by the engine when a market event arrives for an instrument
+    /// this strategy is subscribed to.
+    async fn on_event(&self, event: MarketEvent);
+}
 
 // =============================================================================
 // Dashboard Support

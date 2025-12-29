@@ -1,6 +1,6 @@
 // src/connectors/polymarket.rs
 
-use crate::models::{MarketEvent, Order, OrderId};
+use crate::models::{Instrument, MarketEvent, Order, OrderId};
 use crate::traits::{ExecutionClient, MarketStream, SharedExecutionClient};
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
@@ -180,12 +180,6 @@ impl PolymarketStream {
     }
 }
 
-#[async_trait]
-impl MarketStream for PolymarketStream {
-    async fn next(&mut self) -> Option<MarketEvent> {
-        self.receiver.recv().await
-    }
-}
 
 // --- The Actor ---
 
@@ -287,7 +281,7 @@ impl PolymarketActor {
             if let Some(book) = self.books.get(&token_id) {
                 let event = MarketEvent {
                     timestamp: ts_str.parse().unwrap_or(0),
-                    instrument: token_id,
+                    instrument: Instrument::Polymarket(token_id),
                     best_bid: book.get_best_bid(),
                     best_ask: book.get_best_ask(),
                     delta: None, // Poly doesn't give greeks directly
@@ -296,6 +290,47 @@ impl PolymarketActor {
                 let _ = self.tx.send(event).await;
             }
         }
+    }
+}
+
+#[async_trait]
+impl MarketStream for PolymarketStream {
+    async fn next(&mut self) -> Option<MarketEvent> {
+        self.receiver.recv().await
+    }
+
+    async fn subscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+        let poly_tokens: Vec<&str> = instruments
+            .iter()
+            .filter_map(|i| match i {
+                Instrument::Polymarket(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        
+        if poly_tokens.is_empty() {
+            return Ok(());
+        }
+        
+        warn!("PolymarketStream: Dynamic subscription not yet implemented");
+        Ok(())
+    }
+
+    async fn unsubscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+        let poly_tokens: Vec<&str> = instruments
+            .iter()
+            .filter_map(|i| match i {
+                Instrument::Polymarket(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        
+        if poly_tokens.is_empty() {
+            return Ok(());
+        }
+        
+        warn!("PolymarketStream: Dynamic unsubscription not yet implemented");
+        Ok(())
     }
 }
 

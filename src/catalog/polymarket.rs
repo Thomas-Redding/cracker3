@@ -1,9 +1,13 @@
 // src/catalog/polymarket.rs
 //
-// Polymarket market catalog implementation.
+// Polymarket market catalog implementation with historical time-travel support.
 // Fetches and caches market metadata from Polymarket's CLOB API.
+// Tracks all changes (added/removed/modified) for historical reconstruction.
 
-use super::{MarketCatalog, MarketInfo, SearchResult, TokenInfo};
+use super::{
+    apply_diff, compute_diff, invert_diff, Catalog, CatalogDiff, CatalogFileEntry,
+    MarketCatalog, MarketInfo, SearchResult, TokenInfo,
+};
 use async_trait::async_trait;
 use log::{error, info, warn};
 use regex::Regex;
@@ -11,12 +15,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const POLYMARKET_CLOB_URL: &str = "https://clob.polymarket.com";
 const DEFAULT_CACHE_PATH: &str = "polymarket_markets.jsonl";
-const STALE_THRESHOLD_SECS: i64 = 86400; // 1 day
+const STALE_THRESHOLD_SECS: u64 = 86400; // 1 day
+
+/// Static flag to prevent multiple concurrent auto-refreshes.
+/// Only one background refresh can run at a time across all catalog instances.
+static AUTO_REFRESH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Raw market data from Polymarket API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,34 +58,36 @@ struct MarketsResponse {
     next_cursor: String,
 }
 
-/// Cache file header.
-#[derive(Debug, Serialize, Deserialize)]
-struct CacheHeader {
-    last_updated: i64,
-    version: u32,
-}
-
 /// Internal state for the catalog.
 struct CatalogState {
     markets: HashMap<String, MarketInfo>,
-    last_updated: i64,
+    diffs: Vec<CatalogDiff<MarketInfo>>,
+    last_updated: u64,
 }
 
 impl Default for CatalogState {
     fn default() -> Self {
         Self {
             markets: HashMap::new(),
+            diffs: Vec::new(),
             last_updated: 0,
         }
     }
 }
 
-/// Polymarket market catalog.
+/// Polymarket market catalog with historical time-travel support.
 /// 
 /// Thread-safe via internal RwLock. Uses std::sync::RwLock (not tokio) because:
 /// - Read operations are fast hashmap lookups (no I/O)
 /// - Write lock is held only briefly to swap in new state
 /// - Safe to call sync trait methods from async context without blocking runtime
+/// 
+/// # File Format
+/// The catalog is stored as JSONL with the following structure:
+/// - Line 1: `{"type": "current", "timestamp": ..., "items": [...]}`
+/// - Line 2+: `{"type": "diff", "timestamp": ..., "added": [...], ...}`
+/// 
+/// Diffs are stored newest-first for efficient reconstruction.
 pub struct PolymarketCatalog {
     inner: RwLock<CatalogState>,
     cache_path: String,
@@ -93,6 +104,7 @@ impl PolymarketCatalog {
         
         let loaded_count = state.markets.len();
         let last_updated = state.last_updated;
+        let diff_count = state.diffs.len();
         
         let catalog = Arc::new(Self {
             inner: RwLock::new(state),
@@ -102,22 +114,38 @@ impl PolymarketCatalog {
 
         if loaded_count > 0 {
             info!(
-                "PolymarketCatalog: Loaded {} markets from cache (updated {})",
+                "PolymarketCatalog: Loaded {} markets, {} diffs from cache (updated {})",
                 loaded_count,
+                diff_count,
                 format_timestamp(last_updated)
             );
         }
 
         // Check staleness and auto-refresh in background
+        // Note: We use MarketCatalog::refresh which works with &self via internal mutability
+        // Use atomic flag to prevent multiple concurrent auto-refreshes
         if catalog.is_stale_internal(last_updated) {
-            info!("PolymarketCatalog: Cache is stale, spawning background refresh...");
-            let catalog_clone = catalog.clone();
-            tokio::spawn(async move {
-                match catalog_clone.refresh().await {
-                    Ok(count) => info!("PolymarketCatalog: Background refresh complete, {} markets", count),
-                    Err(e) => error!("PolymarketCatalog: Background refresh failed: {}", e),
-                }
-            });
+            // Try to acquire the refresh lock - only one refresh can run at a time
+            if AUTO_REFRESH_IN_PROGRESS
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                info!("PolymarketCatalog: Cache is stale, spawning background refresh...");
+                let catalog_clone = catalog.clone();
+                tokio::spawn(async move {
+                    match MarketCatalog::refresh(catalog_clone.as_ref()).await {
+                        Ok(count) => info!(
+                            "PolymarketCatalog: Background refresh complete, {} markets",
+                            count
+                        ),
+                        Err(e) => error!("PolymarketCatalog: Background refresh failed: {}", e),
+                    }
+                    // Release the lock
+                    AUTO_REFRESH_IN_PROGRESS.store(false, Ordering::SeqCst);
+                });
+            } else {
+                info!("PolymarketCatalog: Cache is stale, but refresh already in progress");
+            }
         }
 
         catalog
@@ -132,11 +160,11 @@ impl PolymarketCatalog {
         })
     }
 
-    fn is_stale_internal(&self, last_updated: i64) -> bool {
+    fn is_stale_internal(&self, last_updated: u64) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs() as i64;
+            .as_secs();
         now - last_updated > STALE_THRESHOLD_SECS
     }
 
@@ -151,11 +179,21 @@ impl PolymarketCatalog {
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
 
-        // First line is header
-        let header_line = lines.next()?.ok()?;
-        let header: CacheHeader = serde_json::from_str(&header_line).ok()?;
+        // First line should be current state
+        let first_line = lines.next()?.ok()?;
+        let first_entry: CatalogFileEntry<MarketInfo> = serde_json::from_str(&first_line).ok()?;
 
-        let mut markets = HashMap::new();
+        let (markets, last_updated) = match first_entry {
+            CatalogFileEntry::Current { timestamp, items } => {
+                let map: HashMap<String, MarketInfo> =
+                    items.into_iter().map(|m| (m.id.clone(), m)).collect();
+                (map, timestamp)
+            }
+            _ => return None, // First line must be current state
+        };
+
+        // Remaining lines are diffs (newest first)
+        let mut diffs = Vec::new();
         for line in lines {
             let line = match line {
                 Ok(l) => l,
@@ -164,19 +202,24 @@ impl PolymarketCatalog {
             if line.trim().is_empty() {
                 continue;
             }
-            let market: MarketInfo = match serde_json::from_str(&line) {
-                Ok(m) => m,
+            
+            let entry: CatalogFileEntry<MarketInfo> = match serde_json::from_str(&line) {
+                Ok(e) => e,
                 Err(e) => {
-                    warn!("PolymarketCatalog: Failed to parse market line: {}", e);
+                    warn!("PolymarketCatalog: Failed to parse entry: {}", e);
                     continue;
                 }
             };
-            markets.insert(market.id.clone(), market);
+
+            if let CatalogFileEntry::Diff(diff) = entry {
+                diffs.push(diff);
+            }
         }
 
         Some(CatalogState {
             markets,
-            last_updated: header.last_updated,
+            diffs,
+            last_updated,
         })
     }
 
@@ -186,18 +229,19 @@ impl PolymarketCatalog {
         let mut file = File::create(&self.cache_path)
             .map_err(|e| format!("Failed to create cache file: {}", e))?;
 
-        // Write header
-        let header = CacheHeader {
-            last_updated: state.last_updated,
-            version: 1,
+        // Write current state first
+        let current_entry = CatalogFileEntry::Current {
+            timestamp: state.last_updated,
+            items: state.markets.values().cloned().collect(),
         };
-        writeln!(file, "{}", serde_json::to_string(&header).unwrap())
-            .map_err(|e| format!("Failed to write header: {}", e))?;
+        writeln!(file, "{}", serde_json::to_string(&current_entry).unwrap())
+            .map_err(|e| format!("Failed to write current state: {}", e))?;
 
-        // Write markets
-        for market in state.markets.values() {
-            writeln!(file, "{}", serde_json::to_string(market).unwrap())
-                .map_err(|e| format!("Failed to write market: {}", e))?;
+        // Write diffs (newest first)
+        for diff in &state.diffs {
+            let diff_entry: CatalogFileEntry<MarketInfo> = CatalogFileEntry::Diff(diff.clone());
+            writeln!(file, "{}", serde_json::to_string(&diff_entry).unwrap())
+                .map_err(|e| format!("Failed to write diff: {}", e))?;
         }
 
         Ok(())
@@ -230,20 +274,68 @@ impl PolymarketCatalog {
         }
     }
 
+    /// Fetches all markets from the Polymarket API.
+    async fn fetch_all_markets(&self) -> Result<HashMap<String, MarketInfo>, String> {
+        info!("PolymarketCatalog: Starting fetch...");
+        
+        let mut all_markets: HashMap<String, MarketInfo> = HashMap::new();
+        let mut next_cursor: Option<String> = None;
+        let mut page = 0;
+
+        loop {
+            page += 1;
+            if page % 50 == 0 {
+                info!("PolymarketCatalog: Fetching page {}...", page);
+            }
+
+            let url = format!("{}/markets", POLYMARKET_CLOB_URL);
+
+            let mut request = self.http_client.get(&url);
+            if let Some(cursor) = &next_cursor {
+                request = request.query(&[("next_cursor", cursor)]);
+            }
+
+            let response = request
+                .send()
+                .await
+                .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+            if !response.status().is_success() {
+                return Err(format!("API returned status: {}", response.status()));
+            }
+
+            let body: MarketsResponse = response
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+            for api_market in body.data {
+                let market = Self::convert_market(api_market);
+                all_markets.insert(market.id.clone(), market);
+            }
+
+            if body.next_cursor == "LTE=" || body.next_cursor.is_empty() {
+                break;
+            }
+
+            next_cursor = Some(body.next_cursor);
+
+            if page > 1000 {
+                warn!("PolymarketCatalog: Hit page limit, stopping");
+                break;
+            }
+        }
+
+        Ok(all_markets)
+    }
+
     /// Get tokens for a market by condition_id.
-    /// Returns the full token info including outcomes.
     pub fn get_tokens(&self, condition_id: &str) -> Option<Vec<TokenInfo>> {
         let state = self.inner.read().unwrap();
         state.markets.get(condition_id).map(|m| m.tokens.clone())
     }
 
     /// Get a specific token by condition_id and outcome name.
-    /// 
-    /// # Example
-    /// ```ignore
-    /// let yes_token = catalog.get_token_by_outcome("condition123", "Yes");
-    /// let trump_token = catalog.get_token_by_outcome("condition456", "Trump");
-    /// ```
     pub fn get_token_by_outcome(&self, condition_id: &str, outcome: &str) -> Option<TokenInfo> {
         let state = self.inner.read().unwrap();
         state.markets.get(condition_id).and_then(|m| {
@@ -269,81 +361,130 @@ impl PolymarketCatalog {
     }
 }
 
+// =============================================================================
+// New Catalog Trait Implementation (with time-travel)
+// =============================================================================
+
 #[async_trait]
-impl MarketCatalog for PolymarketCatalog {
-    async fn refresh(&self) -> Result<usize, String> {
-        info!("PolymarketCatalog: Starting refresh...");
+impl Catalog for PolymarketCatalog {
+    type Item = MarketInfo;
+
+    fn item_id(item: &Self::Item) -> String {
+        item.id.clone()
+    }
+
+    fn current(&self) -> HashMap<String, MarketInfo> {
+        self.inner.read().unwrap().markets.clone()
+    }
+
+    fn as_of(&self, timestamp: u64) -> HashMap<String, MarketInfo> {
+        let state = self.inner.read().unwrap();
         
-        let mut all_markets: HashMap<String, MarketInfo> = HashMap::new();
-        let mut next_cursor: Option<String> = None;
-        let mut page = 0;
+        // Start with current state
+        let mut result = state.markets.clone();
 
-        loop {
-            page += 1;
-            if page % 50 == 0 {
-                info!("PolymarketCatalog: Fetching page {}...", page);
-            }
-
-            let url = format!("{}/markets", POLYMARKET_CLOB_URL);
-
-            let mut request = self.http_client.get(&url);
-            if let Some(cursor) = &next_cursor {
-                // Use .query() for proper URL encoding of base64 cursors
-                // (which may contain +, /, = characters)
-                request = request.query(&[("next_cursor", cursor)]);
-            }
-
-            let response = request
-                .send()
-                .await
-                .map_err(|e| format!("HTTP request failed: {}", e))?;
-
-            if !response.status().is_success() {
-                return Err(format!("API returned status: {}", response.status()));
-            }
-
-            let body: MarketsResponse = response
-                .json()
-                .await
-                .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-            for api_market in body.data {
-                let market = Self::convert_market(api_market);
-                all_markets.insert(market.id.clone(), market);
-            }
-
-            // "LTE=" indicates end of pagination
-            if body.next_cursor == "LTE=" || body.next_cursor.is_empty() {
+        // Walk backwards through diffs, inverting and applying each one
+        // Diffs are stored newest-first
+        for diff in &state.diffs {
+            if diff.timestamp <= timestamp {
+                // We've gone far enough back
                 break;
             }
-
-            next_cursor = Some(body.next_cursor);
-
-            // Safety: prevent infinite loops
-            if page > 1000 {
-                warn!("PolymarketCatalog: Hit page limit, stopping");
-                break;
-            }
+            
+            // Invert the diff and apply it
+            let inverted = invert_diff(diff);
+            apply_diff(&mut result, &inverted, Self::item_id);
         }
 
-        let count = all_markets.len();
+        result
+    }
+
+    async fn refresh(&mut self) -> Result<CatalogDiff<MarketInfo>, String> {
+        let new_markets = self.fetch_all_markets().await?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs() as i64;
+            .as_secs();
 
-        // Update state - brief lock, just swapping in the new data
+        let diff = {
+            let state = self.inner.read().unwrap();
+            compute_diff(&state.markets, &new_markets, now, Self::item_id)
+        };
+
+        // Update state
         {
             let mut state = self.inner.write().unwrap();
-            state.markets = all_markets;
+            
+            // Only add diff if there are actual changes
+            if !diff.is_empty() {
+                state.diffs.insert(0, diff.clone()); // Insert at front (newest first)
+            }
+            
+            state.markets = new_markets;
             state.last_updated = now;
         }
 
-        // Save to disk (also uses brief read lock)
+        // Save to disk
         if let Err(e) = self.save_to_disk() {
             error!("PolymarketCatalog: Failed to save cache: {}", e);
         } else {
-            info!("PolymarketCatalog: Saved {} markets to cache", count);
+            let state = self.inner.read().unwrap();
+            info!(
+                "PolymarketCatalog: Saved {} markets, {} diffs to cache",
+                state.markets.len(),
+                state.diffs.len()
+            );
+        }
+
+        Ok(diff)
+    }
+
+    fn last_updated(&self) -> u64 {
+        self.inner.read().unwrap().last_updated
+    }
+
+    fn diffs(&self) -> &[CatalogDiff<MarketInfo>] {
+        // Note: This is a limitation - we can't return a reference to data behind RwLock
+        // In practice, callers should use as_of() instead
+        &[]
+    }
+
+    fn len(&self) -> usize {
+        self.inner.read().unwrap().markets.len()
+    }
+}
+
+// =============================================================================
+// Legacy MarketCatalog Trait Implementation
+// =============================================================================
+
+#[async_trait]
+impl MarketCatalog for PolymarketCatalog {
+    async fn refresh(&self) -> Result<usize, String> {
+        // For the legacy trait, we can't mutate self, so we do an internal refresh
+        let new_markets = self.fetch_all_markets().await?;
+        let count = new_markets.len();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let diff = {
+            let state = self.inner.read().unwrap();
+            compute_diff(&state.markets, &new_markets, now, Self::item_id)
+        };
+
+        {
+            let mut state = self.inner.write().unwrap();
+            if !diff.is_empty() {
+                state.diffs.insert(0, diff);
+            }
+            state.markets = new_markets;
+            state.last_updated = now;
+        }
+
+        if let Err(e) = self.save_to_disk() {
+            error!("PolymarketCatalog: Failed to save cache: {}", e);
         }
 
         Ok(count)
@@ -384,7 +525,6 @@ impl MarketCatalog for PolymarketCatalog {
             .filter(|(score, _)| *score > 0)
             .collect();
 
-        // Sort by score descending
         results.sort_by(|a, b| b.0.cmp(&a.0));
 
         results
@@ -440,22 +580,20 @@ impl MarketCatalog for PolymarketCatalog {
     }
 
     fn last_updated(&self) -> i64 {
-        let state = self.inner.read().unwrap();
-        state.last_updated
+        self.inner.read().unwrap().last_updated as i64
     }
 
     fn len(&self) -> usize {
-        let state = self.inner.read().unwrap();
-        state.markets.len()
+        self.inner.read().unwrap().markets.len()
     }
 }
 
 /// Format a Unix timestamp for logging.
-fn format_timestamp(ts: i64) -> String {
+fn format_timestamp(ts: u64) -> String {
     if ts == 0 {
         return "never".to_string();
     }
-    chrono::DateTime::from_timestamp(ts, 0)
+    chrono::DateTime::from_timestamp(ts as i64, 0)
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
         .unwrap_or_else(|| format!("unix:{}", ts))
 }
@@ -468,5 +606,36 @@ mod tests {
     fn test_search_scoring() {
         // Basic scoring test - would need mock data
     }
-}
 
+    #[test]
+    fn test_as_of_with_no_diffs() {
+        // When there are no diffs, as_of should return current state
+        let state = CatalogState {
+            markets: {
+                let mut m = HashMap::new();
+                m.insert("a".to_string(), MarketInfo {
+                    id: "a".to_string(),
+                    slug: Some("test-market".to_string()),
+                    question: Some("Test?".to_string()),
+                    description: None,
+                    tags: None,
+                    tokens: vec![],
+                    extra: serde_json::json!({}),
+                });
+                m
+            },
+            diffs: vec![],
+            last_updated: 1000,
+        };
+
+        let catalog = PolymarketCatalog {
+            inner: RwLock::new(state),
+            cache_path: "test.jsonl".to_string(),
+            http_client: reqwest::Client::new(),
+        };
+
+        let result = catalog.as_of(500);
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key("a"));
+    }
+}
