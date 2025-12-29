@@ -1,9 +1,9 @@
 // src/models.rs
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // The standardized event your Strategy listens to
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketEvent {
     pub timestamp: i64,
     pub instrument: String,
