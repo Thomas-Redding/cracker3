@@ -19,18 +19,24 @@ const POLY_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 // --- Data Models (Internal to Polymarket) ---
 
+/// Message types from Polymarket WebSocket.
+/// 
+/// Note: We use `#[serde(untagged)]` with explicit `event_type` matching
+/// because Polymarket also sends messages without `asset_id` (like acks,
+/// heartbeats, tick updates) that would fail to parse with the tagged approach.
 #[derive(Deserialize, Debug, Clone)]
-#[serde(tag = "event_type", rename_all = "snake_case")]
+#[serde(untagged)]
 enum PolyMessage {
     Book(PolyBook),
     PriceChange(PolyPriceChange),
-    // We ignore 'last_trade_price' for now as strategy likely relies on BBO
-    #[serde(other)]
-    Unknown,
+    /// Catch-all for messages we don't need (acks, heartbeats, tick data, etc.)
+    #[allow(dead_code)]
+    Unknown(serde_json::Value),
 }
 
 #[derive(Deserialize, Debug, Clone)]
 struct PolyBook {
+    event_type: String, // "book"
     asset_id: String,
     bids: Vec<PriceLevel>,
     asks: Vec<PriceLevel>,
@@ -39,6 +45,7 @@ struct PolyBook {
 
 #[derive(Deserialize, Debug, Clone)]
 struct PolyPriceChange {
+    event_type: String, // "price_change"
     asset_id: String,
     price_changes: Vec<PriceChangeItem>,
     timestamp: String,
@@ -253,7 +260,7 @@ impl PolymarketActor {
         let mut dirty_token = None;
 
         match event {
-            PolyMessage::Book(b) => {
+            PolyMessage::Book(b) if b.event_type == "book" => {
                 let book = self
                     .books
                     .entry(b.asset_id.clone())
@@ -261,7 +268,7 @@ impl PolymarketActor {
                 book.set_snapshot(b.clone());
                 dirty_token = Some((b.asset_id, b.timestamp));
             }
-            PolyMessage::PriceChange(pc) => {
+            PolyMessage::PriceChange(pc) if pc.event_type == "price_change" => {
                 let book = self
                     .books
                     .entry(pc.asset_id.clone())
@@ -272,7 +279,7 @@ impl PolymarketActor {
                 }
                 dirty_token = Some((pc.asset_id, pc.timestamp));
             }
-            _ => {}
+            _ => {} // Ignore acks, heartbeats, tick data, etc.
         }
 
         // If book changed, emit MarketEvent
@@ -382,6 +389,7 @@ mod tests {
             let mut book = LocalOrderBook::new();
 
             let snapshot = PolyBook {
+                event_type: "book".to_string(),
                 asset_id: "token123".to_string(),
                 bids: vec![
                     PriceLevel { price: "0.45".to_string(), size: "100.0".to_string() },
@@ -408,6 +416,7 @@ mod tests {
 
             // First snapshot
             let snapshot1 = PolyBook {
+                event_type: "book".to_string(),
                 asset_id: "token123".to_string(),
                 bids: vec![
                     PriceLevel { price: "0.40".to_string(), size: "100.0".to_string() },
@@ -422,6 +431,7 @@ mod tests {
 
             // Second snapshot should replace, not append
             let snapshot2 = PolyBook {
+                event_type: "book".to_string(),
                 asset_id: "token123".to_string(),
                 bids: vec![
                     PriceLevel { price: "0.50".to_string(), size: "200.0".to_string() },
@@ -444,6 +454,7 @@ mod tests {
             let mut book = LocalOrderBook::new();
 
             let snapshot = PolyBook {
+                event_type: "book".to_string(),
                 asset_id: "token123".to_string(),
                 bids: vec![
                     PriceLevel { price: "0.45".to_string(), size: "100.0".to_string() },
@@ -467,6 +478,7 @@ mod tests {
             let mut book = LocalOrderBook::new();
 
             let snapshot = PolyBook {
+                event_type: "book".to_string(),
                 asset_id: "token123".to_string(),
                 bids: vec![
                     PriceLevel { price: "0.45".to_string(), size: "not_a_size".to_string() },
@@ -724,7 +736,7 @@ mod tests {
             }"#;
 
             let msg: PolyMessage = serde_json::from_str(json).unwrap();
-            assert!(matches!(msg, PolyMessage::Unknown));
+            assert!(matches!(msg, PolyMessage::Unknown(_)));
         }
 
         #[test]
@@ -813,6 +825,7 @@ mod tests {
 
             // Initial snapshot
             let snapshot = PolyBook {
+                event_type: "book".to_string(),
                 asset_id: "token".to_string(),
                 bids: vec![
                     PriceLevel { price: "0.45".to_string(), size: "100.0".to_string() },

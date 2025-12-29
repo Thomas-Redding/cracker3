@@ -18,6 +18,8 @@ const MAX_LOG_ENTRIES: usize = 100;
 pub struct GammaScalp {
     name: String,
     instruments: Vec<String>,
+    /// Execution client for placing orders (will be used when order logic is enabled)
+    #[allow(dead_code)]
     exec: SharedExecutionClient,
     /// Internal state protected by a mutex for thread-safe access
     state: Mutex<GammaScalpState>,
