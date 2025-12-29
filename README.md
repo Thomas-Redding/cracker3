@@ -304,3 +304,9 @@ The catalog caches to `polymarket_markets.jsonl` and auto-refreshes in the backg
 - **`MarketCatalog`** — Trait for market discovery (search, regex, lookup)
 
 The catalog caches to `polymarket_markets.jsonl` and auto-refreshes when the cache is older than 1 day.
+
+## LLM Context Cheatsheet:
+
+```bash
+cat README.md Cargo.toml src/**/*.rs > ignore.txt
+```
