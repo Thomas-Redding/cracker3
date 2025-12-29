@@ -57,7 +57,7 @@ Unit tests cover:
 * **Unified Interface:** Strategies are agnostic to the environment—same code runs in production and backtests.
 * **Async-First:** Built on `Tokio` and `async-trait` for non-blocking I/O.
 * **Exchange Support:** Native integration for Deribit, Derive (options/futures), and Polymarket (prediction markets).
-* **Historical Data:** Record live streams to JSONL files and replay them for backtesting with optional realtime simulation.
+* **Historical Data:** Live modes automatically record to JSONL files in `recordings/`; replay them for backtesting with optional realtime simulation.
 * **Market Discovery:** Search markets by slug, description, or regex patterns via `MarketCatalog` trait.
 * **Shared Execution:** Thread-safe execution clients (`SharedExecutionClient`) allow strategies to share connections.
 * **Type Safety:** Strong typing for Greeks (`delta`, `gamma`) and Order types prevents logic errors.
@@ -105,7 +105,8 @@ graph TD
     HS -->|MarketEvent| MR
     
     DS -.->|wrap| RS
-    RS -.->|writes to| JSONL[(market_data.jsonl)]
+    PS -.->|wrap| RS
+    RS -.->|writes to| JSONL[(recordings/*.jsonl)]
 
     MR -->|on_event| S1
     MR -->|on_event| S2
@@ -138,19 +139,24 @@ The framework supports file-based backtesting using JSONL (JSON Lines) format, w
 
 ### Recording Live Data
 
-Use `RecordingStream` to capture live market data for future backtests:
+Live modes automatically record all market events to timestamped JSONL files in the `recordings/` directory:
+
+```bash
+# Start live trading - recording happens automatically
+cargo run -- --mode live-deribit
+# Recording to: recordings/deribit_20251229_143052.jsonl
+
+cargo run -- --mode live-poly
+# Recording to: recordings/polymarket_20251229_143052.jsonl
+```
+
+Under the hood, each live stream is wrapped with `RecordingStream`. You can also use this wrapper manually for custom streams:
 
 ```rust
 use trading_bot::connectors::backtest::RecordingStream;
-use trading_bot::connectors::deribit::DeribitStream;
 
-// Wrap any live stream to record its events
-let live_stream = DeribitStream::new(instruments).await;
-let recording_stream = RecordingStream::new(live_stream, "recorded_data.jsonl")?;
-
-// Events flow through to your strategies AND get saved to disk
-let router = MarketRouter::new(recording_stream, strategies);
-router.run().await;
+// Wrap any MarketStream to record its events
+let recording_stream = RecordingStream::new(my_stream, "my_recording.jsonl")?;
 ```
 
 ### Playback Options
