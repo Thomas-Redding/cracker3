@@ -3,7 +3,7 @@
 // Derive (formerly Lyra) exchange connector.
 // WebSocket streaming for options market data.
 
-use crate::models::{DeriveResponse, DeriveTickerData, MarketEvent, Order, OrderId};
+use crate::models::{DeriveResponse, DeriveTickerData, Instrument, MarketEvent, Order, OrderId};
 use crate::traits::{ExecutionClient, MarketStream, SharedExecutionClient};
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
@@ -66,14 +66,48 @@ impl MarketStream for DeriveStream {
             .and_then(|op| op.delta)
             .or(raw.delta);
 
-        // 3. Convert to standardized MarketEvent
+        // 3. Convert to standardized MarketEvent with typed Instrument
         Some(MarketEvent {
             timestamp: raw.timestamp.unwrap_or(0),
-            instrument: raw.instrument_name.unwrap_or_default(),
+            instrument: Instrument::Derive(raw.instrument_name.unwrap_or_default()),
             best_bid: raw.best_bid_price,
             best_ask: raw.best_ask_price,
             delta,
         })
+    }
+
+    async fn subscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+        let derive_instruments: Vec<&str> = instruments
+            .iter()
+            .filter_map(|i| match i {
+                Instrument::Derive(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        
+        if derive_instruments.is_empty() {
+            return Ok(());
+        }
+        
+        warn!("DeriveStream: Dynamic subscription not yet implemented");
+        Ok(())
+    }
+
+    async fn unsubscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+        let derive_instruments: Vec<&str> = instruments
+            .iter()
+            .filter_map(|i| match i {
+                Instrument::Derive(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        
+        if derive_instruments.is_empty() {
+            return Ok(());
+        }
+        
+        warn!("DeriveStream: Dynamic unsubscription not yet implemented");
+        Ok(())
     }
 }
 

@@ -1,6 +1,6 @@
 // src/connectors/deribit.rs
 
-use crate::models::{DeribitResponse, DeribitTickerData, MarketEvent, Order, OrderId};
+use crate::models::{DeribitResponse, DeribitTickerData, Instrument, MarketEvent, Order, OrderId};
 use crate::traits::{ExecutionClient, MarketStream, SharedExecutionClient};
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
@@ -40,14 +40,52 @@ impl MarketStream for DeribitStream {
         // 1. Receive raw data
         let raw = self.receiver.recv().await?;
 
-        // 2. Convert to standardized MarketEvent
+        // 2. Convert to standardized MarketEvent with typed Instrument
         Some(MarketEvent {
             timestamp: raw.timestamp,
-            instrument: raw.instrument_name,
+            instrument: Instrument::Deribit(raw.instrument_name),
             best_bid: raw.best_bid_price,
             best_ask: raw.best_ask_price,
             delta: raw.greeks.and_then(|g| g.delta),
         })
+    }
+
+    async fn subscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+        // Filter to only Deribit instruments
+        let deribit_instruments: Vec<&str> = instruments
+            .iter()
+            .filter_map(|i| match i {
+                Instrument::Deribit(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        
+        if deribit_instruments.is_empty() {
+            return Ok(());
+        }
+        
+        // TODO: Implement dynamic subscription via WebSocket
+        warn!("DeribitStream: Dynamic subscription not yet implemented");
+        Ok(())
+    }
+
+    async fn unsubscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+        // Filter to only Deribit instruments
+        let deribit_instruments: Vec<&str> = instruments
+            .iter()
+            .filter_map(|i| match i {
+                Instrument::Deribit(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        
+        if deribit_instruments.is_empty() {
+            return Ok(());
+        }
+        
+        // TODO: Implement dynamic unsubscription via WebSocket
+        warn!("DeribitStream: Dynamic unsubscription not yet implemented");
+        Ok(())
     }
 }
 

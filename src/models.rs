@@ -1,12 +1,106 @@
 // src/models.rs
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
-// The standardized event your Strategy listens to
+// =============================================================================
+// Exchange and Instrument Types
+// =============================================================================
+
+/// Supported exchanges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Exchange {
+    Deribit,
+    Polymarket,
+    Derive,
+}
+
+impl fmt::Display for Exchange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Exchange::Deribit => write!(f, "deribit"),
+            Exchange::Polymarket => write!(f, "polymarket"),
+            Exchange::Derive => write!(f, "derive"),
+        }
+    }
+}
+
+/// A typed instrument identifier that encapsulates the exchange and symbol.
+/// 
+/// # Examples
+/// ```
+/// use trading_bot::models::Instrument;
+/// 
+/// let deribit_opt = Instrument::Deribit("BTC-29MAR24-60000-C".to_string());
+/// let poly_token = Instrument::Polymarket("21742633...".to_string());
+/// let derive_opt = Instrument::Derive("BTC-20251226-100000-C".to_string());
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "exchange", content = "symbol")]
+pub enum Instrument {
+    /// Deribit instrument (e.g., "BTC-29MAR24-60000-C", "ETH-PERPETUAL")
+    Deribit(String),
+    /// Polymarket token ID (numeric string)
+    Polymarket(String),
+    /// Derive instrument (e.g., "BTC-20251226-100000-C")
+    Derive(String),
+}
+
+impl Instrument {
+    /// Returns which exchange this instrument belongs to.
+    pub fn exchange(&self) -> Exchange {
+        match self {
+            Instrument::Deribit(_) => Exchange::Deribit,
+            Instrument::Polymarket(_) => Exchange::Polymarket,
+            Instrument::Derive(_) => Exchange::Derive,
+        }
+    }
+
+    /// Returns the symbol/identifier portion of the instrument.
+    pub fn symbol(&self) -> &str {
+        match self {
+            Instrument::Deribit(s) => s,
+            Instrument::Polymarket(s) => s,
+            Instrument::Derive(s) => s,
+        }
+    }
+
+    /// Creates a Deribit instrument.
+    pub fn deribit(symbol: impl Into<String>) -> Self {
+        Instrument::Deribit(symbol.into())
+    }
+
+    /// Creates a Polymarket instrument.
+    pub fn polymarket(token_id: impl Into<String>) -> Self {
+        Instrument::Polymarket(token_id.into())
+    }
+
+    /// Creates a Derive instrument.
+    pub fn derive(symbol: impl Into<String>) -> Self {
+        Instrument::Derive(symbol.into())
+    }
+}
+
+impl fmt::Display for Instrument {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Instrument::Deribit(s) => write!(f, "deribit:{}", s),
+            Instrument::Polymarket(s) => write!(f, "polymarket:{}", s),
+            Instrument::Derive(s) => write!(f, "derive:{}", s),
+        }
+    }
+}
+
+// =============================================================================
+// Market Events
+// =============================================================================
+
+/// The standardized event your Strategy listens to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketEvent {
     pub timestamp: i64,
-    pub instrument: String,
+    pub instrument: Instrument,
     pub best_bid: Option<f64>,
     pub best_ask: Option<f64>,
     pub delta: Option<f64>,
@@ -46,9 +140,76 @@ pub struct Greeks {
     pub vega: Option<f64>,
 }
 
-// Placeholder for Order types used in traits
-#[derive(Debug, Clone)]
-pub struct Order {}
+// =============================================================================
+// Order Types
+// =============================================================================
+
+/// Order side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OrderSide {
+    Buy,
+    Sell,
+}
+
+/// Order type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OrderType {
+    Market,
+    Limit,
+}
+
+/// An order to be placed on an exchange.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Order {
+    /// The instrument to trade.
+    pub instrument: Instrument,
+    /// Buy or sell.
+    pub side: OrderSide,
+    /// Order type (market or limit).
+    pub order_type: OrderType,
+    /// Quantity to trade.
+    pub quantity: f64,
+    /// Price for limit orders.
+    pub price: Option<f64>,
+    /// Client order ID (optional).
+    pub client_order_id: Option<String>,
+}
+
+impl Order {
+    /// Creates a new market order.
+    pub fn market(instrument: Instrument, side: OrderSide, quantity: f64) -> Self {
+        Self {
+            instrument,
+            side,
+            order_type: OrderType::Market,
+            quantity,
+            price: None,
+            client_order_id: None,
+        }
+    }
+
+    /// Creates a new limit order.
+    pub fn limit(instrument: Instrument, side: OrderSide, quantity: f64, price: f64) -> Self {
+        Self {
+            instrument,
+            side,
+            order_type: OrderType::Limit,
+            quantity,
+            price: Some(price),
+            client_order_id: None,
+        }
+    }
+
+    /// Sets a client order ID.
+    pub fn with_client_id(mut self, id: impl Into<String>) -> Self {
+        self.client_order_id = Some(id.into());
+        self
+    }
+}
+
+/// Order ID returned by the exchange.
 pub type OrderId = String;
 
 // --- Raw Derive Types (Used for JSON parsing only) ---

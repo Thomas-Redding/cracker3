@@ -1,11 +1,11 @@
 // src/strategy/momentum.rs
 
-use crate::models::MarketEvent;
-use crate::traits::{Dashboard, DashboardSchema, SharedExecutionClient, Strategy, Widget};
+use crate::models::{Exchange, Instrument, MarketEvent};
+use crate::traits::{Dashboard, DashboardSchema, SharedExecutionRouter, Strategy, Widget};
 use async_trait::async_trait;
 use log::info;
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -18,10 +18,11 @@ const MAX_LOG_ENTRIES: usize = 100;
 /// signals when momentum is detected.
 pub struct MomentumStrategy {
     name: String,
-    instruments: Vec<String>,
-    /// Execution client for placing orders (will be used when order logic is enabled)
+    instruments: Vec<Instrument>,
+    exchanges: HashSet<Exchange>,
+    /// Execution router for placing orders on any exchange
     #[allow(dead_code)]
-    exec: SharedExecutionClient,
+    exec: SharedExecutionRouter,
     state: Mutex<MomentumState>,
 }
 
@@ -55,20 +56,22 @@ impl MomentumStrategy {
     ///
     /// # Arguments
     /// * `name` - Unique name for this strategy instance
-    /// * `instruments` - List of instruments to watch
-    /// * `exec` - Shared execution client
+    /// * `instruments` - List of typed instruments to watch
+    /// * `exec` - Shared execution router
     /// * `lookback_period` - Number of ticks to use for momentum calculation
     /// * `momentum_threshold` - Minimum % change to trigger signal (e.g., 0.02 for 2%)
     pub fn new(
         name: impl Into<String>,
-        instruments: Vec<String>,
-        exec: SharedExecutionClient,
+        instruments: Vec<Instrument>,
+        exec: SharedExecutionRouter,
         lookback_period: usize,
         momentum_threshold: f64,
     ) -> Arc<Self> {
+        let exchanges: HashSet<Exchange> = instruments.iter().map(|i| i.exchange()).collect();
         Arc::new(Self {
             name: name.into(),
             instruments,
+            exchanges,
             exec,
             state: Mutex::new(MomentumState {
                 price_history: VecDeque::with_capacity(lookback_period),
@@ -85,8 +88,8 @@ impl MomentumStrategy {
     /// Creates with default parameters (10 tick lookback, 1% threshold).
     pub fn default_config(
         name: impl Into<String>,
-        instruments: Vec<String>,
-        exec: SharedExecutionClient,
+        instruments: Vec<Instrument>,
+        exec: SharedExecutionRouter,
     ) -> Arc<Self> {
         Self::new(name, instruments, exec, 10, 0.01)
     }
@@ -182,7 +185,11 @@ impl Strategy for MomentumStrategy {
         &self.name
     }
 
-    fn required_subscriptions(&self) -> Vec<String> {
+    fn required_exchanges(&self) -> HashSet<Exchange> {
+        self.exchanges.clone()
+    }
+
+    async fn discover_subscriptions(&self) -> Vec<Instrument> {
         self.instruments.clone()
     }
 
@@ -239,7 +246,8 @@ impl Strategy for MomentumStrategy {
             Self::add_log(&mut state, msg, "signal");
 
             // In a real implementation, place an order:
-            // let order = Order { ... };
+            // let side = if momentum > 0.0 { OrderSide::Buy } else { OrderSide::Sell };
+            // let order = Order::market(event.instrument.clone(), side, quantity);
             // let _ = self.exec.place_order(order).await;
         } else {
             let msg = format!(
@@ -251,4 +259,3 @@ impl Strategy for MomentumStrategy {
         }
     }
 }
-

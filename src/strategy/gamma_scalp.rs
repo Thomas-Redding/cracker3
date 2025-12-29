@@ -1,11 +1,11 @@
 // src/strategy/gamma_scalp.rs
 
-use crate::models::MarketEvent;
-use crate::traits::{Dashboard, DashboardSchema, SharedExecutionClient, Strategy, Widget};
+use crate::models::{Exchange, Instrument, MarketEvent};
+use crate::traits::{Dashboard, DashboardSchema, SharedExecutionRouter, Strategy, Widget};
 use async_trait::async_trait;
 use log::info;
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -17,10 +17,11 @@ const MAX_LOG_ENTRIES: usize = 100;
 /// Now implements the Strategy trait for use with the multi-strategy engine.
 pub struct GammaScalp {
     name: String,
-    instruments: Vec<String>,
-    /// Execution client for placing orders (will be used when order logic is enabled)
+    instruments: Vec<Instrument>,
+    exchanges: HashSet<Exchange>,
+    /// Execution router for placing orders on any exchange
     #[allow(dead_code)]
-    exec: SharedExecutionClient,
+    exec: SharedExecutionRouter,
     /// Internal state protected by a mutex for thread-safe access
     state: Mutex<GammaScalpState>,
 }
@@ -49,16 +50,18 @@ impl GammaScalp {
     ///
     /// # Arguments
     /// * `name` - Unique name for this strategy instance
-    /// * `instruments` - List of instruments to watch (e.g., ["BTC-29MAR24-60000-C"])
-    /// * `exec` - Shared execution client for placing orders
+    /// * `instruments` - List of typed instruments to watch
+    /// * `exec` - Shared execution router for placing orders
     pub fn new(
         name: impl Into<String>,
-        instruments: Vec<String>,
-        exec: SharedExecutionClient,
+        instruments: Vec<Instrument>,
+        exec: SharedExecutionRouter,
     ) -> Arc<Self> {
+        let exchanges: HashSet<Exchange> = instruments.iter().map(|i| i.exchange()).collect();
         Arc::new(Self {
             name: name.into(),
             instruments,
+            exchanges,
             exec,
             state: Mutex::new(GammaScalpState {
                 delta_threshold: 0.5,
@@ -73,13 +76,15 @@ impl GammaScalp {
     /// Creates with a custom delta threshold.
     pub fn with_threshold(
         name: impl Into<String>,
-        instruments: Vec<String>,
-        exec: SharedExecutionClient,
+        instruments: Vec<Instrument>,
+        exec: SharedExecutionRouter,
         threshold: f64,
     ) -> Arc<Self> {
+        let exchanges: HashSet<Exchange> = instruments.iter().map(|i| i.exchange()).collect();
         Arc::new(Self {
             name: name.into(),
             instruments,
+            exchanges,
             exec,
             state: Mutex::new(GammaScalpState {
                 delta_threshold: threshold,
@@ -170,7 +175,13 @@ impl Strategy for GammaScalp {
         &self.name
     }
 
-    fn required_subscriptions(&self) -> Vec<String> {
+    fn required_exchanges(&self) -> HashSet<Exchange> {
+        self.exchanges.clone()
+    }
+
+    async fn discover_subscriptions(&self) -> Vec<Instrument> {
+        // For now, return the static list of instruments
+        // In a more advanced implementation, this could query catalogs
         self.instruments.clone()
     }
 
@@ -196,7 +207,7 @@ impl Strategy for GammaScalp {
                 Self::add_log(&mut state, msg, "signal");
 
                 // In a real implementation, we would place a hedge order here:
-                // let order = Order { ... };
+                // let order = Order::market(event.instrument.clone(), OrderSide::Sell, quantity);
                 // let _ = self.exec.place_order(order).await;
             }
         }

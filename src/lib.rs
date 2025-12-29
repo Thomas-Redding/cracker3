@@ -21,3 +21,6 @@ pub mod engine;
 
 // 7. Dashboard Web Server (The "UI")
 pub mod dashboard;
+
+// 8. Configuration (The "Setup")
+pub mod config;
