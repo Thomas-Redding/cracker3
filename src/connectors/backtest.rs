@@ -1,6 +1,6 @@
 // src/connectors/backtest.rs
 
-use crate::models::{MarketEvent, Order, OrderId};
+use crate::models::{Instrument, MarketEvent, Order, OrderId};
 use crate::traits::{ExecutionClient, MarketStream, SharedExecutionClient};
 use async_trait::async_trait;
 use std::collections::VecDeque;
@@ -192,6 +192,14 @@ impl<S: MarketStream + Send> MarketStream for RecordingStream<S> {
         }
 
         Some(event)
+    }
+
+    async fn subscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+        self.inner.subscribe(instruments).await
+    }
+
+    async fn unsubscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+        self.inner.unsubscribe(instruments).await
     }
 }
 
