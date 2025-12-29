@@ -511,6 +511,10 @@ Options:
   --generate-config      Print default config template and exit
 ```
 
+## TODOs
+* Implement `refresh_subscriptions` in deribit.rs and derive.rs.
+* Implement real trading.
+
 ## LLM Context Cheatsheet
 
 ```bash
