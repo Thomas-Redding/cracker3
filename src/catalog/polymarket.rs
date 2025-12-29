@@ -15,12 +15,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const POLYMARKET_CLOB_URL: &str = "https://clob.polymarket.com";
 const DEFAULT_CACHE_PATH: &str = "polymarket_markets.jsonl";
 const STALE_THRESHOLD_SECS: u64 = 86400; // 1 day
+
+/// Static flag to prevent multiple concurrent auto-refreshes.
+/// Only one background refresh can run at a time across all catalog instances.
+static AUTO_REFRESH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Raw market data from Polymarket API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,22 +122,30 @@ impl PolymarketCatalog {
         }
 
         // Check staleness and auto-refresh in background
+        // Note: We use MarketCatalog::refresh which works with &self via internal mutability
+        // Use atomic flag to prevent multiple concurrent auto-refreshes
         if catalog.is_stale_internal(last_updated) {
-            info!("PolymarketCatalog: Cache is stale, spawning background refresh...");
-            let catalog_clone = catalog.clone();
-            tokio::spawn(async move {
-                // Need mutable access for refresh
-                let catalog_mut = Arc::into_inner(catalog_clone);
-                if let Some(mut cat) = catalog_mut {
-                    match Catalog::refresh(&mut cat).await {
-                        Ok(diff) => info!(
-                            "PolymarketCatalog: Background refresh complete, {} changes",
-                            diff.change_count()
+            // Try to acquire the refresh lock - only one refresh can run at a time
+            if AUTO_REFRESH_IN_PROGRESS
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                info!("PolymarketCatalog: Cache is stale, spawning background refresh...");
+                let catalog_clone = catalog.clone();
+                tokio::spawn(async move {
+                    match MarketCatalog::refresh(catalog_clone.as_ref()).await {
+                        Ok(count) => info!(
+                            "PolymarketCatalog: Background refresh complete, {} markets",
+                            count
                         ),
                         Err(e) => error!("PolymarketCatalog: Background refresh failed: {}", e),
                     }
-                }
-            });
+                    // Release the lock
+                    AUTO_REFRESH_IN_PROGRESS.store(false, Ordering::SeqCst);
+                });
+            } else {
+                info!("PolymarketCatalog: Cache is stale, but refresh already in progress");
+            }
         }
 
         catalog

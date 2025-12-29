@@ -18,6 +18,9 @@ const TEST_MARKET_SLUG: &str = "will-anyone-be-charged-over-daycare-fraud-in-min
 const TEST_OUTPUT_DIR: &str = "test_output";
 const EVENTS_FILE: &str = "polymarket_events.jsonl";
 
+/// Static flag to prevent multiple tests from printing "waiting for catalog" messages.
+static WAITING_FOR_CATALOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Helper to ensure test output directory exists
 fn setup_test_output_dir() -> String {
     let dir = format!("{}/polymarket_integration", TEST_OUTPUT_DIR);
@@ -62,11 +65,12 @@ fn validate_event(event: &MarketEvent, expected_token_ids: &[String]) -> Result<
         return Err(format!("Timestamp looks invalid: {}", event.timestamp));
     }
 
-    // Instrument should be one of our expected token IDs
-    if !expected_token_ids.contains(&event.instrument) {
+    // Instrument should be one of our expected token IDs (as Polymarket instrument)
+    let instrument_symbol = event.instrument.symbol();
+    if !expected_token_ids.iter().any(|id| id == instrument_symbol) {
         return Err(format!(
             "Unexpected instrument: {} (expected one of {:?})",
-            event.instrument, expected_token_ids
+            instrument_symbol, expected_token_ids
         ));
     }
 
@@ -100,16 +104,27 @@ async fn ensure_catalog_populated(
     catalog: &std::sync::Arc<PolymarketCatalog>,
     slug: &str,
 ) -> bool {
+    use std::sync::atomic::Ordering;
+    
     // First check if it's already there
     if catalog.find_by_slug(slug).is_some() {
         println!("  Market found in cache (catalog has {} markets)", catalog.len());
         return true;
     }
 
-    // If catalog is empty or stale, do a full refresh (may take 5+ minutes)
+    // If catalog is empty or stale, wait for the background refresh
     if catalog.len() == 0 || catalog.is_stale() {
-        println!("  Catalog is empty or stale, starting fresh refresh...");
-        println!("  (This may take 3-5 minutes for ~1000 pages)");
+        // Only one test should print the "waiting" messages
+        let should_print = WAITING_FOR_CATALOG
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        
+        if should_print {
+            println!("  Catalog is empty or stale, waiting for background refresh...");
+            println!("  (This may take 3-5 minutes for ~1000 pages)");
+        } else {
+            println!("  Waiting for catalog (another test is tracking progress)...");
+        }
 
         // The background refresh was already spawned by new(), 
         // but let's wait for it by polling the catalog
@@ -121,21 +136,26 @@ async fn ensure_catalog_populated(
             tokio::time::sleep(Duration::from_secs(10)).await;
 
             if catalog.find_by_slug(slug).is_some() {
-                println!("  Found market after {:?}", start.elapsed());
+                if should_print {
+                    println!("  Found market after {:?}", start.elapsed());
+                }
                 return true;
             }
 
             let elapsed = start.elapsed();
             if elapsed > max_wait {
-                println!("  Timeout after {:?} ({} markets loaded)", elapsed, catalog.len());
+                if should_print {
+                    println!("  Timeout after {:?} ({} markets loaded)", elapsed, catalog.len());
+                }
                 break;
             }
 
-            // Show progress
-            if elapsed
-                .checked_sub(last_progress_log)
-                .map(|d| d >= Duration::from_secs(30))
-                .unwrap_or(true)
+            // Show progress (only from one test)
+            if should_print
+                && elapsed
+                    .checked_sub(last_progress_log)
+                    .map(|d| d >= Duration::from_secs(30))
+                    .unwrap_or(true)
             {
                 println!("  Still loading... {} markets so far", catalog.len());
                 last_progress_log = elapsed;
@@ -227,10 +247,11 @@ async fn test_polymarket_connector_live() {
                                 .unwrap_or(true);
 
                             if event_count <= 5 || is_bbo_change {
+                                let symbol = event.instrument.symbol();
                                 println!(
                                     "  Event {}: instrument={} bid={:?} ask={:?} ts={}",
                                     event_count,
-                                    &event.instrument[..8.min(event.instrument.len())],
+                                    &symbol[..8.min(symbol.len())],
                                     event.best_bid,
                                     event.best_ask,
                                     event.timestamp
@@ -387,7 +408,7 @@ async fn test_order_book_consistency() {
     let token_ids: Vec<String> = market.tokens.iter().map(|t| t.token_id.clone()).collect();
     let mut stream = PolymarketStream::new(token_ids).await;
 
-    // Track order book state per token
+    // Track order book state per token (by symbol string)
     let mut last_state: std::collections::HashMap<String, (Option<f64>, Option<f64>)> =
         std::collections::HashMap::new();
     let mut state_changes = 0;
@@ -397,7 +418,8 @@ async fn test_order_book_consistency() {
         while let Some(event) = stream.next().await {
             count += 1;
 
-            let prev = last_state.get(&event.instrument).cloned();
+            let symbol = event.instrument.symbol().to_string();
+            let prev = last_state.get(&symbol).cloned();
             let curr = (event.best_bid, event.best_ask);
 
             // Track state changes
@@ -426,7 +448,7 @@ async fn test_order_book_consistency() {
                 }
             }
 
-            last_state.insert(event.instrument.clone(), curr);
+            last_state.insert(symbol, curr);
 
             if count >= 50 {
                 break;
