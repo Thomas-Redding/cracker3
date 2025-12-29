@@ -18,3 +18,6 @@ pub mod strategy;
 
 // 6. Multi-Strategy Engine (The "Orchestrator")
 pub mod engine;
+
+// 7. Dashboard Web Server (The "UI")
+pub mod dashboard;

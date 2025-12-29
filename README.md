@@ -27,6 +27,9 @@ cargo run -- --mode live-poly
 
 # Live trading on Derive
 cargo run -- --mode live-derive
+
+# Run with web dashboard on port 8080
+cargo run -- --mode backtest --dashboard 8080
 ```
 
 ## 🧪 Testing
@@ -58,6 +61,7 @@ Unit tests cover:
 * **Market Discovery:** Search markets by slug, description, or regex patterns via `MarketCatalog` trait.
 * **Shared Execution:** Thread-safe execution clients (`SharedExecutionClient`) allow strategies to share connections.
 * **Type Safety:** Strong typing for Greeks (`delta`, `gamma`) and Order types prevents logic errors.
+* **Web Dashboard:** Real-time web UI with one tab per strategy, WebSocket updates, and embedded frontend.
 
 ## 🏗 Architecture
 
@@ -166,12 +170,14 @@ src/
 ├── main.rs              # Entry point, mode selection
 ├── lib.rs               # Module exports
 ├── models.rs            # MarketEvent, Order, exchange-specific types
-├── traits.rs            # Strategy, MarketStream, ExecutionClient traits
+├── traits.rs            # Strategy, MarketStream, ExecutionClient, Dashboard traits
 ├── engine/
 │   └── mod.rs           # MarketRouter (pub/sub event distribution)
 ├── catalog/
 │   ├── mod.rs           # MarketCatalog trait + shared types
 │   └── polymarket.rs    # Polymarket market discovery
+├── dashboard/
+│   └── mod.rs           # DashboardServer, REST API, WebSocket, embedded frontend
 ├── strategy/
 │   ├── gamma_scalp.rs   # Delta-based hedging strategy
 │   └── momentum.rs      # Price momentum strategy
@@ -188,19 +194,54 @@ src/
 
 ```rust
 use crate::models::MarketEvent;
-use crate::traits::{Strategy, SharedExecutionClient};
+use crate::traits::{Dashboard, DashboardSchema, SharedExecutionClient, Strategy, Widget};
 use async_trait::async_trait;
+use serde_json::{json, Value};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 pub struct MyStrategy {
     name: String,
     instruments: Vec<String>,
     exec: SharedExecutionClient,
+    state: Mutex<MyState>,
+}
+
+struct MyState {
+    trade_count: u64,
 }
 
 impl MyStrategy {
     pub fn new(name: impl Into<String>, instruments: Vec<String>, exec: SharedExecutionClient) -> Arc<Self> {
-        Arc::new(Self { name: name.into(), instruments, exec })
+        Arc::new(Self {
+            name: name.into(),
+            instruments,
+            exec,
+            state: Mutex::new(MyState { trade_count: 0 }),
+        })
+    }
+}
+
+// Dashboard is required for all strategies
+#[async_trait]
+impl Dashboard for MyStrategy {
+    fn dashboard_name(&self) -> &str { &self.name }
+    
+    async fn dashboard_state(&self) -> Value {
+        let state = self.state.lock().await;
+        json!({ "trade_count": state.trade_count })
+    }
+    
+    fn dashboard_schema(&self) -> DashboardSchema {
+        DashboardSchema {
+            widgets: vec![
+                Widget::KeyValue {
+                    label: "Trades".to_string(),
+                    key: "trade_count".to_string(),
+                    format: None,
+                },
+            ],
+        }
     }
 }
 
@@ -304,6 +345,77 @@ The catalog caches to `polymarket_markets.jsonl` and auto-refreshes in the backg
 - **`MarketCatalog`** — Trait for market discovery (search, regex, lookup)
 
 The catalog caches to `polymarket_markets.jsonl` and auto-refreshes when the cache is older than 1 day.
+
+## 📊 Web Dashboard
+
+Every strategy implements the `Dashboard` trait, enabling a real-time web UI with one tab per strategy.
+
+### Running with Dashboard
+
+Add the `--dashboard <port>` flag to any mode:
+
+```bash
+# Backtest with dashboard
+cargo run -- --mode backtest --dashboard 8080
+
+# Live trading with dashboard
+cargo run -- --mode live-deribit --dashboard 8080
+
+# Historical backtest with dashboard
+cargo run -- --mode historical-backtest --file data.jsonl --realtime --dashboard 8080
+```
+
+Then open http://localhost:8080 in your browser.
+
+### Dashboard Features
+
+- **Tab-per-strategy UI** — Switch between strategies with a single click
+- **Real-time updates** — WebSocket connection pushes state updates every 500ms
+- **Automatic metrics** — Numeric fields are displayed as key-value cards
+- **Activity log** — Scrolling log of recent signals and events
+- **Price/Delta charts** — Visual history of market data
+
+### Dashboard Trait
+
+All strategies must implement `Dashboard`:
+
+```rust
+#[async_trait]
+pub trait Dashboard: Send + Sync {
+    /// Display name for the dashboard tab
+    fn dashboard_name(&self) -> &str;
+
+    /// Returns the current state as JSON for the frontend
+    async fn dashboard_state(&self) -> Value;
+
+    /// Optional: Define custom layout with widgets
+    fn dashboard_schema(&self) -> DashboardSchema {
+        DashboardSchema::default()
+    }
+}
+```
+
+### Widget Types
+
+| Widget | Description |
+|--------|-------------|
+| `KeyValue` | Simple label/value display |
+| `Chart` | Time-series line/bar/area chart |
+| `Table` | Data table with columns |
+| `Log` | Scrolling activity log |
+| `Divider` | Visual separator |
+
+### REST API
+
+The dashboard server exposes these endpoints:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | Embedded frontend HTML |
+| `GET /api/strategies` | List all strategies |
+| `GET /api/strategies/:name` | Get strategy state |
+| `GET /api/strategies/:name/schema` | Get dashboard schema |
+| `GET /ws` | WebSocket for real-time updates |
 
 ## LLM Context Cheatsheet:
 
