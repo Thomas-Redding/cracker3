@@ -512,8 +512,12 @@ Options:
 ```
 
 ## TODOs
-* Implement `refresh_subscriptions` in deribit.rs and derive.rs.
-* Implement real trading.
+
+* P1: Implement BTC trading strategy.
+* P2: Implement `refresh_subscriptions` in deribit.rs and derive.rs.
+* P2: Allow each dashboard to affect each strategy. Especially enabling and disabling.
+* P3: Implement real trading for the various exchanges.
+
 
 ## LLM Context Cheatsheet
 
