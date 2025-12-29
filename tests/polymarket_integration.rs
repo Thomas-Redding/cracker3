@@ -208,8 +208,8 @@ async fn test_polymarket_connector_live() {
     println!("Step 3: Receiving events (will collect for 30 seconds)...");
     
     let mut events_file = File::create(&events_path).expect("Failed to create events file");
-    let mut event_count = 0;
-    let mut error_count = 0;
+    let mut event_count: usize = 0;
+    let mut error_count: usize = 0;
     let mut last_bbo: Option<(Option<f64>, Option<f64>)> = None;
 
     let timeout = tokio::time::timeout(Duration::from_secs(30), async {
