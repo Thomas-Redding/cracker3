@@ -115,6 +115,7 @@ async fn ensure_catalog_populated(
         // but let's wait for it by polling the catalog
         let start = std::time::Instant::now();
         let max_wait = Duration::from_secs(360); // 6 minutes max
+        let mut last_progress_log = Duration::from_secs(0);
 
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
@@ -131,8 +132,13 @@ async fn ensure_catalog_populated(
             }
 
             // Show progress
-            if elapsed.as_secs() % 30 == 0 {
+            if elapsed
+                .checked_sub(last_progress_log)
+                .map(|d| d >= Duration::from_secs(30))
+                .unwrap_or(true)
+            {
                 println!("  Still loading... {} markets so far", catalog.len());
+                last_progress_log = elapsed;
             }
         }
     }
@@ -266,7 +272,8 @@ async fn test_polymarket_connector_live() {
     
     // Step 4: Verify events were persisted correctly
     let loaded_events = load_events(Path::new(&events_path));
-    println!("  Persisted {} events to disk", event_count);
+    let persisted_count = event_count.saturating_sub(error_count);
+    println!("  Persisted {} events to disk", persisted_count);
     println!("  Loaded {} events back from disk", loaded_events.len());
 
     // Verify we got some events
@@ -278,7 +285,7 @@ async fn test_polymarket_connector_live() {
     // Verify persistence worked
     assert_eq!(
         loaded_events.len(),
-        event_count - error_count,
+        persisted_count,
         "All valid events should be persisted and loadable"
     );
 
