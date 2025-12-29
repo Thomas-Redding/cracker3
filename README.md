@@ -28,6 +28,9 @@ cargo run -- --mode live-poly
 # Live trading on Derive
 cargo run -- --mode live-derive
 
+# Live trading on ALL exchanges concurrently (Deribit, Polymarket, Derive)
+cargo run -- --mode live-all
+
 # Run with web dashboard on port 8080
 cargo run -- --mode backtest --dashboard 8080
 ```
@@ -105,6 +108,7 @@ graph TD
     HS -->|MarketEvent| MR
     
     DS -.->|wrap| RS
+    DRS -.->|wrap| RS
     PS -.->|wrap| RS
     RS -.->|writes to| JSONL[(recordings/*.jsonl)]
 
@@ -148,6 +152,9 @@ cargo run -- --mode live-deribit
 
 cargo run -- --mode live-poly
 # Recording to: recordings/polymarket_20251229_143052.jsonl
+
+cargo run -- --mode live-derive
+# Recording to: recordings/derive_20251229_143052.jsonl
 ```
 
 Under the hood, each live stream is wrapped with `RecordingStream`. You can also use this wrapper manually for custom streams:

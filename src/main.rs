@@ -3,7 +3,7 @@
 use chrono::Utc;
 use clap::Parser;
 use std::sync::Arc;
-use trading_bot::connectors::{backtest, deribit, polymarket};
+use trading_bot::connectors::{backtest, deribit, derive, polymarket};
 use trading_bot::dashboard::DashboardServer;
 use trading_bot::engine::MarketRouter;
 use trading_bot::models::MarketEvent;
@@ -44,6 +44,12 @@ async fn main() {
         "live-poly" => {
             run_polymarket_multi_strategy(args.dashboard).await;
         }
+        "live-derive" => {
+            run_derive_multi_strategy(args.dashboard).await;
+        }
+        "live-all" => {
+            run_all_exchanges(args.dashboard).await;
+        }
         "backtest" => {
             run_backtest(args.dashboard).await;
         }
@@ -51,7 +57,7 @@ async fn main() {
             let file_path = args.file.expect("--file is required for historical-backtest mode");
             run_historical_backtest(&file_path, args.realtime, args.speed, args.dashboard).await;
         }
-        _ => println!("Unknown mode. Use: live-deribit, live-poly, backtest, or historical-backtest"),
+        _ => println!("Unknown mode. Use: live-deribit, live-poly, live-derive, live-all, backtest, or historical-backtest"),
     }
 }
 
@@ -179,6 +185,184 @@ async fn run_polymarket_multi_strategy(dashboard_port: Option<u16>) {
     println!("Recording to: {}", recording_path);
 
     // 7. Run
+    let router = MarketRouter::new(stream, strategies);
+    router.run().await;
+}
+
+/// Runs multiple strategies on Derive using a single WebSocket connection.
+async fn run_derive_multi_strategy(dashboard_port: Option<u16>) {
+    println!("Starting Multi-Strategy Derive Engine...");
+
+    let api_key = std::env::var("DERIVE_KEY").unwrap_or_else(|_| "dummy_key".to_string());
+
+    // 1. Create the shared execution client
+    let exec = derive::DeriveExec::new(api_key).await.shared();
+
+    // 2. Create strategies with their specific instruments
+    let gamma_scalp_btc = GammaScalp::new(
+        "GammaScalp-BTC",
+        vec!["BTC-20251226-100000-C".to_string()],
+        exec.clone(),
+    );
+
+    let momentum_eth = MomentumStrategy::new(
+        "Momentum-ETH",
+        vec!["ETH-20251226-4000-C".to_string()],
+        exec.clone(),
+        10,   // 10-tick lookback
+        0.02, // 2% momentum threshold
+    );
+
+    // 3. Build the engine and aggregate subscriptions
+    let strategies: Vec<Arc<dyn Strategy>> = vec![gamma_scalp_btc, momentum_eth];
+
+    // 4. Start dashboard if requested
+    if let Some(port) = dashboard_port {
+        start_dashboard(strategies.clone(), port);
+    }
+
+    let all_instruments = MarketRouter::<derive::DeriveStream>::aggregate_subscriptions(&strategies);
+    println!("Aggregated subscriptions: {:?}", all_instruments);
+
+    // 5. Create the stream with the superset of all instruments
+    let stream = derive::DeriveStream::new(all_instruments).await;
+
+    // 6. Wrap with RecordingStream to save events to disk
+    let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
+    let recording_path = format!("recordings/derive_{}.jsonl", timestamp);
+    std::fs::create_dir_all("recordings").expect("Failed to create recordings directory");
+    let stream = backtest::RecordingStream::new(stream, &recording_path)
+        .expect("Failed to create recording stream");
+    println!("Recording to: {}", recording_path);
+
+    // 7. Create and run the router
+    let router = MarketRouter::new(stream, strategies);
+    router.run().await;
+}
+
+/// Runs all three exchanges (Deribit, Polymarket, Derive) concurrently with recording.
+async fn run_all_exchanges(dashboard_port: Option<u16>) {
+    println!("Starting All Exchanges in Record Mode...");
+
+    std::fs::create_dir_all("recordings").expect("Failed to create recordings directory");
+    let timestamp = Utc::now().format("%Y%m%d_%H%M%S").to_string();
+
+    // Spawn all three exchange handlers concurrently
+    let deribit_handle = tokio::spawn({
+        let timestamp = timestamp.clone();
+        async move {
+            run_exchange_deribit(&timestamp).await;
+        }
+    });
+
+    let polymarket_handle = tokio::spawn({
+        let timestamp = timestamp.clone();
+        async move {
+            run_exchange_polymarket(&timestamp).await;
+        }
+    });
+
+    let derive_handle = tokio::spawn({
+        let timestamp = timestamp.clone();
+        async move {
+            run_exchange_derive(&timestamp).await;
+        }
+    });
+
+    // Note: Dashboard is not supported in live-all mode since strategies are spread across tasks
+    if dashboard_port.is_some() {
+        println!("Warning: Dashboard is not supported in live-all mode");
+    }
+
+    // Wait for all exchanges (they run indefinitely until error/disconnect)
+    let _ = tokio::join!(deribit_handle, polymarket_handle, derive_handle);
+}
+
+/// Internal helper for running Deribit in live-all mode.
+async fn run_exchange_deribit(timestamp: &str) {
+    let api_key = match std::env::var("DERIBIT_KEY") {
+        Ok(key) => key,
+        Err(_) => {
+            println!("Deribit: Skipping (DERIBIT_KEY not set)");
+            return;
+        }
+    };
+
+    println!("Deribit: Starting...");
+    let exec = deribit::DeribitExec::new(api_key).await.shared();
+
+    let gamma_scalp = GammaScalp::new(
+        "GammaScalp-Deribit",
+        vec!["BTC-29MAR24-60000-C".to_string()],
+        exec.clone(),
+    );
+
+    let strategies: Vec<Arc<dyn Strategy>> = vec![gamma_scalp];
+    let all_instruments = MarketRouter::<deribit::DeribitStream>::aggregate_subscriptions(&strategies);
+
+    let stream = deribit::DeribitStream::new(all_instruments).await;
+    let recording_path = format!("recordings/deribit_{}.jsonl", timestamp);
+    let stream = backtest::RecordingStream::new(stream, &recording_path)
+        .expect("Failed to create Deribit recording stream");
+    println!("Deribit: Recording to {}", recording_path);
+
+    let router = MarketRouter::new(stream, strategies);
+    router.run().await;
+}
+
+/// Internal helper for running Polymarket in live-all mode.
+async fn run_exchange_polymarket(timestamp: &str) {
+    println!("Polymarket: Starting...");
+
+    let btc_100k_token =
+        "21742633143463906290569050155826241533067272736897614950488156847949938836455".to_string();
+
+    let exec = polymarket::PolymarketExec::new("dummy_key".into())
+        .await
+        .shared();
+
+    let gamma_scalp = GammaScalp::with_threshold(
+        "GammaScalp-Polymarket",
+        vec![btc_100k_token],
+        exec.clone(),
+        0.3,
+    );
+
+    let strategies: Vec<Arc<dyn Strategy>> = vec![gamma_scalp];
+    let all_tokens = MarketRouter::<polymarket::PolymarketStream>::aggregate_subscriptions(&strategies);
+
+    let stream = polymarket::PolymarketStream::new(all_tokens).await;
+    let recording_path = format!("recordings/polymarket_{}.jsonl", timestamp);
+    let stream = backtest::RecordingStream::new(stream, &recording_path)
+        .expect("Failed to create Polymarket recording stream");
+    println!("Polymarket: Recording to {}", recording_path);
+
+    let router = MarketRouter::new(stream, strategies);
+    router.run().await;
+}
+
+/// Internal helper for running Derive in live-all mode.
+async fn run_exchange_derive(timestamp: &str) {
+    println!("Derive: Starting...");
+
+    let api_key = std::env::var("DERIVE_KEY").unwrap_or_else(|_| "dummy_key".to_string());
+    let exec = derive::DeriveExec::new(api_key).await.shared();
+
+    let gamma_scalp = GammaScalp::new(
+        "GammaScalp-Derive",
+        vec!["BTC-20251226-100000-C".to_string()],
+        exec.clone(),
+    );
+
+    let strategies: Vec<Arc<dyn Strategy>> = vec![gamma_scalp];
+    let all_instruments = MarketRouter::<derive::DeriveStream>::aggregate_subscriptions(&strategies);
+
+    let stream = derive::DeriveStream::new(all_instruments).await;
+    let recording_path = format!("recordings/derive_{}.jsonl", timestamp);
+    let stream = backtest::RecordingStream::new(stream, &recording_path)
+        .expect("Failed to create Derive recording stream");
+    println!("Derive: Recording to {}", recording_path);
+
     let router = MarketRouter::new(stream, strategies);
     router.run().await;
 }
