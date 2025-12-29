@@ -54,7 +54,8 @@ async fn main() {
     }
 }
 
-/// Helper function to start the dashboard server in the background
+/// Helper function to start the dashboard server in the background.
+/// Returns a function that blocks until Ctrl+C (for use after backtest completes).
 fn start_dashboard(strategies: Vec<Arc<dyn Strategy>>, port: u16) {
     let dashboard = DashboardServer::new(strategies, port);
     tokio::spawn(async move {
@@ -63,6 +64,15 @@ fn start_dashboard(strategies: Vec<Arc<dyn Strategy>>, port: u16) {
         }
     });
     println!("Dashboard available at http://localhost:{}", port);
+}
+
+/// Waits for Ctrl+C, keeping the dashboard alive after backtest completes.
+async fn wait_for_shutdown() {
+    println!("Dashboard still running. Press Ctrl+C to exit.");
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to listen for Ctrl+C");
+    println!("\nShutting down...");
 }
 
 /// Runs multiple strategies on Deribit using a single WebSocket connection.
@@ -225,6 +235,11 @@ async fn run_backtest(dashboard_port: Option<u16>) {
 
     println!("\nBacktest complete!");
     // In a real implementation, you would analyze exec.get_fills() here
+
+    // Keep dashboard alive after backtest completes
+    if dashboard_port.is_some() {
+        wait_for_shutdown().await;
+    }
 }
 
 /// Runs a backtest using historical data from a JSONL file.
@@ -279,4 +294,9 @@ async fn run_historical_backtest(file_path: &str, realtime: bool, speed: f64, da
     router.run().await;
 
     println!("\nHistorical backtest complete!");
+
+    // Keep dashboard alive after backtest completes
+    if dashboard_port.is_some() {
+        wait_for_shutdown().await;
+    }
 }
