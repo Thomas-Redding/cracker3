@@ -1,3 +1,5 @@
+// src/main.rs
+
 use clap::Parser;
 use std::sync::Arc;
 use trading_bot::connectors::{backtest, deribit, polymarket};
@@ -10,6 +12,18 @@ use trading_bot::traits::Strategy;
 struct Args {
     #[arg(long)]
     mode: String,
+
+    /// Path to historical data file (JSONL format) for historical-backtest mode
+    #[arg(long)]
+    file: Option<String>,
+
+    /// Enable realtime playback simulation for historical-backtest mode
+    #[arg(long, default_value = "false")]
+    realtime: bool,
+
+    /// Speed multiplier for realtime playback (e.g., 2.0 = 2x speed)
+    #[arg(long, default_value = "1.0")]
+    speed: f64,
 }
 
 #[tokio::main]
@@ -27,7 +41,11 @@ async fn main() {
         "backtest" => {
             run_backtest().await;
         }
-        _ => println!("Unknown mode. Use: live-deribit, live-poly, or backtest"),
+        "historical-backtest" => {
+            let file_path = args.file.expect("--file is required for historical-backtest mode");
+            run_historical_backtest(&file_path, args.realtime, args.speed).await;
+        }
+        _ => println!("Unknown mode. Use: live-deribit, live-poly, backtest, or historical-backtest"),
     }
 }
 
@@ -176,4 +194,53 @@ async fn run_backtest() {
 
     println!("\nBacktest complete!");
     // In a real implementation, you would analyze exec.get_fills() here
+}
+
+/// Runs a backtest using historical data from a JSONL file.
+async fn run_historical_backtest(file_path: &str, realtime: bool, speed: f64) {
+    println!("Starting Historical Backtest from file: {}", file_path);
+
+    // 1. Create playback configuration
+    let config = if realtime {
+        println!("Realtime playback enabled at {}x speed", speed);
+        backtest::PlaybackConfig::realtime(speed)
+    } else {
+        backtest::PlaybackConfig::instant()
+    };
+
+    // 2. Create the historical stream
+    let stream = match backtest::HistoricalStream::with_config(file_path, config) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to open historical data file '{}': {}", file_path, e);
+            return;
+        }
+    };
+
+    // 3. Create shared mock execution client
+    let exec = backtest::MockExec::new().shared();
+
+    // 4. Create strategies (using same config as regular backtest)
+    // In a production setup, you might want to configure these via CLI or config file
+    let gamma_scalp = GammaScalp::new(
+        "GammaScalp-BTC",
+        vec!["BTC-29MAR24-60000-C".to_string()],
+        exec.clone(),
+    );
+
+    let momentum = MomentumStrategy::new(
+        "Momentum-ETH",
+        vec!["ETH-29MAR24-4000-C".to_string()],
+        exec.clone(),
+        3,
+        0.01,
+    );
+
+    let strategies: Vec<Arc<dyn Strategy>> = vec![gamma_scalp, momentum];
+
+    // 5. Run the backtest
+    let router = MarketRouter::new(stream, strategies);
+    router.run().await;
+
+    println!("\nHistorical backtest complete!");
 }

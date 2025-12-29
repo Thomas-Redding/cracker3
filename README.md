@@ -13,6 +13,12 @@ cargo build
 # Backtest (multiple strategies on mock data)
 cargo run -- --mode backtest
 
+# Historical backtest from JSONL file
+cargo run -- --mode historical-backtest --file data/market_data.jsonl
+
+# Historical backtest with realtime simulation (2x speed)
+cargo run -- --mode historical-backtest --file data/market_data.jsonl --realtime --speed 2.0
+
 # Live trading on Deribit
 DERIBIT_KEY=your_api_key cargo run -- --mode live-deribit
 
@@ -48,6 +54,7 @@ Unit tests cover:
 * **Unified Interface:** Strategies are agnostic to the environment—same code runs in production and backtests.
 * **Async-First:** Built on `Tokio` and `async-trait` for non-blocking I/O.
 * **Exchange Support:** Native integration for Deribit, Derive (options/futures), and Polymarket (prediction markets).
+* **Historical Data:** Record live streams to JSONL files and replay them for backtesting with optional realtime simulation.
 * **Market Discovery:** Search markets by slug, description, or regex patterns via `MarketCatalog` trait.
 * **Shared Execution:** Thread-safe execution clients (`SharedExecutionClient`) allow strategies to share connections.
 * **Type Safety:** Strong typing for Greeks (`delta`, `gamma`) and Order types prevents logic errors.
@@ -63,6 +70,11 @@ graph TD
         DRS[DeriveStream]
         PS[PolymarketStream]
         BS[BacktestStream]
+        HS[HistoricalStream<br/>JSONL file reader]
+    end
+
+    subgraph Recording
+        RS[RecordingStream&lt;S&gt;<br/>Wraps any stream]
     end
 
     subgraph Engine
@@ -86,6 +98,10 @@ graph TD
     DRS -->|MarketEvent| MR
     PS -->|MarketEvent| MR
     BS -->|MarketEvent| MR
+    HS -->|MarketEvent| MR
+    
+    DS -.->|wrap| RS
+    RS -.->|writes to| JSONL[(market_data.jsonl)]
 
     MR -->|on_event| S1
     MR -->|on_event| S2
@@ -103,6 +119,45 @@ graph TD
 2. `MarketRouter` aggregates all subscriptions and creates ONE stream per exchange
 3. Incoming `MarketEvent`s are routed only to strategies that subscribed to that instrument
 4. Strategies share a `SharedExecutionClient` (`Arc<dyn ExecutionClient>`) for thread-safe order placement
+
+## 📼 Historical Data & Recording
+
+The framework supports file-based backtesting using JSONL (JSON Lines) format, where each line is a serialized `MarketEvent`.
+
+### Data Format
+
+```json
+{"timestamp":1700000000,"instrument":"BTC-29MAR24-60000-C","best_bid":100.0,"best_ask":101.0,"delta":0.6}
+{"timestamp":1700000001,"instrument":"ETH-29MAR24-4000-C","best_bid":50.0,"best_ask":51.0,"delta":0.3}
+{"timestamp":1700000002,"instrument":"BTC-29MAR24-60000-C","best_bid":102.0,"best_ask":103.0,"delta":0.7}
+```
+
+### Recording Live Data
+
+Use `RecordingStream` to capture live market data for future backtests:
+
+```rust
+use trading_bot::connectors::backtest::RecordingStream;
+use trading_bot::connectors::deribit::DeribitStream;
+
+// Wrap any live stream to record its events
+let live_stream = DeribitStream::new(instruments).await;
+let recording_stream = RecordingStream::new(live_stream, "recorded_data.jsonl")?;
+
+// Events flow through to your strategies AND get saved to disk
+let router = MarketRouter::new(recording_stream, strategies);
+router.run().await;
+```
+
+### Playback Options
+
+| Flag | Description |
+|------|-------------|
+| `--file <path>` | Path to JSONL data file (required) |
+| `--realtime` | Sleep between events based on timestamp deltas |
+| `--speed <float>` | Playback speed multiplier (default: 1.0) |
+
+Realtime playback is useful for testing strategies that depend on wall-clock time or rate limiting.
 
 ## 📁 Project Structure
 
@@ -124,7 +179,7 @@ src/
     ├── deribit.rs       # Deribit WebSocket + REST
     ├── derive.rs        # Derive (Lyra) WebSocket + REST
     ├── polymarket.rs    # Polymarket CLOB WebSocket
-    └── backtest.rs      # Mock stream/exec for backtesting
+    └── backtest.rs      # BacktestStream, HistoricalStream, RecordingStream, MockExec
 ```
 
 ## 🔌 Adding a New Strategy
