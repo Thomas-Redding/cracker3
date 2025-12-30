@@ -47,6 +47,12 @@ impl MarketStream for DeribitStream {
             best_bid: raw.best_bid_price,
             best_ask: raw.best_ask_price,
             delta: raw.greeks.and_then(|g| g.delta),
+            // Pass through IV data for vol surface calibration
+            mark_iv: raw.mark_iv,
+            bid_iv: raw.bid_iv,
+            ask_iv: raw.ask_iv,
+            // Use underlying_price or index_price
+            underlying_price: raw.underlying_price.or(raw.index_price),
         })
     }
 
@@ -254,6 +260,8 @@ mod tests {
                 mark_iv: Some(65.0),
                 bid_iv: Some(62.0),
                 ask_iv: Some(68.0),
+                underlying_price: Some(95000.0),
+                index_price: None,
             };
 
             DeribitActor::normalize_ivs(&mut data);
@@ -274,6 +282,8 @@ mod tests {
                 mark_iv: None,
                 bid_iv: None,
                 ask_iv: None,
+                underlying_price: None,
+                index_price: None,
             };
 
             DeribitActor::normalize_ivs(&mut data);
@@ -294,6 +304,8 @@ mod tests {
                 mark_iv: Some(50.0),
                 bid_iv: None,
                 ask_iv: Some(55.0),
+                underlying_price: Some(95000.0),
+                index_price: None,
             };
 
             DeribitActor::normalize_ivs(&mut data);
@@ -314,6 +326,8 @@ mod tests {
                 mark_iv: Some(0.0),
                 bid_iv: Some(0.0),
                 ask_iv: Some(0.0),
+                underlying_price: None,
+                index_price: None,
             };
 
             DeribitActor::normalize_ivs(&mut data);

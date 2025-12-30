@@ -73,6 +73,11 @@ impl MarketStream for DeriveStream {
             best_bid: raw.best_bid_price,
             best_ask: raw.best_ask_price,
             delta,
+            // Derive ticker data may include IV - pass through if available
+            mark_iv: raw.mark_iv,
+            bid_iv: None,  // Not in Derive data
+            ask_iv: None,
+            underlying_price: raw.underlying_price,
         })
     }
 

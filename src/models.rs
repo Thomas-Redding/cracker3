@@ -104,7 +104,12 @@ pub struct MarketEvent {
     pub best_bid: Option<f64>,
     pub best_ask: Option<f64>,
     pub delta: Option<f64>,
-    // Add other fields as needed
+    /// Implied volatility fields (Deribit options)
+    pub mark_iv: Option<f64>,
+    pub bid_iv: Option<f64>,
+    pub ask_iv: Option<f64>,
+    /// Underlying price (for options, the spot/index price)
+    pub underlying_price: Option<f64>,
 }
 
 // --- Raw Deribit Types (Used for JSON parsing only) ---
@@ -130,6 +135,10 @@ pub struct DeribitTickerData {
     pub mark_iv: Option<f64>,
     pub bid_iv: Option<f64>,
     pub ask_iv: Option<f64>,
+    /// Underlying index price (e.g., BTC-USD index)
+    pub underlying_price: Option<f64>,
+    /// Alternative name for underlying price in some responses
+    pub index_price: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

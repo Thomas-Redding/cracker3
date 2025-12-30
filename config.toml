@@ -1,0 +1,56 @@
+# Trading Bot Configuration - Cross-Market Arbitrage Strategy
+# 
+# This strategy uses Deribit IV as the source of truth and hunts
+# mispricings on Polymarket (binary options) and Derive (vanilla options).
+
+[global]
+# Web dashboard port
+dashboard_port = 8080
+
+# Subscription refresh interval in seconds
+subscription_refresh_secs = 60
+
+# =============================================================================
+# CROSS-MARKET STRATEGY
+# =============================================================================
+
+[[strategies]]
+type = "cross_market"
+name = "CrossMarket-BTC"
+currency = "BTC"
+min_edge = 0.02                # 2% minimum edge to consider
+max_time_to_expiry = 0.5       # 6 months max
+max_expiry_days = 90           # Discovery window for instruments
+initial_wealth = 10000.0       # Bankroll for Kelly sizing ($10k)
+risk_aversion = 1.0            # 1.0 = Kelly, 2.0 = half-Kelly, etc.
+n_scenarios = 10000            # Monte Carlo scenarios
+
+# Regex pattern for auto-discovering Polymarket BTC price markets
+# This matches slugs like "bitcoin-above-100000-on-december-31"
+polymarket_pattern = "bitcoin-above-\\d+"
+
+# Example Polymarket market to track
+# Find real markets at: https://polymarket.com (look for BTC price prediction markets)
+# 
+# To get the condition_id and token_ids:
+# 1. Go to the market page on Polymarket
+# 2. Open browser dev tools (F12)
+# 3. Look for API calls to clob.polymarket.com/markets/...
+# 4. The condition_id and token IDs are in the response
+#
+# [[strategies.polymarket_markets]]
+# condition_id = "0xabcd1234..."          # Condition ID from Polymarket API
+# question = "Will BTC be above $100k on Dec 31, 2025?"
+# strike = 100000.0                        # Strike price in USD
+# expiry_timestamp = 1735689600000         # Unix timestamp in milliseconds
+# yes_token = "12345678901234567890..."    # YES token ID
+# no_token = "98765432109876543210..."     # NO token ID
+
+# You can add multiple markets:
+# [[strategies.polymarket_markets]]
+# condition_id = "0xefgh5678..."
+# question = "Will BTC be above $150k on Dec 31, 2025?"
+# strike = 150000.0
+# expiry_timestamp = 1735689600000
+# yes_token = "..."
+# no_token = "..."

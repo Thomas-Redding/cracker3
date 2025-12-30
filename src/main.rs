@@ -380,6 +380,10 @@ async fn run_demo_mode(args: &Args) {
             best_bid: Some(0.05),
             best_ask: Some(0.055),
             delta: Some(0.6),
+            mark_iv: Some(55.0),  // 55% IV
+            bid_iv: Some(54.0),
+            ask_iv: Some(56.0),
+            underlying_price: Some(95000.0),
         },
         MarketEvent {
             timestamp: 1700000001,
@@ -387,6 +391,10 @@ async fn run_demo_mode(args: &Args) {
             best_bid: Some(0.02),
             best_ask: Some(0.025),
             delta: Some(0.3),
+            mark_iv: Some(60.0),  // 60% IV (OTM options have higher IV)
+            bid_iv: Some(59.0),
+            ask_iv: Some(61.0),
+            underlying_price: Some(95000.0),
         },
         MarketEvent {
             timestamp: 1700000002,
@@ -394,6 +402,10 @@ async fn run_demo_mode(args: &Args) {
             best_bid: Some(0.018),
             best_ask: Some(0.022),
             delta: Some(0.28),
+            mark_iv: None,
+            bid_iv: None,
+            ask_iv: None,
+            underlying_price: Some(95000.0),
         },
         MarketEvent {
             timestamp: 1700000003,
@@ -401,6 +413,10 @@ async fn run_demo_mode(args: &Args) {
             best_bid: Some(0.35),
             best_ask: Some(0.36),
             delta: None,
+            mark_iv: None,
+            bid_iv: None,
+            ask_iv: None,
+            underlying_price: None,
         },
     ];
 

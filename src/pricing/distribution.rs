@@ -217,11 +217,16 @@ impl ExpiryDistribution {
 /// Complete price distribution for all expiries in the surface.
 #[derive(Debug, Clone, Default)]
 pub struct PriceDistribution {
-    /// Distributions indexed by expiry timestamp
+    /// Distributions indexed by expiry timestamp (for PPF lookups)
     distributions: std::collections::BTreeMap<i64, ExpiryDistribution>,
+    /// Spot price from the vol surface
+    spot: f64,
+    /// Creation timestamp
+    now_ms: i64,
     /// Risk-free rate used
-    #[allow(dead_code)]
     rate: f64,
+    /// Cached vol surface data for interpolation: (expiry_ms, time_to_expiry, atm_iv)
+    expiry_data: Vec<(i64, f64, f64)>,
 }
 
 impl PriceDistribution {
@@ -233,14 +238,22 @@ impl PriceDistribution {
     ) -> Self {
         let mut dist = Self {
             distributions: std::collections::BTreeMap::new(),
+            spot: surface.spot(),
+            now_ms,
             rate,
+            expiry_data: Vec::new(),
         };
 
         for expiry in surface.expiries() {
             if let Some(expiry_dist) = ExpiryDistribution::from_vol_surface(surface, expiry, now_ms, rate) {
+                // Cache expiry data for interpolation
+                dist.expiry_data.push((expiry, expiry_dist.time_to_expiry, expiry_dist.atm_iv));
                 dist.distributions.insert(expiry, expiry_dist);
             }
         }
+
+        // Sort expiry data by time
+        dist.expiry_data.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
         dist
     }
@@ -250,14 +263,74 @@ impl PriceDistribution {
         self.distributions.get(&expiry_timestamp)
     }
 
-    /// Gets the probability that S > strike at a given expiry.
+    /// Interpolates IV for a given time to expiry using total variance method.
+    /// This is calendar-arbitrage-free interpolation.
+    fn interpolate_iv(&self, time_to_expiry: f64) -> Option<f64> {
+        if self.expiry_data.is_empty() || time_to_expiry <= 0.0 {
+            return None;
+        }
+
+        // Find bracketing expiries
+        let mut before: Option<(f64, f64)> = None; // (T, σ)
+        let mut after: Option<(f64, f64)> = None;
+
+        for &(_exp, t, iv) in &self.expiry_data {
+            if t <= time_to_expiry {
+                before = Some((t, iv));
+            } else if after.is_none() {
+                after = Some((t, iv));
+            }
+        }
+
+        match (before, after) {
+            // Interpolate using total variance: Var = σ² × T
+            (Some((t1, iv1)), Some((t2, iv2))) => {
+                let var1 = iv1 * iv1 * t1;
+                let var2 = iv2 * iv2 * t2;
+                let w = (time_to_expiry - t1) / (t2 - t1);
+                let var_interp = var1 + w * (var2 - var1);
+                Some((var_interp / time_to_expiry).sqrt())
+            }
+            // Extrapolate flat (use nearest)
+            (Some((_, iv)), None) => Some(iv),
+            (None, Some((_, iv))) => Some(iv),
+            (None, None) => None,
+        }
+    }
+
+    /// Gets the probability that S > strike at a given expiry using interpolated IV.
+    /// This properly handles expiries that don't match Deribit expiries exactly.
     pub fn probability_above(&self, strike: f64, expiry_timestamp: i64) -> Option<f64> {
-        self.distributions.get(&expiry_timestamp).map(|d| d.probability_above(strike))
+        // First try exact match (fast path for Deribit expiries)
+        if let Some(d) = self.distributions.get(&expiry_timestamp) {
+            return Some(d.probability_above(strike));
+        }
+        
+        // Interpolate for non-standard expiries (e.g., Polymarket)
+        self.probability_above_interpolated(strike, expiry_timestamp)
+    }
+
+    /// Computes P(S > K) using interpolated IV and Black-Scholes.
+    pub fn probability_above_interpolated(&self, strike: f64, expiry_timestamp: i64) -> Option<f64> {
+        let time_to_expiry = (expiry_timestamp - self.now_ms) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0);
+        
+        if time_to_expiry <= 0.0 || self.spot <= 0.0 || strike <= 0.0 {
+            return None;
+        }
+
+        let iv = self.interpolate_iv(time_to_expiry)?;
+        
+        // P(S > K) = N(d2) where d2 = (ln(S/K) + (r - 0.5σ²)T) / (σ√T)
+        let sqrt_t = time_to_expiry.sqrt();
+        let d2 = ((self.spot / strike).ln() + (self.rate - 0.5 * iv * iv) * time_to_expiry) 
+                 / (iv * sqrt_t);
+        
+        Some(norm_cdf(d2))
     }
 
     /// Gets the probability that S < strike at a given expiry.
     pub fn probability_below(&self, strike: f64, expiry_timestamp: i64) -> Option<f64> {
-        self.distributions.get(&expiry_timestamp).map(|d| d.probability_below(strike))
+        self.probability_above(strike, expiry_timestamp).map(|p| 1.0 - p)
     }
 
     /// Gets the PPF value at a given percentile and expiry.

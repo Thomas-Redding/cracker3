@@ -36,6 +36,17 @@ struct PolymarketDiscovery {
     no_token: String,
 }
 
+/// Stats for debugging opportunity scanning.
+#[derive(Default)]
+struct ScanStats {
+    polymarket_scanned: usize,
+    derive_scanned: usize,
+    invalid_prices: usize,
+    no_model_prob: usize,
+    below_edge_threshold: usize,
+    opportunities_found: usize,
+}
+
 /// Configuration for the cross-market strategy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrossMarketConfig {
@@ -565,11 +576,68 @@ impl CrossMarketStrategy {
             self.config.rate,
         ));
 
-        debug!(
-            "CrossMarket: Updated vol surface with {} expiries, {} total points",
+        // Log vol surface update with ATM IV for debugging
+        let atm_ivs: Vec<(i64, f64)> = state.vol_surface.expiries()
+            .iter()
+            .filter_map(|&exp| {
+                state.vol_surface.get_smile(exp)
+                    .and_then(|s| s.atm_iv().map(|iv| (exp, iv)))
+            })
+            .collect();
+        
+        println!(
+            "VOL SURFACE: spot=${:.0}, {} expiries, {} iv_points",
+            state.vol_surface.spot(),
             state.vol_surface.num_expiries(),
             state.vol_surface.total_points()
         );
+        
+        // Print ATM IVs for each expiry to verify they're reasonable (should be ~0.5-0.8)
+        for (exp, iv) in &atm_ivs {
+            let date = chrono::DateTime::from_timestamp_millis(*exp)
+                .map(|dt| dt.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "?".to_string());
+            println!("  Expiry {}: ATM IV = {:.4} ({:.1}%)", date, iv, iv * 100.0);
+        }
+        
+        // Sample a few strikes to verify the distribution
+        if let Some(ref dist) = state.distribution {
+            let spot = state.vol_surface.spot();
+            let expiries = dist.expiries();
+            
+            println!("DISTRIBUTION: {} expiries available", expiries.len());
+            
+            if spot > 0.0 && !expiries.is_empty() {
+                // Use the first actual expiry
+                let sample_expiry = expiries[0];
+                let expiry_date = chrono::DateTime::from_timestamp_millis(sample_expiry)
+                    .map(|dt| dt.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                
+                // Sample probabilities at various strikes relative to spot
+                let strikes = vec![
+                    spot * 0.9,  // 10% below
+                    spot * 0.95, // 5% below
+                    spot,        // ATM
+                    spot * 1.05, // 5% above
+                    spot * 1.1,  // 10% above
+                ];
+                
+                // Show price range of the distribution grid
+                if let Some(exp_dist) = dist.get(sample_expiry) {
+                    let (min_price, max_price) = exp_dist.price_range();
+                    println!("DISTRIBUTION (expiry {}): grid ${:.0} - ${:.0}, ATM IV={:.4}", 
+                        expiry_date, min_price, max_price, exp_dist.atm_iv);
+                } else {
+                    println!("DISTRIBUTION SAMPLE (expiry {}):", expiry_date);
+                }
+                
+                for strike in strikes {
+                    let prob = dist.probability_above(strike, sample_expiry);
+                    println!("  P(S > ${:.0}) = {:?}", strike, prob);
+                }
+            }
+        }
     }
 
     /// Scans for opportunities across all markets.
@@ -577,15 +645,67 @@ impl CrossMarketStrategy {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut state = self.state.write().await;
 
+        // Diagnostic: Log vol surface state
+        let spot = state.vol_surface.spot();
+        let num_expiries = state.vol_surface.num_expiries();
+        let total_points = state.vol_surface.total_points();
+        
+        if total_points == 0 {
+            debug!("SCAN: No IV data yet, skipping opportunity scan");
+            return;
+        }
+        
+        debug!("SCAN: Vol surface - spot=${:.0}, expiries={}, iv_points={}", 
+            spot, num_expiries, total_points);
+
         let distribution = match &state.distribution {
             Some(d) => d,
-            None => return,
+            None => {
+                debug!("SCAN: No price distribution built yet");
+                return;
+            }
         };
 
         let mut opportunities = Vec::new();
+        let mut scan_stats = ScanStats::default();
 
         // Scan Polymarket binary options
         for market in state.polymarket_markets.values() {
+            scan_stats.polymarket_scanned += 1;
+            
+            // Get model probability for diagnostics
+            let model_prob = distribution.probability_above(market.strike, market.expiry_timestamp);
+            let time_to_expiry = (market.expiry_timestamp - now_ms) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0);
+            
+            // Log every market for debugging
+            debug!("SCAN PM: {} strike=${:.0} expiry={:.3}y | YES={:.2} NO={:.2} | model_prob={:?}",
+                market.question.chars().take(40).collect::<String>(),
+                market.strike,
+                time_to_expiry,
+                market.yes_price,
+                market.no_price,
+                model_prob
+            );
+            
+            // Check for potential issues
+            if market.yes_price <= 0.0 || market.yes_price >= 1.0 {
+                scan_stats.invalid_prices += 1;
+                debug!("  -> SKIP: Invalid YES price {}", market.yes_price);
+                continue;
+            }
+            if model_prob.is_none() {
+                scan_stats.no_model_prob += 1;
+                debug!("  -> SKIP: No model probability for strike ${:.0}", market.strike);
+                continue;
+            }
+            
+            let prob = model_prob.unwrap();
+            let yes_edge = (prob - market.yes_price) / market.yes_price;
+            let no_edge = ((1.0 - prob) - market.no_price) / market.no_price;
+            
+            debug!("  -> model_prob={:.2} | yes_edge={:.1}% no_edge={:.1}%",
+                prob, yes_edge * 100.0, no_edge * 100.0);
+            
             let opps = self.scanner.scan_binary_option(
                 &market.condition_id,
                 &market.question,
@@ -600,11 +720,19 @@ impl CrossMarketStrategy {
                 Some(&market.yes_token_id),
                 Some(&market.no_token_id),
             );
+            
+            if !opps.is_empty() {
+                scan_stats.opportunities_found += opps.len();
+                debug!("  -> FOUND {} opportunities!", opps.len());
+            }
+            
             opportunities.extend(opps);
         }
 
         // Scan Derive vanilla options
         for ticker in state.derive_tickers.values() {
+            scan_stats.derive_scanned += 1;
+            
             let option_type = if ticker.instrument_name.ends_with("-C") {
                 OptionType::Call
             } else if ticker.instrument_name.ends_with("-P") {
@@ -629,9 +757,34 @@ impl CrossMarketStrategy {
                 &state.vol_surface,
                 now_ms,
             );
+            
+            if !opps.is_empty() {
+                scan_stats.opportunities_found += opps.len();
+            }
+            
             opportunities.extend(opps);
         }
 
+        // Log scan summary
+        println!("SCAN SUMMARY: PM={} Derive={} | invalid_price={} no_model={} | opportunities={}",
+            scan_stats.polymarket_scanned,
+            scan_stats.derive_scanned,
+            scan_stats.invalid_prices,
+            scan_stats.no_model_prob,
+            scan_stats.opportunities_found
+        );
+        
+        // Log the actual opportunities found
+        for opp in &opportunities {
+            println!("  OPPORTUNITY: {} | edge={:.1}% | fair={:.3} vs market={:.3} | {}",
+                opp.exchange,
+                opp.edge * 100.0,
+                opp.fair_value,
+                opp.market_price,
+                opp.description
+            );
+        }
+        
         state.opportunities = opportunities;
     }
 
@@ -659,6 +812,23 @@ impl CrossMarketStrategy {
 
     /// Performs a full recalculation cycle.
     async fn recalculate(&self) {
+        println!("\n=== RECALCULATE CYCLE ===");
+        
+        // Log current Polymarket prices before recalc
+        {
+            let state = self.state.read().await;
+            println!("Polymarket markets with prices:");
+            for market in state.polymarket_markets.values() {
+                println!("  - {} @ ${:.0}: YES={:.3} NO={:.3} (sum={:.3})",
+                    market.question.chars().take(50).collect::<String>(),
+                    market.strike,
+                    market.yes_price,
+                    market.no_price,
+                    market.yes_price + market.no_price
+                );
+            }
+        }
+        
         self.update_vol_surface().await;
         self.scan_opportunities().await;
         self.optimize_portfolio().await;
@@ -693,15 +863,14 @@ impl CrossMarketStrategy {
             None => return,
         };
 
-        // This is a simplified handler - in production we'd parse the full ticker
-        // from a more detailed data structure
+        // Create snapshot with IV data from the event
         let snapshot = DeribitTickerSnapshot {
             instrument_name: instrument_name.to_string(),
             timestamp: event.timestamp,
-            underlying_price: None, // Would come from ticker data
-            mark_iv: None,          // Would come from ticker data
-            bid_iv: None,
-            ask_iv: None,
+            underlying_price: event.underlying_price,
+            mark_iv: event.mark_iv,
+            bid_iv: event.bid_iv,
+            ask_iv: event.ask_iv,
             strike: Some(strike),
             expiry_timestamp,
             best_bid: event.best_bid,
@@ -974,17 +1143,43 @@ impl Strategy for CrossMarketStrategy {
             }
             Instrument::Polymarket(token_id) => {
                 // Update Polymarket prices
+                // NOTE: For BUYING opportunities, we care about the ASK (what we'd pay)
+                // For SELLING opportunities, we care about the BID (what we'd receive)
                 let mut state = self.state.write().await;
+                let mut found = false;
+                
                 for market in state.polymarket_markets.values_mut() {
                     if &market.yes_token_id == token_id {
+                        found = true;
+                        // Use ask for buy opportunities (we pay the ask)
+                        if let Some(ask) = event.best_ask {
+                            market.yes_price = ask;
+                            println!("PM UPDATE YES: {} @ ${:.0} -> {:.3}", 
+                                market.question.chars().take(40).collect::<String>(),
+                                market.strike, ask);
+                        }
                         if let Some(bid) = event.best_bid {
-                            market.yes_price = bid;
+                            market.yes_liquidity = bid * 100.0;
                         }
                     } else if &market.no_token_id == token_id {
+                        found = true;
+                        if let Some(ask) = event.best_ask {
+                            market.no_price = ask;
+                            println!("PM UPDATE NO: {} @ ${:.0} -> {:.3}",
+                                market.question.chars().take(40).collect::<String>(),
+                                market.strike, ask);
+                        }
                         if let Some(bid) = event.best_bid {
-                            market.no_price = bid;
+                            market.no_liquidity = bid * 100.0;
                         }
                     }
+                }
+                
+                if !found {
+                    // Token not found - might be subscribed to wrong tokens
+                    println!("PM UNMATCHED token: {} bid={:?} ask={:?}", 
+                        token_id.chars().take(20).collect::<String>(),
+                        event.best_bid, event.best_ask);
                 }
             }
         }
@@ -1320,13 +1515,17 @@ mod tests {
             state.deribit_subscriptions.insert("BTC-27DEC24-100000-C".to_string());
         }
 
-        // Simulate a Deribit market event
+        // Simulate a Deribit market event with IV data
         let event = MarketEvent {
             timestamp: chrono::Utc::now().timestamp_millis(),
             instrument: Instrument::Deribit("BTC-27DEC24-100000-C".to_string()),
             best_bid: Some(0.05),
             best_ask: Some(0.055),
             delta: Some(0.45),
+            mark_iv: Some(55.0),
+            bid_iv: Some(54.0),
+            ask_iv: Some(56.0),
+            underlying_price: Some(95000.0),
         };
 
         strategy.on_event(event).await;
