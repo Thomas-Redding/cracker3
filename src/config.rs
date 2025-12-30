@@ -340,21 +340,29 @@ fn build_cross_market(
         });
     }).join().expect("Failed to initialize subscriptions");
 
-    // Register Polymarket markets
-    let rt = tokio::runtime::Handle::current();
-    for market in &config.polymarket_markets {
+    // Register Polymarket markets from config (blocking to ensure registration
+    // completes before the strategy starts receiving events)
+    if !config.polymarket_markets.is_empty() {
         let strategy_clone = strategy.clone();
-        let market_clone = market.clone();
-        rt.spawn(async move {
-            strategy_clone.register_polymarket_market(
-                &market_clone.condition_id,
-                &market_clone.question,
-                market_clone.strike,
-                market_clone.expiry_timestamp,
-                &market_clone.yes_token,
-                &market_clone.no_token,
-            ).await;
-        });
+        let markets = config.polymarket_markets.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime");
+            rt.block_on(async {
+                for market in &markets {
+                    strategy_clone.register_polymarket_market(
+                        &market.condition_id,
+                        &market.question,
+                        market.strike,
+                        market.expiry_timestamp,
+                        &market.yes_token,
+                        &market.no_token,
+                    ).await;
+                }
+            });
+        }).join().expect("Failed to register Polymarket markets");
     }
 
     strategy
