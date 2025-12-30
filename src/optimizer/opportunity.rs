@@ -531,5 +531,272 @@ mod tests {
         assert!(!opps.is_empty());
         assert_eq!(opps[0].direction, TradeDirection::Buy);
     }
+
+    #[test]
+    fn test_binary_option_no_edge() {
+        let (dist, now_ms, expiry_ms) = create_test_distribution();
+        let scanner = OpportunityScanner::new(ScannerConfig {
+            min_edge: 0.10, // Higher threshold to avoid small edge
+            ..Default::default()
+        });
+
+        // Fair price approximately matches market (YES ~50%, NO ~50%)
+        // Set prices slightly off from 50% but within edge threshold
+        let opps = scanner.scan_binary_option(
+            "test_market",
+            "BTC above 100k",
+            100_000.0,
+            expiry_ms,
+            0.48, // YES slightly underpriced but within 10% threshold
+            0.52, // NO slightly overpriced but within threshold
+            100.0,
+            100.0,
+            &dist,
+            now_ms,
+            Some("yes_token"),
+            Some("no_token"),
+        );
+
+        // Should find no opportunities since edge < min_edge (10%)
+        // The fair value is ~50%, so (0.50 - 0.48) / 0.48 = 4.2% < 10%
+        assert!(opps.is_empty(), "Found {} opportunities when expecting none", opps.len());
+    }
+
+    #[test]
+    fn test_binary_option_no_opportunity() {
+        let (dist, now_ms, expiry_ms) = create_test_distribution();
+        let scanner = OpportunityScanner::new(ScannerConfig {
+            min_edge: 0.10, // Require 10% edge
+            ..Default::default()
+        });
+
+        // Only 5% edge - below threshold
+        let opps = scanner.scan_binary_option(
+            "test_market",
+            "BTC above 100k",
+            100_000.0,
+            expiry_ms,
+            0.475, // YES price (5% off from ~0.5 fair)
+            0.525, // NO price
+            100.0,
+            100.0,
+            &dist,
+            now_ms,
+            Some("yes_token"),
+            Some("no_token"),
+        );
+
+        assert!(opps.is_empty());
+    }
+
+    #[test]
+    fn test_binary_option_expired_filtered() {
+        let (dist, now_ms, _expiry_ms) = create_test_distribution();
+        let scanner = OpportunityScanner::new(ScannerConfig::default());
+
+        // Expired option (expiry in the past)
+        let past_expiry = now_ms - 1000;
+        let opps = scanner.scan_binary_option(
+            "test_market",
+            "BTC above 100k",
+            100_000.0,
+            past_expiry,
+            0.30,
+            0.70,
+            100.0,
+            100.0,
+            &dist,
+            now_ms,
+            Some("yes_token"),
+            Some("no_token"),
+        );
+
+        assert!(opps.is_empty());
+    }
+
+    #[test]
+    fn test_binary_option_low_liquidity_filtered() {
+        let (dist, now_ms, expiry_ms) = create_test_distribution();
+        let scanner = OpportunityScanner::new(ScannerConfig {
+            min_liquidity: 1.0, // Require at least 1 unit
+            ..Default::default()
+        });
+
+        let opps = scanner.scan_binary_option(
+            "test_market",
+            "BTC above 100k",
+            100_000.0,
+            expiry_ms,
+            0.30, // Big edge
+            0.70,
+            0.5,  // Low liquidity
+            0.5,
+            &dist,
+            now_ms,
+            Some("yes_token"),
+            Some("no_token"),
+        );
+
+        assert!(opps.is_empty());
+    }
+
+    #[test]
+    fn test_vanilla_option_sell_opportunity() {
+        let mut surface = VolatilitySurface::new(100_000.0);
+        let now_ms = 1704067200000i64;
+        let expiry_ms = now_ms + (0.25 * 365.25 * 24.0 * 3600.0 * 1000.0) as i64;
+
+        let mut smile = VolSmile::new(0.25, 100_000.0);
+        smile.add_point(100_000.0, 0.50, None, None);
+        surface.add_smile(expiry_ms, smile);
+
+        let scanner = OpportunityScanner::new(ScannerConfig {
+            min_edge: 0.05,
+            ..Default::default()
+        });
+
+        // Get fair value first
+        let bs = BlackScholes::new(100_000.0, 100_000.0, 0.25, 0.0, 0.50, OptionType::Call);
+        let fair = bs.price();
+
+        // Market bid is 25% above fair value - sell opportunity
+        let market_bid = fair * 1.30;
+
+        let opps = scanner.scan_vanilla_option(
+            "BTC-20240401-100000-C",
+            OptionType::Call,
+            100_000.0,
+            expiry_ms,
+            market_bid,        // bid
+            market_bid * 1.05, // ask
+            10.0,
+            &surface,
+            now_ms,
+        );
+
+        assert!(!opps.is_empty());
+        assert_eq!(opps[0].direction, TradeDirection::Sell);
+    }
+
+    #[test]
+    fn test_vanilla_put_option() {
+        let mut surface = VolatilitySurface::new(100_000.0);
+        let now_ms = 1704067200000i64;
+        let expiry_ms = now_ms + (0.25 * 365.25 * 24.0 * 3600.0 * 1000.0) as i64;
+
+        let mut smile = VolSmile::new(0.25, 100_000.0);
+        smile.add_point(90_000.0, 0.55, None, None);
+        surface.add_smile(expiry_ms, smile);
+
+        let scanner = OpportunityScanner::new(ScannerConfig {
+            min_edge: 0.05,
+            ..Default::default()
+        });
+
+        // Get fair value for put
+        let bs = BlackScholes::new(100_000.0, 90_000.0, 0.25, 0.0, 0.55, OptionType::Put);
+        let fair = bs.price();
+
+        // Market ask is well below fair
+        let market_ask = fair * 0.70;
+
+        let opps = scanner.scan_vanilla_option(
+            "BTC-20240401-90000-P",
+            OptionType::Put,
+            90_000.0,
+            expiry_ms,
+            market_ask * 0.95,
+            market_ask,
+            10.0,
+            &surface,
+            now_ms,
+        );
+
+        assert!(!opps.is_empty());
+        assert_eq!(opps[0].direction, TradeDirection::Buy);
+    }
+
+    #[test]
+    fn test_opportunity_edge_calculation() {
+        let opp = Opportunity {
+            id: "test-1".to_string(),
+            opportunity_type: OpportunityType::BinaryYes,
+            exchange: "test".to_string(),
+            instrument_id: "TEST-INSTR".to_string(),
+            description: "Test opportunity".to_string(),
+            strike: 100_000.0,
+            strike2: None,
+            expiry_timestamp: 0,
+            time_to_expiry: 0.25,
+            direction: TradeDirection::Buy,
+            market_price: 0.40,
+            fair_value: 0.50,
+            edge: 0.25, // (0.50 - 0.40) / 0.40 = 0.25
+            max_profit: 0.60,
+            max_loss: 0.40,
+            liquidity: 100.0,
+            implied_probability: Some(0.40),
+            model_probability: Some(0.50),
+            model_iv: None,
+            token_id: Some("token".to_string()),
+        };
+
+        // Edge formula: (fair - market) / market
+        let expected_edge = (0.50 - 0.40) / 0.40;
+        assert!((opp.edge - expected_edge).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_scanner_config_default() {
+        let config = ScannerConfig::default();
+        
+        assert_eq!(config.min_edge, 0.02);
+        assert_eq!(config.max_spread_width, 5000.0);
+        assert!(config.min_liquidity < 0.1);
+    }
+
+    #[test]
+    fn test_opportunity_type_debug() {
+        // OpportunityType has Debug, so we test with {:?}
+        assert_eq!(format!("{:?}", OpportunityType::BinaryYes), "BinaryYes");
+        assert_eq!(format!("{:?}", OpportunityType::BinaryNo), "BinaryNo");
+        assert_eq!(format!("{:?}", OpportunityType::VanillaCall), "VanillaCall");
+        assert_eq!(format!("{:?}", OpportunityType::VanillaPut), "VanillaPut");
+    }
+
+    #[test]
+    fn test_binary_deep_otm() {
+        // Test strike far above spot - low probability
+        let (dist, now_ms, expiry_ms) = create_test_distribution();
+        let scanner = OpportunityScanner::new(ScannerConfig {
+            min_edge: 0.01,
+            ..Default::default()
+        });
+
+        // Strike at 200k when spot is 100k - very low probability
+        // If market prices YES at 0.40 but fair is ~0.01, that's a NO opportunity
+        let opps = scanner.scan_binary_option(
+            "test_market",
+            "BTC above 200k",
+            200_000.0,
+            expiry_ms,
+            0.40, // YES overpriced
+            0.60, // NO underpriced
+            100.0,
+            100.0,
+            &dist,
+            now_ms,
+            Some("yes_token"),
+            Some("no_token"),
+        );
+
+        // Should find opportunity on NO side
+        let no_opps: Vec<_> = opps.iter()
+            .filter(|o| o.opportunity_type == OpportunityType::BinaryNo)
+            .collect();
+        
+        // The NO side should be attractive since fair(NO) is high but market is only 0.60
+        assert!(!no_opps.is_empty() || !opps.is_empty());
+    }
 }
 

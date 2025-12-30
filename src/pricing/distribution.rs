@@ -444,5 +444,105 @@ mod tests {
             prev_price = price;
         }
     }
+
+    #[test]
+    fn test_probability_interpolated_between_expiries() {
+        let mut surface = VolatilitySurface::new(100_000.0);
+        let now_ms = 1704067200000i64;
+        
+        // Near expiry: 30 days, IV=50%
+        let near_expiry = now_ms + 30 * 24 * 3600 * 1000;
+        let mut near_smile = VolSmile::new(30.0 / 365.25, 100_000.0);
+        near_smile.add_point(100_000.0, 0.50, None, None);
+        surface.add_smile(near_expiry, near_smile);
+
+        // Far expiry: 90 days, IV=45%
+        let far_expiry = now_ms + 90 * 24 * 3600 * 1000;
+        let mut far_smile = VolSmile::new(90.0 / 365.25, 100_000.0);
+        far_smile.add_point(100_000.0, 0.45, None, None);
+        surface.add_smile(far_expiry, far_smile);
+
+        let dist = PriceDistribution::from_vol_surface(&surface, now_ms, 0.0);
+
+        // Query for an expiry in between (60 days)
+        let target_expiry = now_ms + 60 * 24 * 3600 * 1000;
+        let prob = dist.probability_above(100_000.0, target_expiry);
+        
+        // Should be able to interpolate
+        assert!(prob.is_some());
+        // ATM should still be ~50%
+        assert!((prob.unwrap() - 0.5).abs() < 0.15, "ATM prob: {}", prob.unwrap());
+    }
+
+    #[test]
+    fn test_probability_deep_itm_and_otm() {
+        let mut surface = VolatilitySurface::new(100_000.0);
+        let now_ms = 1704067200000i64;
+        let expiry_ms = now_ms + (0.25 * 365.25 * 24.0 * 3600.0 * 1000.0) as i64;
+
+        let mut smile = VolSmile::new(0.25, 100_000.0);
+        smile.add_point(100_000.0, 0.50, None, None);
+        surface.add_smile(expiry_ms, smile);
+
+        let dist = PriceDistribution::from_vol_surface(&surface, now_ms, 0.0);
+
+        // Deep ITM (strike way below spot) - high probability of being above
+        let prob_deep_itm = dist.probability_above(50_000.0, expiry_ms).unwrap();
+        assert!(prob_deep_itm > 0.95, "Deep ITM prob: {}", prob_deep_itm);
+
+        // Deep OTM (strike way above spot) - low probability of being above
+        let prob_deep_otm = dist.probability_above(200_000.0, expiry_ms).unwrap();
+        assert!(prob_deep_otm < 0.05, "Deep OTM prob: {}", prob_deep_otm);
+    }
+
+    #[test]
+    fn test_price_range() {
+        let mut surface = VolatilitySurface::new(100_000.0);
+        let now_ms = 1704067200000i64;
+        let expiry_ms = now_ms + (0.5 * 365.25 * 24.0 * 3600.0 * 1000.0) as i64;
+
+        let mut smile = VolSmile::new(0.5, 100_000.0);
+        smile.add_point(100_000.0, 0.50, None, None);
+        surface.add_smile(expiry_ms, smile);
+
+        let dist = PriceDistribution::from_vol_surface(&surface, now_ms, 0.0);
+        let expiry_dist = dist.get(expiry_ms).unwrap();
+
+        let (min_price, max_price) = expiry_dist.price_range();
+        
+        // Grid should be centered around spot with reasonable range
+        assert!(min_price < 100_000.0);
+        assert!(max_price > 100_000.0);
+        // For 50% IV, 6-month, ±4σ should give roughly 40k-250k range
+        assert!(min_price > 20_000.0 && min_price < 80_000.0);
+        assert!(max_price > 120_000.0 && max_price < 500_000.0);
+    }
+
+    #[test]
+    fn test_num_expiries() {
+        let mut surface = VolatilitySurface::new(100_000.0);
+        let now_ms = 1704067200000i64;
+
+        for i in 1..=5 {
+            let expiry_ms = now_ms + (i as i64 * 30 * 24 * 3600 * 1000);
+            let mut smile = VolSmile::new(i as f64 * 30.0 / 365.25, 100_000.0);
+            smile.add_point(100_000.0, 0.50, None, None);
+            surface.add_smile(expiry_ms, smile);
+        }
+
+        let dist = PriceDistribution::from_vol_surface(&surface, now_ms, 0.0);
+        assert_eq!(dist.num_expiries(), 5);
+        assert_eq!(dist.expiries().len(), 5);
+    }
+
+    #[test]
+    fn test_empty_surface_gives_empty_distribution() {
+        let surface = VolatilitySurface::new(100_000.0);
+        let now_ms = 1704067200000i64;
+
+        let dist = PriceDistribution::from_vol_surface(&surface, now_ms, 0.0);
+        assert_eq!(dist.num_expiries(), 0);
+        assert!(dist.probability_above(100_000.0, now_ms + 1000000).is_none());
+    }
 }
 

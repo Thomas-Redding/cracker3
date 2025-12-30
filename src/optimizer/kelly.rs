@@ -613,5 +613,251 @@ mod tests {
         // Should have a position since there's positive edge
         assert!(result.positions.len() > 0 || result.expected_return >= 0.0);
     }
+
+    #[test]
+    fn test_config_default() {
+        let config = KellyConfig::default();
+        
+        assert_eq!(config.n_scenarios, 10_000);
+        assert_eq!(config.initial_wealth, 10_000.0);
+        assert!(config.max_position_fraction > 0.0 && config.max_position_fraction <= 1.0);
+        assert!(config.tolerance > 0.0);
+    }
+
+    #[test]
+    fn test_utility_function_log_monotonic() {
+        let log = UtilityFunction::Log;
+        
+        // Utility should be monotonically increasing
+        let mut prev_util = f64::NEG_INFINITY;
+        for w in [0.1, 1.0, 10.0, 100.0, 1000.0] {
+            let util = log.utility(w);
+            assert!(util > prev_util, "Log utility not monotonic at w={}", w);
+            prev_util = util;
+        }
+    }
+
+    #[test]
+    fn test_utility_function_crra_monotonic() {
+        for gamma in [0.5, 1.5, 2.0, 3.0] {
+            let crra = UtilityFunction::CRRA { gamma };
+            
+            let mut prev_util = f64::NEG_INFINITY;
+            for w in [0.1, 1.0, 10.0, 100.0, 1000.0] {
+                let util = crra.utility(w);
+                assert!(util > prev_util, "CRRA(γ={}) not monotonic at w={}", gamma, w);
+                prev_util = util;
+            }
+        }
+    }
+
+    #[test]
+    fn test_utility_function_concave() {
+        // Utility should be concave (diminishing marginal utility)
+        let log = UtilityFunction::Log;
+        
+        // u(2W) - u(W) < u(W) - u(0.5W) for concave functions
+        let w = 100.0;
+        let gain_high = log.utility(2.0 * w) - log.utility(w);
+        let gain_low = log.utility(w) - log.utility(0.5 * w);
+        
+        assert!(gain_low > gain_high, "Log utility not concave");
+    }
+
+    #[test]
+    fn test_compute_pnl_binary_no() {
+        let expiry_ts = 1704067200000i64 + 90 * 24 * 3600 * 1000;
+        let opp = Opportunity {
+            id: "test-no".to_string(),
+            opportunity_type: OpportunityType::BinaryNo,
+            exchange: "test".to_string(),
+            instrument_id: "test".to_string(),
+            description: "Test NO".to_string(),
+            strike: 100_000.0,
+            strike2: None,
+            expiry_timestamp: expiry_ts,
+            time_to_expiry: 0.25,
+            direction: TradeDirection::Buy,
+            market_price: 0.50,
+            fair_value: 0.60,
+            edge: 0.20,
+            max_profit: 0.50,
+            max_loss: 0.50,
+            liquidity: 100.0,
+            implied_probability: Some(0.50),
+            model_probability: Some(0.60),
+            model_iv: None,
+            token_id: Some("token".to_string()),
+        };
+        
+        let optimizer = KellyOptimizer::default();
+
+        // For BinaryNo: wins if price < strike
+        // Winning scenario (price < strike)
+        let win_scenario = Scenario {
+            prices: [(opp.expiry_timestamp, 90_000.0)].into_iter().collect(),
+        };
+        let win_pnl = optimizer.compute_pnl(&opp, &win_scenario);
+        assert!((win_pnl - 0.50).abs() < 1e-10); // 1 - 0.50
+
+        // Losing scenario (price > strike)
+        let lose_scenario = Scenario {
+            prices: [(opp.expiry_timestamp, 110_000.0)].into_iter().collect(),
+        };
+        let lose_pnl = optimizer.compute_pnl(&opp, &lose_scenario);
+        assert!((lose_pnl - (-0.50)).abs() < 1e-10); // -cost
+    }
+
+    #[test]
+    fn test_compute_pnl_vanilla_call() {
+        let expiry_ts = 1704067200000i64 + 90 * 24 * 3600 * 1000;
+        let opp = Opportunity {
+            id: "test-call".to_string(),
+            opportunity_type: OpportunityType::VanillaCall,
+            exchange: "derive".to_string(),
+            instrument_id: "BTC-CALL-100K".to_string(),
+            description: "Test call".to_string(),
+            strike: 100_000.0,
+            strike2: None,
+            expiry_timestamp: expiry_ts,
+            time_to_expiry: 0.25,
+            direction: TradeDirection::Buy,
+            market_price: 4000.0,
+            fair_value: 5000.0,
+            edge: 0.25,
+            max_profit: f64::MAX,
+            max_loss: 4000.0,
+            liquidity: 10.0,
+            implied_probability: None,
+            model_probability: None,
+            model_iv: Some(0.50),
+            token_id: None,
+        };
+        
+        let optimizer = KellyOptimizer::default();
+
+        // ITM scenario (price > strike)
+        let itm_scenario = Scenario {
+            prices: [(opp.expiry_timestamp, 120_000.0)].into_iter().collect(),
+        };
+        let itm_pnl = optimizer.compute_pnl(&opp, &itm_scenario);
+        // Payoff = max(0, 120k - 100k) - premium = 20k - 4k = 16k
+        assert!((itm_pnl - 16000.0).abs() < 1e-6);
+
+        // OTM scenario (price < strike)
+        let otm_scenario = Scenario {
+            prices: [(opp.expiry_timestamp, 90_000.0)].into_iter().collect(),
+        };
+        let otm_pnl = optimizer.compute_pnl(&opp, &otm_scenario);
+        // Payoff = max(0, 90k - 100k) - premium = 0 - 4k = -4k
+        assert!((otm_pnl - (-4000.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_compute_pnl_vanilla_put() {
+        let expiry_ts = 1704067200000i64 + 90 * 24 * 3600 * 1000;
+        let opp = Opportunity {
+            id: "test-put".to_string(),
+            opportunity_type: OpportunityType::VanillaPut,
+            exchange: "derive".to_string(),
+            instrument_id: "BTC-PUT-100K".to_string(),
+            description: "Test put".to_string(),
+            strike: 100_000.0,
+            strike2: None,
+            expiry_timestamp: expiry_ts,
+            time_to_expiry: 0.25,
+            direction: TradeDirection::Buy,
+            market_price: 4000.0,
+            fair_value: 5000.0,
+            edge: 0.25,
+            max_profit: 100_000.0,
+            max_loss: 4000.0,
+            liquidity: 10.0,
+            implied_probability: None,
+            model_probability: None,
+            model_iv: Some(0.50),
+            token_id: None,
+        };
+        
+        let optimizer = KellyOptimizer::default();
+
+        // ITM scenario (price < strike)
+        let itm_scenario = Scenario {
+            prices: [(opp.expiry_timestamp, 80_000.0)].into_iter().collect(),
+        };
+        let itm_pnl = optimizer.compute_pnl(&opp, &itm_scenario);
+        // Payoff = max(0, 100k - 80k) - premium = 20k - 4k = 16k
+        assert!((itm_pnl - 16000.0).abs() < 1e-6);
+
+        // OTM scenario (price > strike)
+        let otm_scenario = Scenario {
+            prices: [(opp.expiry_timestamp, 120_000.0)].into_iter().collect(),
+        };
+        let otm_pnl = optimizer.compute_pnl(&opp, &otm_scenario);
+        // Payoff = max(0, 100k - 120k) - premium = 0 - 4k = -4k
+        assert!((otm_pnl - (-4000.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_capital_required_binary() {
+        let opp = create_test_opportunity();
+        // Binary option capital = market price per contract
+        assert!((opp.capital_required() - 0.40).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_capital_required_vanilla() {
+        let opp = Opportunity {
+            id: "test-cap".to_string(),
+            opportunity_type: OpportunityType::VanillaCall,
+            exchange: "derive".to_string(),
+            instrument_id: "BTC-CALL".to_string(),
+            description: "Test capital".to_string(),
+            strike: 100_000.0,
+            strike2: None,
+            expiry_timestamp: 0,
+            time_to_expiry: 0.25,
+            direction: TradeDirection::Buy,
+            market_price: 4000.0,
+            fair_value: 5000.0,
+            edge: 0.25,
+            max_profit: f64::MAX,
+            max_loss: 4000.0,
+            liquidity: 10.0,
+            implied_probability: None,
+            model_probability: None,
+            model_iv: Some(0.50),
+            token_id: None,
+        };
+        // Vanilla option capital = premium (market price)
+        assert!((opp.capital_required() - 4000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_optimization_result_structure() {
+        let config = KellyConfig::default();
+        let optimizer = KellyOptimizer::new(config);
+        
+        use crate::pricing::vol_surface::{VolSmile, VolatilitySurface};
+        use crate::pricing::distribution::PriceDistribution;
+        
+        let opp = create_test_opportunity();
+        let mut surface = VolatilitySurface::new(100_000.0);
+        let now_ms = 1704067200000i64;
+        
+        let mut smile = VolSmile::new(0.25, 100_000.0);
+        smile.add_point(100_000.0, 0.50, None, None);
+        surface.add_smile(opp.expiry_timestamp, smile);
+        
+        let dist = PriceDistribution::from_vol_surface(&surface, now_ms, 0.0);
+        let result = optimizer.optimize(&[opp], &dist, now_ms);
+        
+        // Result should have valid fields
+        assert!(result.expected_return.is_finite());
+        assert!(result.expected_sharpe.is_finite());
+        assert!(result.expected_utility.is_finite());
+        assert!(result.prob_loss.is_finite() && result.prob_loss >= 0.0 && result.prob_loss <= 1.0);
+        assert!(result.max_drawdown.is_finite() && result.max_drawdown >= 0.0);
+    }
 }
 

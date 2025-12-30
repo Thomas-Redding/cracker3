@@ -423,6 +423,7 @@ pub fn parse_deribit_expiry(expiry_str: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Datelike;
 
     #[test]
     fn test_smile_interpolation() {
@@ -493,6 +494,190 @@ mod tests {
         let expected_ts = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(expected, chrono::Utc)
             .timestamp_millis();
         assert_eq!(ts.unwrap(), expected_ts);
+    }
+
+    #[test]
+    fn test_parse_deribit_expiry_all_months() {
+        // Test all month abbreviations
+        let months = [
+            ("15JAN25", 1), ("15FEB25", 2), ("15MAR25", 3), ("15APR25", 4),
+            ("15MAY25", 5), ("15JUN25", 6), ("15JUL25", 7), ("15AUG25", 8),
+            ("15SEP25", 9), ("15OCT25", 10), ("15NOV25", 11), ("15DEC25", 12),
+        ];
+        for (s, expected_month) in months {
+            let ts = parse_deribit_expiry(s);
+            assert!(ts.is_some(), "Failed to parse: {}", s);
+            let dt = chrono::DateTime::from_timestamp_millis(ts.unwrap()).unwrap();
+            assert_eq!(dt.month(), expected_month, "Wrong month for {}", s);
+        }
+    }
+
+    #[test]
+    fn test_parse_deribit_expiry_invalid() {
+        assert!(parse_deribit_expiry("").is_none());
+        assert!(parse_deribit_expiry("29XXX24").is_none());
+        assert!(parse_deribit_expiry("ABCDEF").is_none());
+        assert!(parse_deribit_expiry("29MAR").is_none()); // Too short
+    }
+
+    #[test]
+    fn test_from_deribit_tickers_basic() {
+        let now_ms = 1704067200000i64; // Jan 1, 2024
+        let expiry_ms = now_ms + 30 * 24 * 3600 * 1000; // 30 days out
+
+        let tickers = vec![
+            DeribitTickerInput {
+                instrument_name: "BTC-31JAN24-90000-C".to_string(),
+                strike: Some(90_000.0),
+                expiry_timestamp: expiry_ms,
+                underlying_price: Some(95_000.0),
+                mark_iv: Some(0.55),
+                bid_iv: Some(0.54),
+                ask_iv: Some(0.56),
+            },
+            DeribitTickerInput {
+                instrument_name: "BTC-31JAN24-100000-C".to_string(),
+                strike: Some(100_000.0),
+                expiry_timestamp: expiry_ms,
+                underlying_price: Some(95_000.0),
+                mark_iv: Some(0.50),
+                bid_iv: None,
+                ask_iv: None,
+            },
+        ];
+
+        let surface = VolatilitySurface::from_deribit_tickers(&tickers, now_ms);
+
+        assert_eq!(surface.num_expiries(), 1);
+        assert_eq!(surface.total_points(), 2);
+        assert!((surface.spot() - 95_000.0).abs() < 1.0);
+
+        // Check IV at 90k strike
+        let iv = surface.get_iv(90_000.0, expiry_ms);
+        assert!(iv.is_some());
+        assert!((iv.unwrap() - 0.55).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_from_deribit_tickers_filters_invalid_iv() {
+        let now_ms = 1704067200000i64;
+        let expiry_ms = now_ms + 30 * 24 * 3600 * 1000;
+
+        let tickers = vec![
+            DeribitTickerInput {
+                instrument_name: "BTC-31JAN24-90000-C".to_string(),
+                strike: Some(90_000.0),
+                expiry_timestamp: expiry_ms,
+                underlying_price: Some(95_000.0),
+                mark_iv: Some(0.0), // Invalid: zero IV
+                bid_iv: None,
+                ask_iv: None,
+            },
+            DeribitTickerInput {
+                instrument_name: "BTC-31JAN24-100000-C".to_string(),
+                strike: Some(100_000.0),
+                expiry_timestamp: expiry_ms,
+                underlying_price: Some(95_000.0),
+                mark_iv: Some(6.0), // Invalid: > 500% IV
+                bid_iv: None,
+                ask_iv: None,
+            },
+            DeribitTickerInput {
+                instrument_name: "BTC-31JAN24-110000-C".to_string(),
+                strike: Some(110_000.0),
+                expiry_timestamp: expiry_ms,
+                underlying_price: Some(95_000.0),
+                mark_iv: Some(0.45), // Valid
+                bid_iv: None,
+                ask_iv: None,
+            },
+        ];
+
+        let surface = VolatilitySurface::from_deribit_tickers(&tickers, now_ms);
+        
+        // Only the valid IV should be included
+        assert_eq!(surface.total_points(), 1);
+    }
+
+    #[test]
+    fn test_from_deribit_tickers_uses_bid_ask_mid() {
+        let now_ms = 1704067200000i64;
+        let expiry_ms = now_ms + 30 * 24 * 3600 * 1000;
+
+        let tickers = vec![
+            DeribitTickerInput {
+                instrument_name: "BTC-31JAN24-90000-C".to_string(),
+                strike: Some(90_000.0),
+                expiry_timestamp: expiry_ms,
+                underlying_price: Some(95_000.0),
+                mark_iv: None, // No mark IV
+                bid_iv: Some(0.50),
+                ask_iv: Some(0.60),
+            },
+        ];
+
+        let surface = VolatilitySurface::from_deribit_tickers(&tickers, now_ms);
+        
+        // Should use mid of bid/ask = 0.55
+        let iv = surface.get_iv(90_000.0, expiry_ms);
+        assert!(iv.is_some());
+        assert!((iv.unwrap() - 0.55).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_surface_multiple_expiries() {
+        let now_ms = 1704067200000i64;
+        let expiry1 = now_ms + 30 * 24 * 3600 * 1000; // 30 days
+        let expiry2 = now_ms + 60 * 24 * 3600 * 1000; // 60 days
+
+        let tickers = vec![
+            DeribitTickerInput {
+                instrument_name: "BTC-31JAN24-90000-C".to_string(),
+                strike: Some(90_000.0),
+                expiry_timestamp: expiry1,
+                underlying_price: Some(95_000.0),
+                mark_iv: Some(0.50),
+                bid_iv: None,
+                ask_iv: None,
+            },
+            DeribitTickerInput {
+                instrument_name: "BTC-01MAR24-90000-C".to_string(),
+                strike: Some(90_000.0),
+                expiry_timestamp: expiry2,
+                underlying_price: Some(95_000.0),
+                mark_iv: Some(0.45),
+                bid_iv: None,
+                ask_iv: None,
+            },
+        ];
+
+        let surface = VolatilitySurface::from_deribit_tickers(&tickers, now_ms);
+
+        assert_eq!(surface.num_expiries(), 2);
+        
+        // Check IVs at each expiry
+        assert!((surface.get_iv(90_000.0, expiry1).unwrap() - 0.50).abs() < 0.01);
+        assert!((surface.get_iv(90_000.0, expiry2).unwrap() - 0.45).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_atm_iv() {
+        let mut smile = VolSmile::new(0.5, 100_000.0);
+        smile.add_point(90_000.0, 0.55, None, None);
+        smile.add_point(100_000.0, 0.50, None, None);  // ATM
+        smile.add_point(110_000.0, 0.52, None, None);
+
+        let atm = smile.atm_iv();
+        assert!(atm.is_some());
+        assert!((atm.unwrap() - 0.50).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_smile_empty() {
+        let smile = VolSmile::new(0.5, 100_000.0);
+        assert!(smile.get_iv(100_000.0).is_none());
+        assert!(smile.atm_iv().is_none());
+        assert!(smile.is_empty());
     }
 }
 
