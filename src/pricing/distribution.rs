@@ -338,6 +338,32 @@ impl PriceDistribution {
         self.distributions.get(&expiry_timestamp).map(|d| d.ppf(percentile))
     }
 
+    /// Gets the PPF value for a given percentile and time to expiry using interpolation.
+    /// 
+    /// This handles Polymarket expiries that don't match Deribit expiries exactly.
+    /// Uses interpolated IV and lognormal price assumption.
+    pub fn ppf_interpolated(&self, percentile: f64, time_to_expiry: f64) -> Option<f64> {
+        if time_to_expiry <= 0.0 || self.spot <= 0.0 {
+            return None;
+        }
+
+        let iv = self.interpolate_iv(time_to_expiry)?;
+        
+        // For lognormal: S_T = S_0 * exp((r - 0.5σ²)T + σ√T * Z)
+        // where Z = Φ^(-1)(percentile)
+        let z = super::black_scholes::norm_ppf(percentile);
+        let sqrt_t = time_to_expiry.sqrt();
+        let drift = (self.rate - 0.5 * iv * iv) * time_to_expiry;
+        let diffusion = iv * sqrt_t * z;
+        
+        Some(self.spot * (drift + diffusion).exp())
+    }
+
+    /// Returns the spot price used for this distribution.
+    pub fn spot(&self) -> f64 {
+        self.spot
+    }
+
     /// Returns all expiry timestamps with distributions.
     pub fn expiries(&self) -> Vec<i64> {
         self.distributions.keys().copied().collect()

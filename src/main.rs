@@ -373,6 +373,9 @@ async fn run_demo_mode(args: &Args) {
     ).await;
 
     // Create mock market data simulating Deribit options with IV
+    // NOTE: IVs must be in decimal form (0.55 = 55%), not percentage form (55.0),
+    // because DeribitStream normalizes IVs via normalize_ivs() before creating MarketEvents,
+    // and the vol surface filter rejects iv > 5.0 (500%).
     let mock_data = vec![
         MarketEvent {
             timestamp: 1700000000,
@@ -380,9 +383,9 @@ async fn run_demo_mode(args: &Args) {
             best_bid: Some(0.05),
             best_ask: Some(0.055),
             delta: Some(0.6),
-            mark_iv: Some(55.0),  // 55% IV
-            bid_iv: Some(54.0),
-            ask_iv: Some(56.0),
+            mark_iv: Some(0.55),  // 55% IV (decimal form)
+            bid_iv: Some(0.54),
+            ask_iv: Some(0.56),
             underlying_price: Some(95000.0),
         },
         MarketEvent {
@@ -391,9 +394,9 @@ async fn run_demo_mode(args: &Args) {
             best_bid: Some(0.02),
             best_ask: Some(0.025),
             delta: Some(0.3),
-            mark_iv: Some(60.0),  // 60% IV (OTM options have higher IV)
-            bid_iv: Some(59.0),
-            ask_iv: Some(61.0),
+            mark_iv: Some(0.60),  // 60% IV (OTM options have higher IV)
+            bid_iv: Some(0.59),
+            ask_iv: Some(0.61),
             underlying_price: Some(95000.0),
         },
         MarketEvent {

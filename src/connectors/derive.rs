@@ -59,12 +59,16 @@ impl MarketStream for DeriveStream {
         // 1. Receive raw data from actor
         let raw = self.receiver.recv().await?;
 
-        // 2. Extract Greeks from option_pricing or direct fields
-        let delta = raw
-            .option_pricing
-            .as_ref()
-            .and_then(|op| op.delta)
-            .or(raw.delta);
+        // 2. Extract fields from option_pricing (WebSocket format) or direct fields (REST format)
+        // WebSocket data uses nested option_pricing object, REST uses direct fields.
+        // Check option_pricing first, then fall back to direct fields.
+        let op = raw.option_pricing.as_ref();
+        
+        let delta = op.and_then(|o| o.delta).or(raw.delta);
+        let mark_iv = op.and_then(|o| o.mark_iv).or(raw.mark_iv);
+        let bid_iv = op.and_then(|o| o.bid_iv).or(raw.bid_iv);
+        let ask_iv = op.and_then(|o| o.ask_iv).or(raw.ask_iv);
+        let underlying_price = op.and_then(|o| o.underlying_price).or(raw.underlying_price);
 
         // 3. Convert to standardized MarketEvent with typed Instrument
         Some(MarketEvent {
@@ -73,11 +77,10 @@ impl MarketStream for DeriveStream {
             best_bid: raw.best_bid_price,
             best_ask: raw.best_ask_price,
             delta,
-            // Derive ticker data may include IV - pass through if available
-            mark_iv: raw.mark_iv,
-            bid_iv: None,  // Not in Derive data
-            ask_iv: None,
-            underlying_price: raw.underlying_price,
+            mark_iv,
+            bid_iv,
+            ask_iv,
+            underlying_price,
         })
     }
 

@@ -257,13 +257,17 @@ impl KellyOptimizer {
     }
 
     /// Generates Monte Carlo scenarios using Sobol sequences.
+    /// 
+    /// Generates correlated price paths for all opportunity expiries, including
+    /// Polymarket expiries that may not have exact matches in the Deribit-based
+    /// distribution. Uses interpolation for non-matching expiries.
     fn generate_scenarios(
         &self,
         opportunities: &[Opportunity],
         distribution: &PriceDistribution,
-        _now_ms: i64,
+        now_ms: i64,
     ) -> Vec<Scenario> {
-        // Collect unique expiries
+        // Collect unique expiries from opportunities
         let mut expiries: Vec<i64> = opportunities.iter()
             .map(|o| o.expiry_timestamp)
             .collect();
@@ -275,6 +279,21 @@ impl KellyOptimizer {
             return vec![];
         }
 
+        // Pre-compute time to expiry for each opportunity expiry
+        // This handles both Deribit expiries (exact match) and Polymarket (interpolated)
+        let expiry_info: Vec<(i64, f64)> = expiries.iter()
+            .map(|&exp| {
+                // Try exact match first
+                if let Some(dist) = distribution.get(exp) {
+                    (exp, dist.time_to_expiry)
+                } else {
+                    // Compute time to expiry from timestamp
+                    let tte = (exp - now_ms) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0);
+                    (exp, tte.max(0.001))
+                }
+            })
+            .collect();
+
         // Generate Sobol normal samples
         let mut sobol = SobolGenerator::new(n_expiries.min(21));
         let z_samples = sobol.generate_normal(self.config.n_scenarios);
@@ -285,22 +304,16 @@ impl KellyOptimizer {
             let mut prices = HashMap::new();
             let mut cumulative_w = 0.0;
 
-            for (i, &expiry_ts) in expiries.iter().enumerate() {
-                let expiry_dist = match distribution.get(expiry_ts) {
-                    Some(d) => d,
-                    None => continue,
-                };
+            for (i, &(expiry_ts, time_to_expiry)) in expiry_info.iter().enumerate() {
+                if time_to_expiry <= 0.0 {
+                    continue;
+                }
 
-                let time_to_expiry = expiry_dist.time_to_expiry;
-                
                 // Time increment
                 let dt = if i == 0 {
                     time_to_expiry
                 } else {
-                    let prev_tte = distribution.get(expiries[i - 1])
-                        .map(|d| d.time_to_expiry)
-                        .unwrap_or(0.0);
-                    (time_to_expiry - prev_tte).max(0.001)
+                    (time_to_expiry - expiry_info[i - 1].1).max(0.001)
                 };
 
                 // Brownian bridge
@@ -316,8 +329,23 @@ impl KellyOptimizer {
                 };
                 let percentile = norm_cdf(z_marginal);
 
-                // Price from PPF
-                let price = expiry_dist.ppf(percentile);
+                // Price from PPF - try exact match, then use interpolation
+                let price = if let Some(expiry_dist) = distribution.get(expiry_ts) {
+                    expiry_dist.ppf(percentile)
+                } else {
+                    // For non-matching expiries (e.g., Polymarket), use price interpolation
+                    distribution.ppf_interpolated(percentile, time_to_expiry)
+                        .unwrap_or_else(|| {
+                            // Fallback: use spot price with simple lognormal assumption
+                            let spot = distribution.spot();
+                            if spot > 0.0 {
+                                spot * (z_marginal * 0.5 * time_to_expiry.sqrt()).exp()
+                            } else {
+                                0.0
+                            }
+                        })
+                };
+
                 prices.insert(expiry_ts, price);
             }
 
@@ -858,6 +886,105 @@ mod tests {
         assert!(result.expected_utility.is_finite());
         assert!(result.prob_loss.is_finite() && result.prob_loss >= 0.0 && result.prob_loss <= 1.0);
         assert!(result.max_drawdown.is_finite() && result.max_drawdown >= 0.0);
+    }
+
+    #[test]
+    fn test_scenarios_generated_for_nonmatching_expiries() {
+        // This test verifies the fix for the bug where Polymarket expiries
+        // that don't match Deribit expiries would get price=0 in scenarios,
+        // causing BinaryYes to always lose and BinaryNo to always win.
+        
+        use crate::pricing::vol_surface::{VolSmile, VolatilitySurface};
+        use crate::pricing::distribution::PriceDistribution;
+        
+        let now_ms = 1704067200000i64;
+        
+        // Create a vol surface with Deribit expiries (30 and 90 days)
+        let mut surface = VolatilitySurface::new(100_000.0);
+        
+        let deribit_expiry_30d = now_ms + 30 * 24 * 3600 * 1000;
+        let mut smile_30d = VolSmile::new(30.0 / 365.25, 100_000.0);
+        smile_30d.add_point(100_000.0, 0.50, None, None);
+        surface.add_smile(deribit_expiry_30d, smile_30d);
+        
+        let deribit_expiry_90d = now_ms + 90 * 24 * 3600 * 1000;
+        let mut smile_90d = VolSmile::new(90.0 / 365.25, 100_000.0);
+        smile_90d.add_point(100_000.0, 0.45, None, None);
+        surface.add_smile(deribit_expiry_90d, smile_90d);
+        
+        let dist = PriceDistribution::from_vol_surface(&surface, now_ms, 0.0);
+        
+        // Create a Polymarket opportunity with 45-day expiry (NOT matching Deribit)
+        let polymarket_expiry = now_ms + 45 * 24 * 3600 * 1000;
+        let opp = Opportunity {
+            id: "pm-test".to_string(),
+            opportunity_type: OpportunityType::BinaryYes,
+            exchange: "polymarket".to_string(),
+            instrument_id: "btc-above-100k".to_string(),
+            description: "BTC above 100k".to_string(),
+            strike: 100_000.0,
+            strike2: None,
+            expiry_timestamp: polymarket_expiry, // 45 days - doesn't match 30 or 90
+            time_to_expiry: 45.0 / 365.25,
+            direction: TradeDirection::Buy,
+            market_price: 0.40,
+            fair_value: 0.50,
+            edge: 0.25,
+            max_profit: 0.60,
+            max_loss: 0.40,
+            liquidity: 100.0,
+            implied_probability: Some(0.40),
+            model_probability: Some(0.50),
+            model_iv: None,
+            token_id: None,
+        };
+        
+        let config = KellyConfig {
+            n_scenarios: 100,
+            ..Default::default()
+        };
+        let optimizer = KellyOptimizer::new(config);
+        
+        // Generate scenarios
+        let scenarios = optimizer.generate_scenarios(&[opp.clone()], &dist, now_ms);
+        
+        // All scenarios should have a price for the Polymarket expiry
+        assert!(!scenarios.is_empty(), "No scenarios generated");
+        
+        for (i, scenario) in scenarios.iter().enumerate() {
+            let price = scenario.prices.get(&polymarket_expiry);
+            assert!(
+                price.is_some(),
+                "Scenario {} missing price for Polymarket expiry", i
+            );
+            
+            let price = *price.unwrap();
+            // Price should be reasonable (not 0, not negative, near spot)
+            assert!(
+                price > 10_000.0 && price < 1_000_000.0,
+                "Scenario {} has unreasonable price: ${}", i, price
+            );
+        }
+        
+        // Compute P&L for some scenarios - should have variety (not all same outcome)
+        let mut wins = 0;
+        let mut losses = 0;
+        for scenario in &scenarios {
+            let pnl = optimizer.compute_pnl(&opp, scenario);
+            if pnl > 0.0 {
+                wins += 1;
+            } else {
+                losses += 1;
+            }
+        }
+        
+        // With ATM strike, should have roughly balanced wins/losses, not all losses
+        // (The bug would cause all losses for BinaryYes since price=0 < strike)
+        assert!(
+            wins > 10 && losses > 10,
+            "P&L outcomes not balanced: {} wins, {} losses (bug would cause 0 wins)",
+            wins, losses
+        );
     }
 }
 
