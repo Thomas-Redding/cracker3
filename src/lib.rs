@@ -24,3 +24,9 @@ pub mod dashboard;
 
 // 8. Configuration (The "Setup")
 pub mod config;
+
+// 9. Pricing Models (The "Math")
+pub mod pricing;
+
+// 10. Position Optimizer (The "Optimizer")
+pub mod optimizer;
