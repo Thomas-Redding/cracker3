@@ -4,7 +4,8 @@
 // Supports TOML config files that specify strategies and their parameters.
 
 use crate::models::{Exchange, Instrument};
-use crate::strategy::{GammaScalp, MomentumStrategy};
+use crate::optimizer::KellyConfig;
+use crate::strategy::{CrossMarketConfig, CrossMarketStrategy, GammaScalp, MomentumStrategy};
 use crate::traits::{SharedExecutionRouter, Strategy};
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -44,6 +45,7 @@ pub struct GlobalConfig {
 pub enum StrategyConfig {
     GammaScalp(GammaScalpConfig),
     Momentum(MomentumConfig),
+    CrossMarket(CrossMarketConfigFile),
 }
 
 /// Configuration for GammaScalp strategy.
@@ -97,6 +99,78 @@ fn default_momentum_threshold() -> f64 {
     0.01
 }
 
+/// Configuration for CrossMarket strategy (from file).
+#[derive(Debug, Deserialize)]
+pub struct CrossMarketConfigFile {
+    /// Unique name for this strategy instance
+    pub name: String,
+    /// Underlying currency (e.g., "BTC")
+    #[serde(default = "default_currency")]
+    pub currency: String,
+    /// Minimum edge threshold for opportunities
+    #[serde(default = "default_min_edge")]
+    pub min_edge: f64,
+    /// Maximum time to expiry in years
+    #[serde(default = "default_max_time_to_expiry")]
+    pub max_time_to_expiry: f64,
+    /// Maximum expiry days for instrument discovery (default: 90)
+    pub max_expiry_days: Option<u32>,
+    /// Regex pattern for discovering Polymarket markets (default: "bitcoin-above-\\d+")
+    #[serde(default = "default_polymarket_pattern")]
+    pub polymarket_pattern: String,
+    /// Initial wealth/bankroll for Kelly sizing
+    #[serde(default = "default_initial_wealth")]
+    pub initial_wealth: f64,
+    /// Risk aversion parameter (1 = Kelly, >1 = more conservative)
+    #[serde(default = "default_risk_aversion")]
+    pub risk_aversion: f64,
+    /// Number of Monte Carlo scenarios
+    #[serde(default = "default_n_scenarios")]
+    pub n_scenarios: usize,
+    /// Polymarket markets to track (list of {condition_id, question, strike, expiry_timestamp, yes_token, no_token})
+    #[serde(default)]
+    pub polymarket_markets: Vec<PolymarketMarketConfig>,
+}
+
+/// Configuration for a Polymarket market to track.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PolymarketMarketConfig {
+    pub condition_id: String,
+    pub question: String,
+    pub strike: f64,
+    pub expiry_timestamp: i64,
+    pub yes_token: String,
+    pub no_token: String,
+}
+
+fn default_currency() -> String {
+    "BTC".to_string()
+}
+
+fn default_min_edge() -> f64 {
+    0.02
+}
+
+fn default_polymarket_pattern() -> String {
+    r"bitcoin-above-\d+".to_string()
+}
+
+fn default_max_time_to_expiry() -> f64 {
+    0.5
+}
+
+fn default_initial_wealth() -> f64 {
+    10000.0
+}
+
+fn default_risk_aversion() -> f64 {
+    1.0
+}
+
+fn default_n_scenarios() -> usize {
+    10000
+}
+
 // =============================================================================
 // Configuration Loading
 // =============================================================================
@@ -125,6 +199,12 @@ impl Config {
                 StrategyConfig::Momentum(cfg) => {
                     exchanges.extend(parse_exchanges(&cfg.exchanges));
                 }
+                StrategyConfig::CrossMarket(_) => {
+                    // CrossMarket always requires all three exchanges
+                    exchanges.insert(Exchange::Deribit);
+                    exchanges.insert(Exchange::Derive);
+                    exchanges.insert(Exchange::Polymarket);
+                }
             }
         }
         exchanges
@@ -140,6 +220,7 @@ impl Config {
             .filter_map(|cfg| match cfg {
                 StrategyConfig::GammaScalp(c) => Some(build_gamma_scalp(c, exec_router.clone())),
                 StrategyConfig::Momentum(c) => Some(build_momentum(c, exec_router.clone())),
+                StrategyConfig::CrossMarket(c) => Some(build_cross_market(c, exec_router.clone())),
             })
             .collect()
     }
@@ -209,6 +290,84 @@ fn build_momentum(
     )
 }
 
+fn build_cross_market(
+    config: &CrossMarketConfigFile,
+    exec_router: SharedExecutionRouter,
+) -> Arc<dyn Strategy> {
+    use crate::optimizer::{ScannerConfig, UtilityFunction};
+
+    let kelly_config = KellyConfig {
+        utility: if (config.risk_aversion - 1.0).abs() < 0.01 {
+            UtilityFunction::Log
+        } else {
+            UtilityFunction::CRRA { gamma: config.risk_aversion }
+        },
+        n_scenarios: config.n_scenarios,
+        initial_wealth: config.initial_wealth,
+        ..Default::default()
+    };
+
+    let scanner_config = ScannerConfig {
+        min_edge: config.min_edge,
+        max_time_to_expiry: config.max_time_to_expiry,
+        ..Default::default()
+    };
+
+    let cross_market_config = CrossMarketConfig {
+        currency: config.currency.clone(),
+        min_edge: config.min_edge,
+        max_time_to_expiry: config.max_time_to_expiry,
+        max_expiry_days: config.max_expiry_days.unwrap_or(90),
+        rate: 0.0,
+        kelly_config,
+        scanner_config,
+        polymarket_pattern: config.polymarket_pattern.clone(),
+        recalc_interval_secs: 60,
+    };
+
+    let max_expiry_days = cross_market_config.max_expiry_days;
+    let strategy = CrossMarketStrategy::new(&config.name, cross_market_config, exec_router);
+
+    // Initialize subscriptions from exchange APIs (blocking)
+    let strategy_clone = strategy.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
+        rt.block_on(async {
+            strategy_clone.initialize_subscriptions(max_expiry_days).await;
+        });
+    }).join().expect("Failed to initialize subscriptions");
+
+    // Register Polymarket markets from config (blocking to ensure registration
+    // completes before the strategy starts receiving events)
+    if !config.polymarket_markets.is_empty() {
+        let strategy_clone = strategy.clone();
+        let markets = config.polymarket_markets.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime");
+            rt.block_on(async {
+                for market in &markets {
+                    strategy_clone.register_polymarket_market(
+                        &market.condition_id,
+                        &market.question,
+                        market.strike,
+                        market.expiry_timestamp,
+                        &market.yes_token,
+                        &market.no_token,
+                    ).await;
+                }
+            });
+        }).join().expect("Failed to register Polymarket markets");
+    }
+
+    strategy
+}
+
 // =============================================================================
 // Default Configuration
 // =============================================================================
@@ -227,38 +386,50 @@ dashboard_port = 8080
 # Subscription refresh interval in seconds
 subscription_refresh_secs = 60
 
-# Strategies to run
-[[strategies]]
-type = "gamma_scalp"
-name = "GammaScalp-BTC"
-exchanges = ["deribit"]
-instruments = ["BTC-29MAR24-60000-C", "BTC-29MAR24-70000-C"]
-threshold = 0.5
+# =============================================================================
+# CROSS-MARKET STRATEGY (Recommended for BTC options arbitrage)
+# Uses Deribit IV as source of truth, hunts mispricings on Polymarket & Derive
+# =============================================================================
 
 [[strategies]]
-type = "momentum"
-name = "Momentum-ETH"
-exchanges = ["deribit"]
-instruments = ["ETH-29MAR24-4000-C"]
-lookback_period = 10
-momentum_threshold = 0.02
+type = "cross_market"
+name = "CrossMarket-BTC"
+currency = "BTC"
+min_edge = 0.02                # 2% minimum edge to consider
+max_time_to_expiry = 0.5       # 6 months max
+initial_wealth = 10000.0       # Bankroll for Kelly sizing
+risk_aversion = 1.0            # 1.0 = Kelly, >1 = more conservative
+n_scenarios = 10000            # Monte Carlo scenarios
 
-# Example: Cross-exchange strategy
+# Polymarket markets to track
+[[strategies.polymarket_markets]]
+condition_id = "0x..."         # Replace with actual condition ID
+question = "Will BTC be above $100k on Dec 31?"
+strike = 100000.0
+expiry_timestamp = 1735689600000  # Dec 31, 2024 00:00 UTC (ms)
+yes_token = "yes_token_id..."
+no_token = "no_token_id..."
+
+# =============================================================================
+# ALTERNATIVE STRATEGIES
+# =============================================================================
+
+# Example: GammaScalp strategy
 # [[strategies]]
 # type = "gamma_scalp"
-# name = "GammaScalp-Derive"
-# exchanges = ["derive"]
-# instruments = ["BTC-20251226-100000-C"]
-# threshold = 0.3
+# name = "GammaScalp-BTC"
+# exchanges = ["deribit"]
+# instruments = ["BTC-29MAR24-60000-C", "BTC-29MAR24-70000-C"]
+# threshold = 0.5
 
-# Example: Polymarket strategy
+# Example: Momentum strategy
 # [[strategies]]
 # type = "momentum"
-# name = "Momentum-Poly"
-# exchanges = ["polymarket"]
-# instruments = ["21742633143463906290569050155826241533067272736897614950488156847949938836455"]
-# lookback_period = 5
-# momentum_threshold = 0.01
+# name = "Momentum-ETH"
+# exchanges = ["deribit"]
+# instruments = ["ETH-29MAR24-4000-C"]
+# lookback_period = 10
+# momentum_threshold = 0.02
 "#
 }
 

@@ -285,6 +285,10 @@ impl PolymarketActor {
                     best_bid: book.get_best_bid(),
                     best_ask: book.get_best_ask(),
                     delta: None, // Poly doesn't give greeks directly
+                    mark_iv: None,
+                    bid_iv: None,
+                    ask_iv: None,
+                    underlying_price: None,
                 };
 
                 let _ = self.tx.send(event).await;

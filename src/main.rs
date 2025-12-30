@@ -12,7 +12,7 @@ use trading_bot::connectors::{backtest, deribit, derive, polymarket};
 use trading_bot::dashboard::DashboardServer;
 use trading_bot::engine::Engine;
 use trading_bot::models::{Exchange, Instrument, MarketEvent};
-use trading_bot::strategy::{GammaScalp, MomentumStrategy};
+use trading_bot::strategy::{CrossMarketStrategy, GammaScalp, MomentumStrategy};
 use trading_bot::traits::{ExecutionRouter, SharedExecutionClient, Strategy};
 
 #[derive(Parser)]
@@ -107,25 +107,36 @@ async fn run_live_mode(args: &Args) {
     println!("Required exchanges: {:?}", required_exchanges);
 
     // Build execution clients for each exchange
+    // API keys are optional for read-only mode (market data streaming)
+    // They're only needed for actual trading
     let mut exec_clients: HashMap<Exchange, SharedExecutionClient> = HashMap::new();
 
     for exchange in &required_exchanges {
         match exchange {
             Exchange::Deribit => {
                 let api_key = std::env::var("DERIBIT_KEY")
-                    .expect("DERIBIT_KEY required for Deribit trading");
+                    .unwrap_or_else(|_| {
+                        println!("Note: DERIBIT_KEY not set - trading disabled, read-only mode");
+                        "read_only".to_string()
+                    });
                 let client = deribit::DeribitExec::new(api_key).await.shared();
                 exec_clients.insert(Exchange::Deribit, client);
             }
             Exchange::Derive => {
                 let api_key = std::env::var("DERIVE_KEY")
-                    .unwrap_or_else(|_| "dummy_key".to_string());
+                    .unwrap_or_else(|_| {
+                        println!("Note: DERIVE_KEY not set - trading disabled, read-only mode");
+                        "read_only".to_string()
+                    });
                 let client = derive::DeriveExec::new(api_key).await.shared();
                 exec_clients.insert(Exchange::Derive, client);
             }
             Exchange::Polymarket => {
                 let api_key = std::env::var("POLYMARKET_KEY")
-                    .unwrap_or_else(|_| "dummy_key".to_string());
+                    .unwrap_or_else(|_| {
+                        println!("Note: POLYMARKET_KEY not set - trading disabled, read-only mode");
+                        "read_only".to_string()
+                    });
                 let client = polymarket::PolymarketExec::new(api_key).await.shared();
                 exec_clients.insert(Exchange::Polymarket, client);
             }
@@ -330,57 +341,102 @@ fn default_backtest_strategies(exec_router: Arc<ExecutionRouter>) -> Vec<Arc<dyn
 async fn run_demo_mode(args: &Args) {
     println!("Starting Demo Mode with mock data...");
 
-    // Create mock data
+    // Create mock execution for all exchanges
+    let mock_exec = backtest::MockExec::new().shared();
+    let mut exec_clients = HashMap::new();
+    exec_clients.insert(Exchange::Deribit, mock_exec.clone());
+    exec_clients.insert(Exchange::Derive, mock_exec.clone());
+    exec_clients.insert(Exchange::Polymarket, mock_exec.clone());
+    let exec_router = Arc::new(ExecutionRouter::new(exec_clients));
+
+    // Create CrossMarket strategy
+    let cross_market = CrossMarketStrategy::with_defaults("CrossMarket-BTC", exec_router.clone());
+
+    // Register a mock Polymarket market
+    let expiry_ms = chrono::Utc::now().timestamp_millis() + (90 * 24 * 3600 * 1000); // 90 days from now
+    cross_market.register_polymarket_market(
+        "demo_condition_123",
+        "Will BTC be above $100k by expiry?",
+        100_000.0,
+        expiry_ms,
+        "demo_yes_token",
+        "demo_no_token",
+    ).await;
+
+    // Update with mock prices (underpriced YES = opportunity)
+    cross_market.update_polymarket_prices(
+        "demo_condition_123",
+        0.35,   // YES price (market thinks 35%)
+        0.65,   // NO price
+        1000.0, // YES liquidity
+        1000.0, // NO liquidity
+    ).await;
+
+    // Create mock market data simulating Deribit options with IV
+    // NOTE: IVs must be in decimal form (0.55 = 55%), not percentage form (55.0),
+    // because DeribitStream normalizes IVs via normalize_ivs() before creating MarketEvents,
+    // and the vol surface filter rejects iv > 5.0 (500%).
     let mock_data = vec![
         MarketEvent {
             timestamp: 1700000000,
             instrument: Instrument::Deribit("BTC-29MAR24-60000-C".to_string()),
-            best_bid: Some(100.0),
-            best_ask: Some(101.0),
+            best_bid: Some(0.05),
+            best_ask: Some(0.055),
             delta: Some(0.6),
+            mark_iv: Some(0.55),  // 55% IV (decimal form)
+            bid_iv: Some(0.54),
+            ask_iv: Some(0.56),
+            underlying_price: Some(95000.0),
         },
         MarketEvent {
             timestamp: 1700000001,
-            instrument: Instrument::Deribit("ETH-29MAR24-4000-C".to_string()),
-            best_bid: Some(50.0),
-            best_ask: Some(51.0),
+            instrument: Instrument::Deribit("BTC-29MAR24-100000-C".to_string()),
+            best_bid: Some(0.02),
+            best_ask: Some(0.025),
             delta: Some(0.3),
+            mark_iv: Some(0.60),  // 60% IV (OTM options have higher IV)
+            bid_iv: Some(0.59),
+            ask_iv: Some(0.61),
+            underlying_price: Some(95000.0),
         },
         MarketEvent {
             timestamp: 1700000002,
-            instrument: Instrument::Deribit("BTC-29MAR24-60000-C".to_string()),
-            best_bid: Some(102.0),
-            best_ask: Some(103.0),
-            delta: Some(0.7),
+            instrument: Instrument::Derive("BTC-20250329-100000-C".to_string()),
+            best_bid: Some(0.018),
+            best_ask: Some(0.022),
+            delta: Some(0.28),
+            mark_iv: None,
+            bid_iv: None,
+            ask_iv: None,
+            underlying_price: Some(95000.0),
         },
         MarketEvent {
             timestamp: 1700000003,
-            instrument: Instrument::Deribit("ETH-29MAR24-4000-C".to_string()),
-            best_bid: Some(52.0),
-            best_ask: Some(53.0),
-            delta: Some(0.35),
+            instrument: Instrument::Polymarket("demo_yes_token".to_string()),
+            best_bid: Some(0.35),
+            best_ask: Some(0.36),
+            delta: None,
+            mark_iv: None,
+            bid_iv: None,
+            ask_iv: None,
+            underlying_price: None,
         },
     ];
 
-    // Create mock execution
-    let mock_exec = backtest::MockExec::new().shared();
-    let mut exec_clients = HashMap::new();
-    exec_clients.insert(Exchange::Deribit, mock_exec);
-    let exec_router = Arc::new(ExecutionRouter::new(exec_clients));
-
-    // Create strategies
+    // Create strategies including the new CrossMarket
     let strategies: Vec<Arc<dyn Strategy>> = vec![
+        cross_market,
         GammaScalp::new(
-        "GammaScalp-BTC",
+            "GammaScalp-BTC",
             vec![Instrument::Deribit("BTC-29MAR24-60000-C".to_string())],
             exec_router.clone(),
         ),
         MomentumStrategy::new(
-        "Momentum-ETH",
+            "Momentum-ETH",
             vec![Instrument::Deribit("ETH-29MAR24-4000-C".to_string())],
             exec_router,
             3,
-        0.01,
+            0.01,
         ),
     ];
 
@@ -394,8 +450,8 @@ async fn run_demo_mode(args: &Args) {
     #[allow(deprecated)]
     {
         use trading_bot::engine::MarketRouter;
-    let router = MarketRouter::new(stream, strategies);
-    router.run().await;
+        let router = MarketRouter::new(stream, strategies);
+        router.run().await;
     }
 
     println!("\nDemo complete!");
