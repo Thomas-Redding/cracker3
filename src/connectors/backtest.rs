@@ -12,24 +12,24 @@ use tokio::sync::Mutex;
 
 // --- 1. The Mock Stream ---
 pub struct BacktestStream {
-    // We use VecDeque to pop events off one by one
-    events: VecDeque<MarketEvent>,
+    // We use VecDeque to pop events off one by one, wrapped for interior mutability
+    events: Mutex<VecDeque<MarketEvent>>,
 }
 
 impl BacktestStream {
     pub fn new(data: Vec<MarketEvent>) -> Self {
         Self {
-            events: VecDeque::from(data),
+            events: Mutex::new(VecDeque::from(data)),
         }
     }
 }
 
 #[async_trait]
 impl MarketStream for BacktestStream {
-    async fn next(&mut self) -> Option<MarketEvent> {
+    async fn next(&self) -> Option<MarketEvent> {
         // Instantly returns the next event from memory.
         // In a complex backtester, you might simulate "time" delays here.
-        self.events.pop_front()
+        self.events.lock().await.pop_front()
     }
 }
 
@@ -68,13 +68,18 @@ impl PlaybackConfig {
     }
 }
 
+/// Internal state for HistoricalStream.
+struct HistoricalStreamState {
+    reader: BufReader<File>,
+    line_buffer: String,
+    last_timestamp: Option<i64>,
+}
+
 /// A MarketStream that reads historical data from a JSONL file.
 /// Each line should be a JSON-serialized MarketEvent.
 pub struct HistoricalStream {
-    reader: BufReader<File>,
-    line_buffer: String,
+    state: Mutex<HistoricalStreamState>,
     playback_config: PlaybackConfig,
-    last_timestamp: Option<i64>,
 }
 
 impl HistoricalStream {
@@ -83,10 +88,12 @@ impl HistoricalStream {
     pub fn new<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let file = File::open(path)?;
         Ok(Self {
-            reader: BufReader::new(file),
-            line_buffer: String::new(),
+            state: Mutex::new(HistoricalStreamState {
+                reader: BufReader::new(file),
+                line_buffer: String::new(),
+                last_timestamp: None,
+            }),
             playback_config: PlaybackConfig::default(),
-            last_timestamp: None,
         })
     }
 
@@ -94,23 +101,28 @@ impl HistoricalStream {
     pub fn with_config<P: AsRef<Path>>(path: P, config: PlaybackConfig) -> std::io::Result<Self> {
         let file = File::open(path)?;
         Ok(Self {
-            reader: BufReader::new(file),
-            line_buffer: String::new(),
+            state: Mutex::new(HistoricalStreamState {
+                reader: BufReader::new(file),
+                line_buffer: String::new(),
+                last_timestamp: None,
+            }),
             playback_config: config,
-            last_timestamp: None,
         })
     }
 }
 
 #[async_trait]
 impl MarketStream for HistoricalStream {
-    async fn next(&mut self) -> Option<MarketEvent> {
+    async fn next(&self) -> Option<MarketEvent> {
+        let mut state = self.state.lock().await;
         loop {
-            self.line_buffer.clear();
-            match self.reader.read_line(&mut self.line_buffer) {
+            state.line_buffer.clear();
+            // Split borrows: get mutable references to reader and line_buffer separately
+            let HistoricalStreamState { ref mut reader, ref mut line_buffer, ref mut last_timestamp } = *state;
+            match reader.read_line(line_buffer) {
                 Ok(0) => return None, // EOF
                 Ok(_) => {
-                    let line = self.line_buffer.trim();
+                    let line = line_buffer.trim();
                     if line.is_empty() {
                         continue; // Skip empty lines
                     }
@@ -118,19 +130,23 @@ impl MarketStream for HistoricalStream {
                         Ok(event) => {
                             // Handle time-aware playback
                             if self.playback_config.realtime {
-                                if let Some(last_ts) = self.last_timestamp {
+                                if let Some(last_ts) = *last_timestamp {
                                     let delta_ms = event.timestamp - last_ts;
                                     if delta_ms > 0 {
                                         let sleep_ms =
                                             (delta_ms as f64 / self.playback_config.speed) as u64;
+                                        // Drop the lock before sleeping to avoid holding it
+                                        drop(state);
                                         tokio::time::sleep(
                                             tokio::time::Duration::from_millis(sleep_ms),
                                         )
                                         .await;
+                                        // Reacquire to update timestamp
+                                        state = self.state.lock().await;
                                     }
                                 }
                             }
-                            self.last_timestamp = Some(event.timestamp);
+                            state.last_timestamp = Some(event.timestamp);
                             return Some(event);
                         }
                         Err(e) => {
@@ -154,7 +170,7 @@ impl MarketStream for HistoricalStream {
 /// Use this to capture live data for future backtesting.
 pub struct RecordingStream<S: MarketStream> {
     inner: S,
-    writer: BufWriter<File>,
+    writer: Mutex<BufWriter<File>>,
 }
 
 impl<S: MarketStream> RecordingStream<S> {
@@ -164,25 +180,26 @@ impl<S: MarketStream> RecordingStream<S> {
         let file = File::create(output_path)?;
         Ok(Self {
             inner,
-            writer: BufWriter::new(file),
+            writer: Mutex::new(BufWriter::new(file)),
         })
     }
 
     /// Flushes any buffered data to disk.
-    pub fn flush(&mut self) -> std::io::Result<()> {
-        self.writer.flush()
+    pub async fn flush(&self) -> std::io::Result<()> {
+        self.writer.lock().await.flush()
     }
 }
 
 #[async_trait]
-impl<S: MarketStream + Send> MarketStream for RecordingStream<S> {
-    async fn next(&mut self) -> Option<MarketEvent> {
+impl<S: MarketStream + Send + Sync> MarketStream for RecordingStream<S> {
+    async fn next(&self) -> Option<MarketEvent> {
         let event = self.inner.next().await?;
 
         // Serialize and write to file
         match serde_json::to_string(&event) {
             Ok(json) => {
-                if let Err(e) = writeln!(self.writer, "{}", json) {
+                let mut writer = self.writer.lock().await;
+                if let Err(e) = writeln!(writer, "{}", json) {
                     log::error!("Failed to write event to recording file: {}", e);
                 }
             }
@@ -194,19 +211,12 @@ impl<S: MarketStream + Send> MarketStream for RecordingStream<S> {
         Some(event)
     }
 
-    async fn subscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+    async fn subscribe(&self, instruments: &[Instrument]) -> Result<(), String> {
         self.inner.subscribe(instruments).await
     }
 
-    async fn unsubscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+    async fn unsubscribe(&self, instruments: &[Instrument]) -> Result<(), String> {
         self.inner.unsubscribe(instruments).await
-    }
-}
-
-impl<S: MarketStream> Drop for RecordingStream<S> {
-    fn drop(&mut self) {
-        // Ensure all data is flushed when the stream is dropped
-        let _ = self.writer.flush();
     }
 }
 

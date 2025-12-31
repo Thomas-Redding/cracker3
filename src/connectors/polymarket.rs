@@ -168,11 +168,12 @@ impl LocalOrderBook {
 // --- The Public Stream ---
 
 pub struct PolymarketStream {
-    receiver: mpsc::Receiver<MarketEvent>,
+    /// Receiver wrapped in Mutex for interior mutability (allows &self in next())
+    receiver: tokio::sync::Mutex<mpsc::Receiver<MarketEvent>>,
     /// Channel to send commands to the actor
     cmd_tx: mpsc::Sender<PolymarketCommand>,
-    /// Track current subscriptions to compute diffs
-    current_subs: HashSet<String>,
+    /// Track current subscriptions to compute diffs (wrapped for interior mutability)
+    current_subs: tokio::sync::Mutex<HashSet<String>>,
 }
 
 impl PolymarketStream {
@@ -192,7 +193,11 @@ impl PolymarketStream {
             actor.run().await;
         });
 
-        Self { receiver: rx, cmd_tx, current_subs }
+        Self { 
+            receiver: tokio::sync::Mutex::new(rx), 
+            cmd_tx, 
+            current_subs: tokio::sync::Mutex::new(current_subs),
+        }
     }
 }
 
@@ -378,11 +383,11 @@ impl PolymarketActor {
 
 #[async_trait]
 impl MarketStream for PolymarketStream {
-    async fn next(&mut self) -> Option<MarketEvent> {
-        self.receiver.recv().await
+    async fn next(&self) -> Option<MarketEvent> {
+        self.receiver.lock().await.recv().await
     }
 
-    async fn subscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+    async fn subscribe(&self, instruments: &[Instrument]) -> Result<(), String> {
         let poly_tokens: Vec<String> = instruments
             .iter()
             .filter_map(|i| match i {
@@ -396,7 +401,8 @@ impl MarketStream for PolymarketStream {
         }
         
         // Add new tokens to our local tracking
-        let mut new_subs = self.current_subs.clone();
+        let mut current_subs = self.current_subs.lock().await;
+        let mut new_subs = current_subs.clone();
         let mut changed = false;
         for token in poly_tokens {
             if new_subs.insert(token) {
@@ -416,11 +422,11 @@ impl MarketStream for PolymarketStream {
             .await
             .map_err(|e| format!("Failed to send subscribe command: {}", e))?;
         
-        self.current_subs = new_subs;
+        *current_subs = new_subs;
         Ok(())
     }
 
-    async fn unsubscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+    async fn unsubscribe(&self, instruments: &[Instrument]) -> Result<(), String> {
         let poly_tokens: Vec<String> = instruments
             .iter()
             .filter_map(|i| match i {
@@ -434,7 +440,8 @@ impl MarketStream for PolymarketStream {
         }
         
         // Remove tokens from our local tracking
-        let mut new_subs = self.current_subs.clone();
+        let mut current_subs = self.current_subs.lock().await;
+        let mut new_subs = current_subs.clone();
         let mut changed = false;
         for token in poly_tokens {
             if new_subs.remove(&token) {
@@ -454,7 +461,7 @@ impl MarketStream for PolymarketStream {
             .await
             .map_err(|e| format!("Failed to send unsubscribe command: {}", e))?;
         
-        self.current_subs = new_subs;
+        *current_subs = new_subs;
         Ok(())
     }
 }

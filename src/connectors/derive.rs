@@ -37,7 +37,8 @@ pub enum DeriveCommand {
 /// Implements `MarketStream` to provide standardized `MarketEvent`s.
 /// Spawns a background actor to handle reconnection and parsing.
 pub struct DeriveStream {
-    receiver: mpsc::Receiver<DeriveTickerData>,
+    /// Receiver wrapped in Mutex for interior mutability (allows &self in next())
+    receiver: tokio::sync::Mutex<mpsc::Receiver<DeriveTickerData>>,
     /// Channel to send commands to the actor
     cmd_tx: mpsc::Sender<DeriveCommand>,
 }
@@ -61,15 +62,18 @@ impl DeriveStream {
             actor.run().await;
         });
 
-        Self { receiver: rx, cmd_tx }
+        Self { 
+            receiver: tokio::sync::Mutex::new(rx), 
+            cmd_tx,
+        }
     }
 }
 
 #[async_trait]
 impl MarketStream for DeriveStream {
-    async fn next(&mut self) -> Option<MarketEvent> {
-        // 1. Receive raw data from actor
-        let raw = self.receiver.recv().await?;
+    async fn next(&self) -> Option<MarketEvent> {
+        // 1. Receive raw data from actor (lock the receiver)
+        let raw = self.receiver.lock().await.recv().await?;
 
         // 2. Extract fields from option_pricing (WebSocket format) or direct fields (REST format)
         // WebSocket data uses nested option_pricing object, REST uses direct fields.
@@ -96,7 +100,7 @@ impl MarketStream for DeriveStream {
         })
     }
 
-    async fn subscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+    async fn subscribe(&self, instruments: &[Instrument]) -> Result<(), String> {
         let derive_instruments: Vec<String> = instruments
             .iter()
             .filter_map(|i| match i {
@@ -116,7 +120,7 @@ impl MarketStream for DeriveStream {
             .map_err(|e| format!("Failed to send subscribe command: {}", e))
     }
 
-    async fn unsubscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+    async fn unsubscribe(&self, instruments: &[Instrument]) -> Result<(), String> {
         let derive_instruments: Vec<String> = instruments
             .iter()
             .filter_map(|i| match i {
@@ -235,6 +239,7 @@ impl DeriveActor {
                                             .collect();
                                         
                                         // Subscribe in batches
+                                        let mut batch_failed = false;
                                         for batch in channels.chunks(BATCH_SIZE) {
                                             let msg = json!({
                                                 "jsonrpc": "2.0",
@@ -245,9 +250,16 @@ impl DeriveActor {
                                             
                                             if let Err(e) = write.send(Message::Text(msg.to_string())).await {
                                                 warn!("Derive: Failed to send subscribe: {}", e);
+                                                batch_failed = true;
                                                 break;
                                             }
                                             sleep(Duration::from_millis(100)).await;
+                                        }
+                                        
+                                        if batch_failed {
+                                            // Break to outer loop to trigger reconnect
+                                            // Don't update current_subs - reconnect will resubscribe properly
+                                            break;
                                         }
                                         
                                         info!("Derive: Subscribed to {} new instruments", new_instruments.len());
@@ -270,6 +282,7 @@ impl DeriveActor {
                                             .collect();
                                         
                                         // Unsubscribe in batches
+                                        let mut batch_failed = false;
                                         for batch in channels.chunks(BATCH_SIZE) {
                                             let msg = json!({
                                                 "jsonrpc": "2.0",
@@ -280,9 +293,16 @@ impl DeriveActor {
                                             
                                             if let Err(e) = write.send(Message::Text(msg.to_string())).await {
                                                 warn!("Derive: Failed to send unsubscribe: {}", e);
+                                                batch_failed = true;
                                                 break;
                                             }
                                             sleep(Duration::from_millis(100)).await;
+                                        }
+                                        
+                                        if batch_failed {
+                                            // Break to outer loop to trigger reconnect
+                                            // Don't update current_subs - reconnect will resubscribe properly
+                                            break;
                                         }
                                         
                                         info!("Derive: Unsubscribed from {} instruments", to_unsub.len());

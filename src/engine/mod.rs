@@ -6,7 +6,7 @@ use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
 // =============================================================================
 // Unified Multi-Exchange Engine
@@ -27,7 +27,8 @@ impl Default for EngineConfig {
 }
 
 /// Shared stream reference for thread-safe access.
-pub type SharedStream = Arc<Mutex<Box<dyn MarketStream>>>;
+/// Uses Arc<dyn MarketStream> since the trait uses interior mutability.
+pub type SharedStream = Arc<dyn MarketStream>;
 
 /// The unified multi-exchange Engine.
 /// 
@@ -111,7 +112,7 @@ impl Engine {
 
     /// Adds a market data stream for an exchange.
     pub fn with_stream(mut self, exchange: Exchange, stream: Box<dyn MarketStream>) -> Self {
-        self.streams.insert(exchange, Arc::new(Mutex::new(stream)));
+        self.streams.insert(exchange, Arc::from(stream));
         self
     }
 
@@ -193,18 +194,16 @@ impl Engine {
                 .cloned()
                 .collect();
 
-            let mut stream_guard = stream.lock().await;
-            
             if !to_add.is_empty() {
                 info!("Engine: Subscribing to {} new instruments on {:?}", to_add.len(), exchange);
-                if let Err(e) = stream_guard.subscribe(&to_add).await {
+                if let Err(e) = stream.subscribe(&to_add).await {
                     warn!("Engine: Failed to subscribe on {:?}: {}", exchange, e);
                 }
             }
 
             if !to_remove.is_empty() {
                 info!("Engine: Unsubscribing from {} instruments on {:?}", to_remove.len(), exchange);
-                if let Err(e) = stream_guard.unsubscribe(&to_remove).await {
+                if let Err(e) = stream.unsubscribe(&to_remove).await {
                     warn!("Engine: Failed to unsubscribe on {:?}: {}", exchange, e);
                 }
             }
@@ -229,7 +228,7 @@ impl Engine {
         let (tx, mut rx) = mpsc::channel::<(Exchange, MarketEvent)>(1000);
 
         // Spawn a task for each stream to forward events to the channel
-        // Keep the Arc<Mutex<Stream>> references so we can still call subscribe/unsubscribe
+        // Streams use interior mutability, so we can call next() through &self
         let mut stream_handles = Vec::new();
         for (exchange, stream) in &self.streams {
             let tx = tx.clone();
@@ -237,13 +236,8 @@ impl Engine {
             let exchange = *exchange;
             let handle = tokio::spawn(async move {
                 loop {
-                    // Lock the stream to get the next event
-                    let event = {
-                        let mut stream_guard = stream_clone.lock().await;
-                        stream_guard.next().await
-                    };
-                    
-                    match event {
+                    // Call next() directly - stream uses interior mutability
+                    match stream_clone.next().await {
                         Some(evt) => {
                             if tx.send((exchange, evt)).await.is_err() {
                                 // Channel closed, stop this stream
@@ -386,7 +380,7 @@ impl<S: MarketStream + 'static> MarketRouter<S> {
     }
 
     /// Runs the router, distributing market events to interested strategies.
-    pub async fn run(mut self) {
+    pub async fn run(self) {
         info!("MarketRouter starting event loop...");
 
         while let Some(event) = self.stream.next().await {
@@ -458,9 +452,7 @@ struct DummyStream;
 
 #[async_trait::async_trait]
 impl MarketStream for DummyStream {
-    async fn next(&mut self) -> Option<MarketEvent> {
+    async fn next(&self) -> Option<MarketEvent> {
         None
     }
 }
-
-impl std::marker::Unpin for DummyStream {}

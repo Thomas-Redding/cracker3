@@ -11,16 +11,22 @@ use std::sync::Arc;
 /// 
 /// Supports dynamic subscription management for adding/removing instruments
 /// at runtime without reconnecting.
+/// 
+/// All methods take `&self` to allow concurrent access - implementations should
+/// use interior mutability (e.g., channels, mutexes) as needed.
 #[async_trait]
-pub trait MarketStream: Send + Unpin {
+pub trait MarketStream: Send + Sync {
     /// Receive the next market event from the stream.
-    async fn next(&mut self) -> Option<MarketEvent>;
+    /// 
+    /// Implementations should use interior mutability (e.g., `Mutex<Receiver>`)
+    /// to allow this to be called concurrently with subscribe/unsubscribe.
+    async fn next(&self) -> Option<MarketEvent>;
 
     /// Subscribe to additional instruments.
     /// 
     /// The stream will start receiving events for these instruments.
     /// Instruments not matching this stream's exchange are ignored.
-    async fn subscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+    async fn subscribe(&self, instruments: &[Instrument]) -> Result<(), String> {
         // Default implementation does nothing
         let _ = instruments;
         Ok(())
@@ -30,7 +36,7 @@ pub trait MarketStream: Send + Unpin {
     /// 
     /// The stream will stop receiving events for these instruments.
     /// Instruments not matching this stream's exchange are ignored.
-    async fn unsubscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+    async fn unsubscribe(&self, instruments: &[Instrument]) -> Result<(), String> {
         // Default implementation does nothing
         let _ = instruments;
         Ok(())

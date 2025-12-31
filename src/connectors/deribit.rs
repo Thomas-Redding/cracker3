@@ -22,7 +22,8 @@ pub enum DeribitCommand {
 }
 
 pub struct DeribitStream {
-    receiver: mpsc::Receiver<DeribitTickerData>,
+    /// Receiver wrapped in Mutex for interior mutability (allows &self in next())
+    receiver: tokio::sync::Mutex<mpsc::Receiver<DeribitTickerData>>,
     /// Channel to send commands to the actor
     cmd_tx: mpsc::Sender<DeribitCommand>,
 }
@@ -42,15 +43,18 @@ impl DeribitStream {
             actor.run().await;
         });
 
-        Self { receiver: rx, cmd_tx }
+        Self { 
+            receiver: tokio::sync::Mutex::new(rx), 
+            cmd_tx,
+        }
     }
 }
 
 #[async_trait]
 impl MarketStream for DeribitStream {
-    async fn next(&mut self) -> Option<MarketEvent> {
-        // 1. Receive raw data
-        let raw = self.receiver.recv().await?;
+    async fn next(&self) -> Option<MarketEvent> {
+        // 1. Receive raw data (lock the receiver)
+        let raw = self.receiver.lock().await.recv().await?;
 
         // 2. Convert to standardized MarketEvent with typed Instrument
         Some(MarketEvent {
@@ -68,7 +72,7 @@ impl MarketStream for DeribitStream {
         })
     }
 
-    async fn subscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+    async fn subscribe(&self, instruments: &[Instrument]) -> Result<(), String> {
         // Filter to only Deribit instruments
         let deribit_instruments: Vec<String> = instruments
             .iter()
@@ -89,7 +93,7 @@ impl MarketStream for DeribitStream {
             .map_err(|e| format!("Failed to send subscribe command: {}", e))
     }
 
-    async fn unsubscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
+    async fn unsubscribe(&self, instruments: &[Instrument]) -> Result<(), String> {
         // Filter to only Deribit instruments
         let deribit_instruments: Vec<String> = instruments
             .iter()
