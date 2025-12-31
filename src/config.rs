@@ -334,8 +334,9 @@ fn build_cross_market(
         scanner_config,
         polymarket_pattern: config.polymarket_pattern.clone(),
         recalc_interval_secs: 60,
-        hourly_vols: Vec::new(), // Default: use calendar time
-        regime_scaler: 1.0,      // Default: no regime adjustment
+        vol_time_strategy: "calendar".to_string(), // Default: calendar time
+        hourly_vols: Vec::new(),
+        regime_scaler: 1.0,
     };
 
     let max_expiry_days = cross_market_config.max_expiry_days;

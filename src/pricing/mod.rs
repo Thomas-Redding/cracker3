@@ -11,5 +11,5 @@ pub mod vol_time;
 pub use black_scholes::{BlackScholes, OptionType, norm_cdf, norm_ppf};
 pub use distribution::{ExpiryDistribution, PriceDistribution};
 pub use vol_surface::{VolSmile, VolatilitySurface, DeribitTickerInput, parse_deribit_expiry, parse_deribit_instrument};
-pub use vol_time::VolTimeCalculator;
+pub use vol_time::{VolTimeStrategy, CalendarVolTimeStrategy, WeightedVolTimeStrategy};
 

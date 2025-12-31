@@ -10,7 +10,8 @@ use crate::optimizer::{
     OptimizedPortfolio, ScannerConfig,
 };
 use crate::pricing::{
-    OptionType, PriceDistribution, VolatilitySurface, VolTimeCalculator,
+    OptionType, PriceDistribution, VolatilitySurface, VolTimeStrategy,
+    CalendarVolTimeStrategy, WeightedVolTimeStrategy,
     vol_surface::DeribitTickerInput,
 };
 use crate::traits::{Dashboard, DashboardSchema, SharedExecutionRouter, Strategy, Widget, TableColumn};
@@ -70,18 +71,25 @@ pub struct CrossMarketConfig {
     pub polymarket_pattern: String,
     /// How often to recalculate (seconds)
     pub recalc_interval_secs: u64,
-    /// Historical hourly volatilities for vol-weighted time (168 values = 7 days × 24 hours)
-    /// If empty, uses uniform weights (calendar time)
+    /// Vol time strategy type: "calendar" or "weighted"
+    #[serde(default = "default_vol_time_strategy")]
+    pub vol_time_strategy: String,
+    /// Historical hourly volatilities for weighted strategy (168 values = 7 days × 24 hours)
+    /// Only used if vol_time_strategy is "weighted"
     #[serde(default)]
     pub hourly_vols: Vec<f64>,
     /// Regime scaler: recent volatility / long-term average (GARCH-lite)
-    /// Default 1.0 means no regime adjustment
+    /// Only used if vol_time_strategy is "weighted"
     #[serde(default = "default_regime_scaler")]
     pub regime_scaler: f64,
 }
 
 fn default_regime_scaler() -> f64 {
     1.0
+}
+
+fn default_vol_time_strategy() -> String {
+    "calendar".to_string()
 }
 
 impl Default for CrossMarketConfig {
@@ -97,7 +105,8 @@ impl Default for CrossMarketConfig {
             // Pattern matches Polymarket slugs like "bitcoin-above-100000-on-december-31"
             polymarket_pattern: r"bitcoin-above-\d+".to_string(),
             recalc_interval_secs: 60,
-            hourly_vols: Vec::new(), // Empty = use calendar time
+            vol_time_strategy: "calendar".to_string(),
+            hourly_vols: Vec::new(),
             regime_scaler: 1.0,
         }
     }
@@ -109,8 +118,8 @@ struct CrossMarketState {
     vol_surface: VolatilitySurface,
     /// Price distribution
     distribution: Option<PriceDistribution>,
-    /// Volatility-weighted time calculator
-    vol_time_calculator: Option<VolTimeCalculator>,
+    /// Volatility-weighted time strategy (required)
+    vol_time_strategy: Box<dyn VolTimeStrategy>,
     /// Current opportunities
     opportunities: Vec<Opportunity>,
     /// Optimized portfolio
@@ -136,7 +145,7 @@ impl Default for CrossMarketState {
         Self {
             vol_surface: VolatilitySurface::new(0.0),
             distribution: None,
-            vol_time_calculator: None,
+            vol_time_strategy: Box::new(CalendarVolTimeStrategy),
             opportunities: Vec::new(),
             portfolio: None,
             deribit_tickers: HashMap::new(),
@@ -641,23 +650,29 @@ impl CrossMarketStrategy {
             self.config.rate,
         ));
 
-        // Initialize vol time calculator if hourly vols are provided
-        // This improves interpolation by accounting for intraday/weekly volatility patterns
-        // and regime changes. If not provided, falls back to calendar time.
-        if !self.config.hourly_vols.is_empty() {
-            state.vol_time_calculator = Some(VolTimeCalculator::new(
-                self.config.hourly_vols.clone(),
-                self.config.regime_scaler,
-                vec![], // Event overrides can be added later if needed
-            ));
-            debug!("VOL TIME: Initialized calculator with {} hourly weights, regime_scaler={:.2}",
-                self.config.hourly_vols.len(),
-                self.config.regime_scaler
-            );
-        } else {
-            state.vol_time_calculator = None;
-            debug!("VOL TIME: Using calendar time (no hourly vols provided)");
-        }
+        // Initialize vol time strategy based on config
+        state.vol_time_strategy = match self.config.vol_time_strategy.as_str() {
+            "weighted" => {
+                if self.config.hourly_vols.is_empty() {
+                    warn!("VOL TIME: 'weighted' strategy specified but hourly_vols is empty, falling back to calendar");
+                    Box::new(CalendarVolTimeStrategy)
+                } else {
+                    debug!("VOL TIME: Initialized weighted strategy with {} hourly weights, regime_scaler={:.2}",
+                        self.config.hourly_vols.len(),
+                        self.config.regime_scaler
+                    );
+                    Box::new(WeightedVolTimeStrategy::new(
+                        self.config.hourly_vols.clone(),
+                        self.config.regime_scaler,
+                        vec![], // Event overrides can be added later if needed
+                    ))
+                }
+            }
+            "calendar" | _ => {
+                debug!("VOL TIME: Using calendar strategy");
+                Box::new(CalendarVolTimeStrategy)
+            }
+        };
 
         // Log vol surface update with ATM IV for debugging
         let atm_ivs: Vec<(i64, f64)> = state.vol_surface.expiries()
@@ -773,19 +788,15 @@ impl CrossMarketStrategy {
             
             // Get model probability for diagnostics
             let model_prob = distribution.probability_above(market.strike, market.expiry_timestamp);
-            // Use vol-weighted time if available, otherwise calendar time
-            let time_to_expiry = if let Some(ref calc) = state.vol_time_calculator {
-                let now_dt = chrono::DateTime::from_timestamp_millis(now_ms)
-                    .unwrap_or_else(|| chrono::Utc::now())
-                    .with_timezone(&chrono::Utc);
-                let expiry_dt = chrono::DateTime::from_timestamp_millis(market.expiry_timestamp)
-                    .unwrap_or_else(|| chrono::Utc::now())
-                    .with_timezone(&chrono::Utc);
-                let vol_weighted_seconds = calc.get_vol_time(now_dt, expiry_dt);
-                VolTimeCalculator::vol_seconds_to_years(vol_weighted_seconds)
-            } else {
-                (market.expiry_timestamp - now_ms) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0)
-            };
+            // Calculate vol-weighted time using the configured strategy
+            let now_dt = chrono::DateTime::from_timestamp_millis(now_ms)
+                .unwrap_or_else(|| chrono::Utc::now())
+                .with_timezone(&chrono::Utc);
+            let expiry_dt = chrono::DateTime::from_timestamp_millis(market.expiry_timestamp)
+                .unwrap_or_else(|| chrono::Utc::now())
+                .with_timezone(&chrono::Utc);
+            let vol_weighted_seconds = state.vol_time_strategy.get_vol_time(now_dt, expiry_dt);
+            let time_to_expiry = state.vol_time_strategy.vol_seconds_to_years(vol_weighted_seconds);
             
             // Log every market for debugging
             debug!("SCAN PM: {} strike=${:.0} expiry={:.3}y | YES={:.2} NO={:.2} | model_prob={:?}",
@@ -857,19 +868,15 @@ impl CrossMarketStrategy {
             let liquidity = ticker.best_bid_amount.unwrap_or(0.0)
                 .min(ticker.best_ask_amount.unwrap_or(0.0));
 
-            // Calculate vol-weighted time for Derive options too
-            let time_to_expiry = if let Some(ref calc) = state.vol_time_calculator {
-                let now_dt = chrono::DateTime::from_timestamp_millis(now_ms)
-                    .unwrap_or_else(|| chrono::Utc::now())
-                    .with_timezone(&chrono::Utc);
-                let expiry_dt = chrono::DateTime::from_timestamp_millis(ticker.expiry_timestamp)
-                    .unwrap_or_else(|| chrono::Utc::now())
-                    .with_timezone(&chrono::Utc);
-                let vol_weighted_seconds = calc.get_vol_time(now_dt, expiry_dt);
-                Some(VolTimeCalculator::vol_seconds_to_years(vol_weighted_seconds))
-            } else {
-                None // Will use calendar time in scanner
-            };
+            // Calculate vol-weighted time for Derive options using the configured strategy
+            let now_dt = chrono::DateTime::from_timestamp_millis(now_ms)
+                .unwrap_or_else(|| chrono::Utc::now())
+                .with_timezone(&chrono::Utc);
+            let expiry_dt = chrono::DateTime::from_timestamp_millis(ticker.expiry_timestamp)
+                .unwrap_or_else(|| chrono::Utc::now())
+                .with_timezone(&chrono::Utc);
+            let vol_weighted_seconds = state.vol_time_strategy.get_vol_time(now_dt, expiry_dt);
+            let time_to_expiry = Some(state.vol_time_strategy.vol_seconds_to_years(vol_weighted_seconds));
 
             let opps = self.scanner.scan_vanilla_option(
                 &ticker.instrument_name,
@@ -1804,6 +1811,7 @@ mod tests {
             scanner_config: ScannerConfig::default(),
             polymarket_pattern: "ethereum-above-\\d+".to_string(),
             recalc_interval_secs: 120,
+            vol_time_strategy: "calendar".to_string(),
             hourly_vols: Vec::new(),
             regime_scaler: 1.0,
         };

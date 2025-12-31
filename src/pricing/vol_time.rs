@@ -5,13 +5,53 @@
 
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
 
-/// Calculates volatility-weighted time between timestamps.
+/// Trait for calculating volatility-weighted time between timestamps.
+pub trait VolTimeStrategy: Send + Sync {
+    /// Calculates the total "vol-weighted seconds" between two timestamps.
+    /// 
+    /// This converts calendar time to volatility-weighted time.
+    /// 
+    /// # Returns
+    /// The vol-weighted time in seconds. This can be converted to years by dividing
+    /// by the number of seconds in a year (365.25 * 24 * 3600).
+    fn get_vol_time(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> f64;
+    
+    /// Converts vol-weighted seconds to years.
+    /// 
+    /// Useful for converting the output of `get_vol_time` to a time-to-expiry
+    /// that can be used with existing pricing models.
+    fn vol_seconds_to_years(&self, vol_seconds: f64) -> f64 {
+        vol_seconds / (365.25 * 24.0 * 3600.0)
+    }
+    
+    /// Converts years to vol-weighted seconds.
+    /// 
+    /// This is a helper for converting calendar time-to-expiry to vol-weighted time.
+    fn years_to_vol_seconds(&self, years: f64) -> f64 {
+        years * 365.25 * 24.0 * 3600.0
+    }
+}
+
+/// Simple calendar-based vol time strategy.
+/// Uses uniform calendar time (no volatility weighting).
+pub struct CalendarVolTimeStrategy;
+
+impl VolTimeStrategy for CalendarVolTimeStrategy {
+    fn get_vol_time(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> f64 {
+        if start >= end {
+            return 0.0;
+        }
+        (end - start).num_seconds() as f64
+    }
+}
+
+/// Weighted volatility time strategy.
 /// 
-/// This improves interpolation logic by accounting for:
+/// Accounts for:
 /// - Intraday/weekly volatility patterns (e.g., higher vol during market hours)
 /// - Regime changes (GARCH-lite scaling)
 /// - Event-specific overrides (e.g., FOMC announcements)
-pub struct VolTimeCalculator {
+pub struct WeightedVolTimeStrategy {
     /// Weights for each hour of the week (0..167)
     /// Monday 00:00 = 0, Sunday 23:00 = 167
     hourly_weights: Vec<f64>,
@@ -23,8 +63,8 @@ pub struct VolTimeCalculator {
     event_overrides: Vec<(DateTime<Utc>, DateTime<Utc>, f64)>,
 }
 
-impl VolTimeCalculator {
-    /// Creates a new VolTimeCalculator.
+impl WeightedVolTimeStrategy {
+    /// Creates a new WeightedVolTimeStrategy.
     /// 
     /// # Arguments
     /// * `historical_vols` - Raw hourly vols from Deribit (should be 168 values for full week)
@@ -57,15 +97,10 @@ impl VolTimeCalculator {
         }
     }
 
-    /// Calculates the total "vol-weighted seconds" between two timestamps.
-    /// 
-    /// This converts calendar time to volatility-weighted time, accounting for
-    /// intraday patterns, regime changes, and event overrides.
-    /// 
-    /// # Returns
-    /// The vol-weighted time in seconds. This can be converted to years by dividing
-    /// by the number of seconds in a year (365.25 * 24 * 3600).
-    pub fn get_vol_time(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> f64 {
+}
+
+impl VolTimeStrategy for WeightedVolTimeStrategy {
+    fn get_vol_time(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> f64 {
         if start >= end {
             return 0.0;
         }
@@ -92,7 +127,9 @@ impl VolTimeCalculator {
 
         total_weighted_seconds
     }
+}
 
+impl WeightedVolTimeStrategy {
     /// Gets the volatility weight at a specific timestamp.
     /// 
     /// Priority order:
@@ -114,21 +151,6 @@ impl VolTimeCalculator {
 
         *self.hourly_weights.get(hour_idx).unwrap_or(&1.0)
     }
-
-    /// Converts vol-weighted seconds to years.
-    /// 
-    /// Useful for converting the output of `get_vol_time` to a time-to-expiry
-    /// that can be used with existing pricing models.
-    pub fn vol_seconds_to_years(vol_seconds: f64) -> f64 {
-        vol_seconds / (365.25 * 24.0 * 3600.0)
-    }
-
-    /// Converts years to vol-weighted seconds.
-    /// 
-    /// This is a helper for converting calendar time-to-expiry to vol-weighted time.
-    pub fn years_to_vol_seconds(years: f64) -> f64 {
-        years * 365.25 * 24.0 * 3600.0
-    }
 }
 
 #[cfg(test)]
@@ -136,10 +158,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_calendar_strategy() {
+        let strategy = CalendarVolTimeStrategy;
+        
+        let start = DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339("2024-01-01T01:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        
+        let vol_time = strategy.get_vol_time(start, end);
+        // Should be exactly 3600 seconds (1 hour)
+        assert!((vol_time - 3600.0).abs() < 1.0);
+        
+        let years = strategy.vol_seconds_to_years(vol_time);
+        let hours = years * 365.25 * 24.0;
+        assert!((hours - 1.0).abs() < 0.01);
+    }
+
+    #[test]
     fn test_uniform_weights() {
         // Uniform weights should give roughly calendar time
         let uniform_vols = vec![1.0; 168];
-        let calc = VolTimeCalculator::new(uniform_vols, 1.0, vec![]);
+        let calc = WeightedVolTimeStrategy::new(uniform_vols, 1.0, vec![]);
         
         let start = DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
             .unwrap()
@@ -156,7 +198,7 @@ mod tests {
     #[test]
     fn test_regime_scaler() {
         let uniform_vols = vec![1.0; 168];
-        let calc = VolTimeCalculator::new(uniform_vols, 2.0, vec![]);
+        let calc = WeightedVolTimeStrategy::new(uniform_vols, 2.0, vec![]);
         
         let start = DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
             .unwrap()
@@ -180,7 +222,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         
-        let calc = VolTimeCalculator::new(
+        let calc = WeightedVolTimeStrategy::new(
             uniform_vols,
             1.0,
             vec![(start_time, end_time, 3.0)],
@@ -197,7 +239,7 @@ mod tests {
         let mut vols = vec![1.0; 168];
         vols[9] = 2.0; // Monday 9am
         
-        let calc = VolTimeCalculator::new(vols, 1.0, vec![]);
+        let calc = WeightedVolTimeStrategy::new(vols, 1.0, vec![]);
         
         let monday_9am = DateTime::parse_from_rfc3339("2024-01-01T09:00:00Z")
             .unwrap()
@@ -213,7 +255,7 @@ mod tests {
 
     #[test]
     fn test_empty_weights() {
-        let calc = VolTimeCalculator::new(vec![], 1.0, vec![]);
+        let calc = WeightedVolTimeStrategy::new(vec![], 1.0, vec![]);
         
         let start = DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
             .unwrap()
@@ -229,14 +271,16 @@ mod tests {
 
     #[test]
     fn test_vol_seconds_to_years() {
+        let strategy = CalendarVolTimeStrategy;
         let seconds_per_year = 365.25 * 24.0 * 3600.0;
-        let years = VolTimeCalculator::vol_seconds_to_years(seconds_per_year);
+        let years = strategy.vol_seconds_to_years(seconds_per_year);
         assert!((years - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn test_years_to_vol_seconds() {
-        let seconds = VolTimeCalculator::years_to_vol_seconds(1.0);
+        let strategy = CalendarVolTimeStrategy;
+        let seconds = strategy.years_to_vol_seconds(1.0);
         let expected = 365.25 * 24.0 * 3600.0;
         assert!((seconds - expected).abs() < 1e-6);
     }
