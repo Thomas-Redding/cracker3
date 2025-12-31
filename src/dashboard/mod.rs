@@ -711,6 +711,10 @@ const FRONTEND_HTML: &str = r##"<!DOCTYPE html>
         async function selectStrategy(name) {
             activeStrategy = name;
             await loadSchema(name);
+            
+            // Guard against race condition: user may have clicked another strategy during await
+            if (activeStrategy !== name) return;
+            
             renderTabs();
             
             // Clear existing charts when switching strategies
@@ -733,7 +737,7 @@ const FRONTEND_HTML: &str = r##"<!DOCTYPE html>
 
             // If no schema, fallback to basic metric rendering
             if (!schema || !schema.widgets) {
-                renderFallbackDashboard(state, dashboard, "Waiting for schema layout...");
+                renderFallbackDashboard(state, dashboard);
                 return;
             }
 
@@ -920,7 +924,7 @@ const FRONTEND_HTML: &str = r##"<!DOCTYPE html>
                 `;
             }
 
-            if (state.log) {
+            if (Array.isArray(state.log)) {
                 html += `
                     <div class="card log-container">
                         <div class="card-header"><span class="card-title">Activity Log</span></div>
