@@ -600,7 +600,7 @@ impl CrossMarketStrategy {
             }
         }
         
-        println!(
+        debug!(
             "VOL SURFACE: spot=${:.0}, {} expiries, {} iv_points",
             state.vol_surface.spot(),
             state.vol_surface.num_expiries(),
@@ -612,7 +612,7 @@ impl CrossMarketStrategy {
             let date = chrono::DateTime::from_timestamp_millis(*exp)
                 .map(|dt| dt.format("%Y-%m-%d").to_string())
                 .unwrap_or_else(|| "?".to_string());
-            println!("  Expiry {}: ATM IV = {:.4} ({:.1}%)", date, iv, iv * 100.0);
+            debug!("  Expiry {}: ATM IV = {:.4} ({:.1}%)", date, iv, iv * 100.0);
         }
         
         // Sample a few strikes to verify the distribution
@@ -620,7 +620,7 @@ impl CrossMarketStrategy {
             let spot = state.vol_surface.spot();
             let expiries = dist.expiries();
             
-            println!("DISTRIBUTION: {} expiries available", expiries.len());
+            debug!("DISTRIBUTION: {} expiries available", expiries.len());
             
             if spot > 0.0 && !expiries.is_empty() {
                 // Use the first actual expiry
@@ -641,15 +641,15 @@ impl CrossMarketStrategy {
                 // Show price range of the distribution grid
                 if let Some(exp_dist) = dist.get(sample_expiry) {
                     let (min_price, max_price) = exp_dist.price_range();
-                    println!("DISTRIBUTION (expiry {}): grid ${:.0} - ${:.0}, ATM IV={:.4}", 
+                    debug!("DISTRIBUTION (expiry {}): grid ${:.0} - ${:.0}, ATM IV={:.4}", 
                         expiry_date, min_price, max_price, exp_dist.atm_iv);
                 } else {
-                    println!("DISTRIBUTION SAMPLE (expiry {}):", expiry_date);
+                    debug!("DISTRIBUTION SAMPLE (expiry {}):", expiry_date);
                 }
                 
                 for strike in strikes {
                     let prob = dist.probability_above(strike, sample_expiry);
-                    println!("  P(S > ${:.0}) = {:?}", strike, prob);
+                    debug!("  P(S > ${:.0}) = {:?}", strike, prob);
                 }
             }
         }
@@ -1058,12 +1058,6 @@ impl Dashboard for CrossMarketStrategy {
                     }
                 }
             }
-        }
-
-        if !iv_chart_data.is_empty() {
-            println!("IV CHART: Generated {} data points for {} expiries", iv_chart_data.len(), expiries.len());
-        } else {
-            println!("IV CHART: No data points generated (expiries={})", expiries.len());
         }
 
         json!({

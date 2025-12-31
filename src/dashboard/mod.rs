@@ -165,16 +165,13 @@ async fn get_strategy_schema(
     State(state): State<Arc<DashboardState>>,
     Path(name): Path<String>,
 ) -> Response {
-    println!("DASHBOARD API: Fetching schema for strategy '{}'", name);
     for strategy in &state.strategies {
         if strategy.dashboard_name() == name {
             let schema = strategy.dashboard_schema();
-            println!("DASHBOARD API: Returning schema with {} widgets for '{}'", schema.widgets.len(), name);
             return Json(schema).into_response();
         }
     }
 
-    println!("DASHBOARD API: Strategy '{}' not found!", name);
     (StatusCode::NOT_FOUND, "Strategy not found").into_response()
 }
 
@@ -617,8 +614,6 @@ const FRONTEND_HTML: &str = r##"<!DOCTYPE html>
             <div class="status">
                 <div class="status-dot" id="statusDot"></div>
                 <span id="statusText">Connecting...</span>
-                <span style="margin-left: 15px; opacity: 0.5;">|</span>
-                <span id="schemaStatus" style="margin-left: 15px; color: var(--text-muted);">Schema: Loading...</span>
             </div>
         </header>
 
@@ -649,10 +644,8 @@ const FRONTEND_HTML: &str = r##"<!DOCTYPE html>
 
         async function loadStrategies() {
             try {
-                console.log('Fetching strategies...');
                 const res = await fetch('/api/strategies');
                 strategies = await res.json();
-                console.log('Loaded strategies:', strategies);
                 
                 if (strategies.length > 0) {
                     activeStrategy = strategies[0].name;
@@ -660,55 +653,34 @@ const FRONTEND_HTML: &str = r##"<!DOCTYPE html>
                     renderTabs();
                 }
             } catch (err) {
-                console.error('Failed to load strategies:', err);
+                // Strategy loading failed
             }
         }
 
         async function loadSchema(name) {
-            const statusEl = document.getElementById('schemaStatus');
-            if (strategySchemas[name]) {
-                statusEl.textContent = 'Schema: OK';
-                statusEl.style.color = 'var(--success)';
-                return;
-            }
+            if (strategySchemas[name]) return;
             try {
-                console.log(`Fetching schema for ${name}...`);
-                statusEl.textContent = 'Schema: Fetching...';
                 const res = await fetch(`/api/strategies/${encodeURIComponent(name)}/schema`);
                 if (res.ok) {
                     strategySchemas[name] = await res.json();
-                    console.log(`Loaded schema for ${name}:`, strategySchemas[name]);
-                    statusEl.textContent = 'Schema: OK';
-                    statusEl.style.color = 'var(--success)';
-                } else {
-                    console.error(`Failed to load schema: ${res.status}`);
-                    statusEl.textContent = `Schema: Error ${res.status}`;
-                    statusEl.style.color = 'var(--danger)';
                 }
             } catch (err) {
-                console.error(`Failed to load schema for ${name}:`, err);
-                statusEl.textContent = 'Schema: Failed';
-                statusEl.style.color = 'var(--danger)';
+                // Schema loading failed - will use fallback rendering
             }
         }
 
         function connectWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const url = `${protocol}//${window.location.host}/ws`;
-            console.log(`Connecting to WebSocket at ${url}...`);
-            ws = new WebSocket(url);
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
 
             ws.onopen = () => {
-                console.log('WebSocket connected');
                 document.getElementById('statusDot').classList.remove('disconnected');
                 document.getElementById('statusText').textContent = 'Connected';
             };
 
             ws.onclose = () => {
-                console.log('WebSocket disconnected');
                 document.getElementById('statusDot').classList.add('disconnected');
                 document.getElementById('statusText').textContent = 'Disconnected';
-                // Reconnect after 2 seconds
                 setTimeout(connectWebSocket, 2000);
             };
 
@@ -721,7 +693,7 @@ const FRONTEND_HTML: &str = r##"<!DOCTYPE html>
                         renderDashboard(update.state);
                     }
                 } catch (err) {
-                    console.error('Failed to parse update:', err);
+                    // Parse error
                 }
             };
         }
