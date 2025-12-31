@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
-use log::debug;
+use log::{debug, warn};
 
 /// A single IV point on the surface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
