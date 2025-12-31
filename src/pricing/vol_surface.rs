@@ -318,6 +318,7 @@ impl VolatilitySurface {
 
             // Skip if IV is unreasonable
             if iv <= 0.0 || iv > 5.0 {
+                warn!("Invalid IV: {}", iv);
                 continue;
             }
 

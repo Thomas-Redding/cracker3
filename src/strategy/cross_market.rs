@@ -523,6 +523,7 @@ impl CrossMarketStrategy {
         let date = dt_utc.date_naive();
         
         // Check description for "12:00 in the ET timezone" or similar patterns
+        // TODO: This is very hacky. Fix it/
         let use_et_noon = market.description.as_ref()
             .map(|desc| {
                 desc.contains("12:00") && 
