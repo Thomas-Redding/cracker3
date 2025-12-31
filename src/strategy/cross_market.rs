@@ -585,6 +585,21 @@ impl CrossMarketStrategy {
             })
             .collect();
         
+        if !atm_ivs.is_empty() {
+            let msg = format!("Vol surface updated: {} expiries, spot=${:.0}", atm_ivs.len(), state.vol_surface.spot());
+            // We can't use self.add_log here because we have a mutable borrow of state
+            // But we can add it to the state.log directly
+            let entry = LogEntry {
+                time: chrono::Utc::now().format("%H:%M:%S").to_string(),
+                level: "info".to_string(),
+                message: msg,
+            };
+            state.log.push_back(entry);
+            if state.log.len() > MAX_LOG_ENTRIES {
+                state.log.pop_front();
+            }
+        }
+        
         println!(
             "VOL SURFACE: spot=${:.0}, {} expiries, {} iv_points",
             state.vol_surface.spot(),
@@ -1022,6 +1037,35 @@ impl Dashboard for CrossMarketStrategy {
             "max_drawdown": format!("{:.1}%", p.max_drawdown * 100.0),
         }));
 
+        // Build IV chart data from the volatility surface
+        // Each point includes strike, IV, and expiry label for multi-series display
+        let mut iv_chart_data: Vec<Value> = Vec::new();
+        let expiries = state.vol_surface.expiries();
+        
+        for expiry_ts in &expiries {
+            if let Some(smile) = state.vol_surface.get_smile(*expiry_ts) {
+                let expiry_label = chrono::DateTime::from_timestamp_millis(*expiry_ts)
+                    .map(|dt| dt.format("%b %d").to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                
+                for strike in smile.strikes() {
+                    if let Some(iv) = smile.get_iv(strike) {
+                        iv_chart_data.push(json!({
+                            "strike": strike,
+                            "iv": iv * 100.0, // Convert to percentage
+                            "expiry": expiry_label,
+                        }));
+                    }
+                }
+            }
+        }
+
+        if !iv_chart_data.is_empty() {
+            println!("IV CHART: Generated {} data points for {} expiries", iv_chart_data.len(), expiries.len());
+        } else {
+            println!("IV CHART: No data points generated (expiries={})", expiries.len());
+        }
+
         json!({
             "spot_price": state.vol_surface.spot(),
             "num_expiries": state.vol_surface.num_expiries(),
@@ -1034,6 +1078,7 @@ impl Dashboard for CrossMarketStrategy {
             "portfolio_stats": portfolio_stats,
             "last_recalc": state.last_recalc,
             "log": state.log.iter().collect::<Vec<_>>(),
+            "iv_chart": iv_chart_data,
         })
     }
 
@@ -1054,6 +1099,12 @@ impl Dashboard for CrossMarketStrategy {
                     label: "IV Data Points".to_string(),
                     key: "total_iv_points".to_string(),
                     format: None,
+                },
+                Widget::Divider,
+                Widget::Chart {
+                    title: "Implied Volatility Surface".to_string(),
+                    data_key: "iv_chart".to_string(),
+                    chart_type: "line".to_string(),
                 },
                 Widget::Divider,
                 Widget::Table {
