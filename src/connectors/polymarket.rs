@@ -4,10 +4,10 @@ use crate::models::{Instrument, MarketEvent, Order, OrderId};
 use crate::traits::{ExecutionClient, MarketStream, SharedExecutionClient};
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -16,6 +16,14 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
 
 const POLY_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+
+/// Commands sent from the stream to the actor for subscription management.
+/// Polymarket doesn't support incremental sub/unsub, so we use reconnect strategy.
+#[derive(Debug, Clone)]
+pub enum PolymarketCommand {
+    /// Update the subscription set and reconnect
+    UpdateSubscriptions(HashSet<String>),
+}
 
 // --- Data Models (Internal to Polymarket) ---
 
@@ -161,22 +169,30 @@ impl LocalOrderBook {
 
 pub struct PolymarketStream {
     receiver: mpsc::Receiver<MarketEvent>,
+    /// Channel to send commands to the actor
+    cmd_tx: mpsc::Sender<PolymarketCommand>,
+    /// Track current subscriptions to compute diffs
+    current_subs: HashSet<String>,
 }
 
 impl PolymarketStream {
     pub async fn new(token_ids: Vec<String>) -> Self {
         let (tx, rx) = mpsc::channel(1000);
+        let (cmd_tx, cmd_rx) = mpsc::channel(100);
+        
+        let current_subs: HashSet<String> = token_ids.iter().cloned().collect();
 
         tokio::spawn(async move {
             let actor = PolymarketActor {
                 token_ids,
                 tx,
+                cmd_rx,
                 books: HashMap::new(),
             };
             actor.run().await;
         });
 
-        Self { receiver: rx }
+        Self { receiver: rx, cmd_tx, current_subs }
     }
 }
 
@@ -186,67 +202,130 @@ impl PolymarketStream {
 struct PolymarketActor {
     token_ids: Vec<String>,
     tx: mpsc::Sender<MarketEvent>,
+    cmd_rx: mpsc::Receiver<PolymarketCommand>,
     books: HashMap<String, LocalOrderBook>,
 }
 
 impl PolymarketActor {
     async fn run(mut self) {
         let url = Url::parse(POLY_WS_URL).unwrap();
+        
+        // Track current subscriptions
+        let mut current_subs: HashSet<String> = self.token_ids.iter().cloned().collect();
 
         loop {
-            info!("Polymarket: Connecting...");
+            // Get the current set of tokens to subscribe to
+            let tokens_to_subscribe: Vec<String> = current_subs.iter().cloned().collect();
+            
+            if tokens_to_subscribe.is_empty() {
+                // No subscriptions - just wait for commands
+                debug!("Polymarket: No subscriptions, waiting for commands...");
+                match self.cmd_rx.recv().await {
+                    Some(PolymarketCommand::UpdateSubscriptions(new_subs)) => {
+                        info!("Polymarket: Received subscription update ({} tokens)", new_subs.len());
+                        current_subs = new_subs;
+                        continue;
+                    }
+                    None => {
+                        info!("Polymarket: Command channel closed, shutting down actor");
+                        return;
+                    }
+                }
+            }
+            
+            // Flag to indicate we should reconnect with new subscriptions (skip backoff)
+            let mut skip_backoff;
+            
+            info!("Polymarket: Connecting with {} tokens...", tokens_to_subscribe.len());
             match connect_async(&url).await {
                 Ok((ws_stream, _)) => {
                     info!("Polymarket: Connected.");
                     let (mut write, mut read) = ws_stream.split();
+                    skip_backoff = false;
 
                     // 1. Subscribe
                     let sub_msg = json!({
                         "type": "Market",
-                        "assets_ids": self.token_ids
+                        "assets_ids": tokens_to_subscribe
                     });
 
                     if let Err(e) = write.send(Message::Text(sub_msg.to_string())).await {
                         error!("Polymarket: Sub failed: {}", e);
                         continue;
                     }
+                    
+                    info!("Polymarket: Subscribed to {} tokens", tokens_to_subscribe.len());
 
-                    // 2. Loop
-                    while let Some(msg) = read.next().await {
-                        match msg {
-                            Ok(Message::Text(text)) => {
-                                // Poly sends an array of events usually
-                                let events: Vec<PolyMessage> = match serde_json::from_str(&text) {
-                                    Ok(e) => e,
-                                    Err(_) => {
-                                        // Sometimes it sends a single object, not array
-                                        match serde_json::from_str::<PolyMessage>(&text) {
-                                            Ok(e) => vec![e],
-                                            Err(e) => {
-                                                warn!("Poly parse error: {}", e);
-                                                continue;
+                    // 2. Process loop with command handling
+                    loop {
+                        tokio::select! {
+                            // Handle incoming WebSocket messages
+                            msg = read.next() => {
+                                match msg {
+                                    Some(Ok(Message::Text(text))) => {
+                                        // Poly sends an array of events usually
+                                        let events: Vec<PolyMessage> = match serde_json::from_str(&text) {
+                                            Ok(e) => e,
+                                            Err(_) => {
+                                                // Sometimes it sends a single object, not array
+                                                match serde_json::from_str::<PolyMessage>(&text) {
+                                                    Ok(e) => vec![e],
+                                                    Err(e) => {
+                                                        warn!("Polymarket: Parse error: {}", e);
+                                                        continue;
+                                                    }
+                                                }
                                             }
+                                        };
+
+                                        for event in events {
+                                            self.process_event(event).await;
                                         }
                                     }
-                                };
-
-                                for event in events {
-                                    self.process_event(event).await;
+                                    Some(Err(e)) => {
+                                        error!("Polymarket: WS Error: {}", e);
+                                        break;
+                                    }
+                                    None => {
+                                        info!("Polymarket: Stream ended");
+                                        break;
+                                    }
+                                    _ => {}
                                 }
                             }
-                            Err(e) => {
-                                error!("Poly WS Error: {}", e);
-                                break;
+                            // Handle subscription commands
+                            cmd = self.cmd_rx.recv() => {
+                                match cmd {
+                                    Some(PolymarketCommand::UpdateSubscriptions(new_subs)) => {
+                                        if new_subs != current_subs {
+                                            info!("Polymarket: Subscription update received ({} -> {} tokens), reconnecting...", 
+                                                current_subs.len(), new_subs.len());
+                                            current_subs = new_subs;
+                                            skip_backoff = true;
+                                            // Clear order books for removed tokens
+                                            self.books.retain(|k, _| current_subs.contains(k));
+                                            break; // Break to reconnect with new subscriptions
+                                        }
+                                    }
+                                    None => {
+                                        info!("Polymarket: Command channel closed, shutting down actor");
+                                        return;
+                                    }
+                                }
                             }
-                            _ => {}
                         }
                     }
                 }
-                Err(e) => error!("Poly Connect Error: {}", e),
+                Err(e) => {
+                    error!("Polymarket: Connect Error: {}", e);
+                    skip_backoff = false;
+                }
             }
 
-            warn!("Polymarket: Reconnecting in 5s...");
-            sleep(Duration::from_secs(5)).await;
+            if !skip_backoff {
+                warn!("Polymarket: Reconnecting in 5s...");
+                sleep(Duration::from_secs(5)).await;
+            }
         }
     }
 
@@ -304,10 +383,10 @@ impl MarketStream for PolymarketStream {
     }
 
     async fn subscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
-        let poly_tokens: Vec<&str> = instruments
+        let poly_tokens: Vec<String> = instruments
             .iter()
             .filter_map(|i| match i {
-                Instrument::Polymarket(s) => Some(s.as_str()),
+                Instrument::Polymarket(s) => Some(s.clone()),
                 _ => None,
             })
             .collect();
@@ -316,15 +395,36 @@ impl MarketStream for PolymarketStream {
             return Ok(());
         }
         
-        warn!("PolymarketStream: Dynamic subscription not yet implemented");
+        // Add new tokens to our local tracking
+        let mut new_subs = self.current_subs.clone();
+        let mut changed = false;
+        for token in poly_tokens {
+            if new_subs.insert(token) {
+                changed = true;
+            }
+        }
+        
+        if !changed {
+            return Ok(());
+        }
+        
+        debug!("PolymarketStream: Updating subscriptions, now {} tokens", new_subs.len());
+        
+        // Send the full new set to actor (it will reconnect with the new set)
+        self.cmd_tx
+            .send(PolymarketCommand::UpdateSubscriptions(new_subs.clone()))
+            .await
+            .map_err(|e| format!("Failed to send subscribe command: {}", e))?;
+        
+        self.current_subs = new_subs;
         Ok(())
     }
 
     async fn unsubscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
-        let poly_tokens: Vec<&str> = instruments
+        let poly_tokens: Vec<String> = instruments
             .iter()
             .filter_map(|i| match i {
-                Instrument::Polymarket(s) => Some(s.as_str()),
+                Instrument::Polymarket(s) => Some(s.clone()),
                 _ => None,
             })
             .collect();
@@ -333,7 +433,28 @@ impl MarketStream for PolymarketStream {
             return Ok(());
         }
         
-        warn!("PolymarketStream: Dynamic unsubscription not yet implemented");
+        // Remove tokens from our local tracking
+        let mut new_subs = self.current_subs.clone();
+        let mut changed = false;
+        for token in poly_tokens {
+            if new_subs.remove(&token) {
+                changed = true;
+            }
+        }
+        
+        if !changed {
+            return Ok(());
+        }
+        
+        debug!("PolymarketStream: Updating subscriptions, now {} tokens", new_subs.len());
+        
+        // Send the full new set to actor (it will reconnect with the new set)
+        self.cmd_tx
+            .send(PolymarketCommand::UpdateSubscriptions(new_subs.clone()))
+            .await
+            .map_err(|e| format!("Failed to send unsubscribe command: {}", e))?;
+        
+        self.current_subs = new_subs;
         Ok(())
     }
 }

@@ -3,6 +3,7 @@
 // Configuration file parsing for strategy-centric architecture.
 // Supports TOML config files that specify strategies and their parameters.
 
+use crate::engine::EngineConfig;
 use crate::models::{Exchange, Instrument};
 use crate::optimizer::KellyConfig;
 use crate::strategy::{CrossMarketConfig, CrossMarketStrategy, GammaScalp, MomentumStrategy};
@@ -12,6 +13,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 // =============================================================================
 // Configuration Types
@@ -186,6 +188,15 @@ impl Config {
     /// Parse configuration from a TOML string.
     pub fn from_str(s: &str) -> Result<Self, String> {
         toml::from_str(s).map_err(|e| format!("Failed to parse config: {}", e))
+    }
+
+    /// Builds an EngineConfig from global settings.
+    pub fn engine_config(&self) -> EngineConfig {
+        EngineConfig {
+            subscription_refresh_interval: Duration::from_secs(
+                self.global.subscription_refresh_secs.unwrap_or(60)
+            ),
+        }
     }
 
     /// Returns all unique exchanges required by configured strategies.

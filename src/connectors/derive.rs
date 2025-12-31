@@ -10,6 +10,7 @@ use futures::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -24,12 +25,21 @@ const BATCH_SIZE: usize = 50;
 /// See: https://docs.derive.xyz/reference/ticker_slim-instrument_name-interval
 const INTERVAL: &str = "1000";
 
+/// Commands sent from the stream to the actor for dynamic subscription management.
+#[derive(Debug, Clone)]
+pub enum DeriveCommand {
+    Subscribe(Vec<String>),
+    Unsubscribe(Vec<String>),
+}
+
 /// Derive WebSocket market data stream.
 ///
 /// Implements `MarketStream` to provide standardized `MarketEvent`s.
 /// Spawns a background actor to handle reconnection and parsing.
 pub struct DeriveStream {
     receiver: mpsc::Receiver<DeriveTickerData>,
+    /// Channel to send commands to the actor
+    cmd_tx: mpsc::Sender<DeriveCommand>,
 }
 
 impl DeriveStream {
@@ -39,17 +49,19 @@ impl DeriveStream {
     /// * `instruments` - List of instrument names (e.g., "BTC-20251226-100000-C")
     pub async fn new(instruments: Vec<String>) -> Self {
         let (tx, rx) = mpsc::channel(1000);
+        let (cmd_tx, cmd_rx) = mpsc::channel(100);
 
         tokio::spawn(async move {
             let actor = DeriveActor {
-                instruments,
+                initial_instruments: instruments,
                 tx,
+                cmd_rx,
                 url: Url::parse("wss://api.lyra.finance/ws").unwrap(),
             };
             actor.run().await;
         });
 
-        Self { receiver: rx }
+        Self { receiver: rx, cmd_tx }
     }
 }
 
@@ -85,10 +97,10 @@ impl MarketStream for DeriveStream {
     }
 
     async fn subscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
-        let derive_instruments: Vec<&str> = instruments
+        let derive_instruments: Vec<String> = instruments
             .iter()
             .filter_map(|i| match i {
-                Instrument::Derive(s) => Some(s.as_str()),
+                Instrument::Derive(s) => Some(s.clone()),
                 _ => None,
             })
             .collect();
@@ -97,15 +109,18 @@ impl MarketStream for DeriveStream {
             return Ok(());
         }
         
-        warn!("DeriveStream: Dynamic subscription not yet implemented");
-        Ok(())
+        debug!("DeriveStream: Sending subscribe command for {} instruments", derive_instruments.len());
+        self.cmd_tx
+            .send(DeriveCommand::Subscribe(derive_instruments))
+            .await
+            .map_err(|e| format!("Failed to send subscribe command: {}", e))
     }
 
     async fn unsubscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
-        let derive_instruments: Vec<&str> = instruments
+        let derive_instruments: Vec<String> = instruments
             .iter()
             .filter_map(|i| match i {
-                Instrument::Derive(s) => Some(s.as_str()),
+                Instrument::Derive(s) => Some(s.clone()),
                 _ => None,
             })
             .collect();
@@ -114,85 +129,184 @@ impl MarketStream for DeriveStream {
             return Ok(());
         }
         
-        warn!("DeriveStream: Dynamic unsubscription not yet implemented");
-        Ok(())
+        debug!("DeriveStream: Sending unsubscribe command for {} instruments", derive_instruments.len());
+        self.cmd_tx
+            .send(DeriveCommand::Unsubscribe(derive_instruments))
+            .await
+            .map_err(|e| format!("Failed to send unsubscribe command: {}", e))
     }
 }
 
 // --- The Private Actor (Background Task) ---
-// Handles WebSocket connection, reconnects, JSON parsing, subscriptions.
+// Handles WebSocket connection, reconnects, JSON parsing, subscriptions, and dynamic subscription commands.
 
 struct DeriveActor {
-    instruments: Vec<String>,
+    initial_instruments: Vec<String>,
     tx: mpsc::Sender<DeriveTickerData>,
+    cmd_rx: mpsc::Receiver<DeriveCommand>,
     url: Url,
 }
 
 impl DeriveActor {
-    pub async fn run(self) {
+    pub async fn run(mut self) {
+        // Track current subscriptions for reconnect resubscription
+        let mut current_subs: HashSet<String> = self.initial_instruments.iter().cloned().collect();
+        
         loop {
-            info!("Connecting to Derive...");
+            info!("Derive: Connecting...");
             match connect_async(&self.url).await {
                 Ok((ws_stream, _)) => {
-                    info!("Connected to Derive.");
+                    info!("Derive: Connected.");
                     let (mut write, mut read) = ws_stream.split();
 
-                    // 1. Subscribe in batches
-                    let channels: Vec<String> = self
-                        .instruments
-                        .iter()
-                        .map(|i| format!("ticker_slim.{}.{}", i, INTERVAL))
-                        .collect();
+                    // 1. Subscribe to all current instruments on connect/reconnect
+                    if !current_subs.is_empty() {
+                        let channels: Vec<String> = current_subs
+                            .iter()
+                            .map(|i| format!("ticker_slim.{}.{}", i, INTERVAL))
+                            .collect();
 
-                    for batch in channels.chunks(BATCH_SIZE) {
-                        let subscribe_msg = json!({
-                            "jsonrpc": "2.0",
-                            "method": "subscribe",
-                            "id": 42,
-                            "params": {
-                                "channels": batch
+                        for batch in channels.chunks(BATCH_SIZE) {
+                            let subscribe_msg = json!({
+                                "jsonrpc": "2.0",
+                                "method": "subscribe",
+                                "id": 42,
+                                "params": {
+                                    "channels": batch
+                                }
+                            });
+
+                            if let Err(e) = write.send(Message::Text(subscribe_msg.to_string())).await {
+                                error!("Derive: Failed to send subscription: {}", e);
+                                break;
                             }
-                        });
-
-                        if let Err(e) = write.send(Message::Text(subscribe_msg.to_string())).await {
-                            error!("Failed to send subscription: {}", e);
-                            break;
+                            // Small delay between batches to avoid flooding
+                            sleep(Duration::from_millis(100)).await;
                         }
-                        // Small delay between batches to avoid flooding
-                        sleep(Duration::from_millis(100)).await;
+                        info!("Derive: Subscribed to {} instruments on connect", current_subs.len());
                     }
-                    info!("Subscribed to {} channels.", channels.len());
 
-                    // 2. Process incoming messages
-                    while let Some(msg_result) = read.next().await {
-                        match msg_result {
-                            Ok(Message::Text(text)) => {
-                                if let Err(e) = self.handle_message(&text).await {
-                                    warn!("Error handling message: {}", e);
+                    // 2. Process incoming messages with command handling
+                    loop {
+                        tokio::select! {
+                            // Handle incoming WebSocket messages
+                            msg_result = read.next() => {
+                                match msg_result {
+                                    Some(Ok(Message::Text(text))) => {
+                                        if let Err(e) = self.handle_message(&text).await {
+                                            warn!("Derive: Error handling message: {}", e);
+                                        }
+                                    }
+                                    Some(Ok(Message::Ping(_))) => {
+                                        // Tungstenite handles Pong automatically
+                                    }
+                                    Some(Ok(Message::Close(_))) => {
+                                        info!("Derive: Received close frame.");
+                                        break;
+                                    }
+                                    Some(Err(e)) => {
+                                        error!("Derive: WebSocket error: {}", e);
+                                        break;
+                                    }
+                                    None => {
+                                        info!("Derive: Stream ended");
+                                        break;
+                                    }
+                                    _ => {}
                                 }
                             }
-                            Ok(Message::Ping(_)) => {
-                                // Tungstenite handles Pong automatically
+                            // Handle subscription commands from the stream
+                            cmd = self.cmd_rx.recv() => {
+                                match cmd {
+                                    Some(DeriveCommand::Subscribe(instruments)) => {
+                                        // Filter out already subscribed instruments
+                                        let new_instruments: Vec<String> = instruments
+                                            .into_iter()
+                                            .filter(|i| !current_subs.contains(i))
+                                            .collect();
+                                        
+                                        if new_instruments.is_empty() {
+                                            continue;
+                                        }
+                                        
+                                        let channels: Vec<String> = new_instruments
+                                            .iter()
+                                            .map(|i| format!("ticker_slim.{}.{}", i, INTERVAL))
+                                            .collect();
+                                        
+                                        // Subscribe in batches
+                                        for batch in channels.chunks(BATCH_SIZE) {
+                                            let msg = json!({
+                                                "jsonrpc": "2.0",
+                                                "method": "subscribe",
+                                                "id": 43,
+                                                "params": { "channels": batch }
+                                            });
+                                            
+                                            if let Err(e) = write.send(Message::Text(msg.to_string())).await {
+                                                warn!("Derive: Failed to send subscribe: {}", e);
+                                                break;
+                                            }
+                                            sleep(Duration::from_millis(100)).await;
+                                        }
+                                        
+                                        info!("Derive: Subscribed to {} new instruments", new_instruments.len());
+                                        current_subs.extend(new_instruments);
+                                    }
+                                    Some(DeriveCommand::Unsubscribe(instruments)) => {
+                                        // Filter to only currently subscribed instruments
+                                        let to_unsub: Vec<String> = instruments
+                                            .into_iter()
+                                            .filter(|i| current_subs.contains(i))
+                                            .collect();
+                                        
+                                        if to_unsub.is_empty() {
+                                            continue;
+                                        }
+                                        
+                                        let channels: Vec<String> = to_unsub
+                                            .iter()
+                                            .map(|i| format!("ticker_slim.{}.{}", i, INTERVAL))
+                                            .collect();
+                                        
+                                        // Unsubscribe in batches
+                                        for batch in channels.chunks(BATCH_SIZE) {
+                                            let msg = json!({
+                                                "jsonrpc": "2.0",
+                                                "method": "unsubscribe",
+                                                "id": 44,
+                                                "params": { "channels": batch }
+                                            });
+                                            
+                                            if let Err(e) = write.send(Message::Text(msg.to_string())).await {
+                                                warn!("Derive: Failed to send unsubscribe: {}", e);
+                                                break;
+                                            }
+                                            sleep(Duration::from_millis(100)).await;
+                                        }
+                                        
+                                        info!("Derive: Unsubscribed from {} instruments", to_unsub.len());
+                                        for inst in to_unsub {
+                                            current_subs.remove(&inst);
+                                        }
+                                    }
+                                    None => {
+                                        // Command channel closed, stream is being dropped
+                                        info!("Derive: Command channel closed, shutting down actor");
+                                        return;
+                                    }
+                                }
                             }
-                            Ok(Message::Close(_)) => {
-                                info!("Received close frame from Derive.");
-                                break;
-                            }
-                            Err(e) => {
-                                error!("WebSocket error: {}", e);
-                                break;
-                            }
-                            _ => {}
                         }
                     }
                 }
                 Err(e) => {
-                    error!("Connection to Derive failed: {}", e);
+                    error!("Derive: Connection failed: {}", e);
                 }
             }
 
             // Reconnection Backoff
-            warn!("Disconnected from Derive. Reconnecting in 5 seconds...");
+            warn!("Derive: Disconnected. Reconnecting in 5 seconds...");
             sleep(Duration::from_secs(5)).await;
         }
     }

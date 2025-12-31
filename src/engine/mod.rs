@@ -2,10 +2,11 @@
 
 use crate::models::{Exchange, Instrument, MarketEvent};
 use crate::traits::{ExecutionRouter, MarketStream, SharedExecutionRouter, Strategy};
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{mpsc, Mutex};
 
 // =============================================================================
 // Unified Multi-Exchange Engine
@@ -25,6 +26,9 @@ impl Default for EngineConfig {
     }
 }
 
+/// Shared stream reference for thread-safe access.
+pub type SharedStream = Arc<Mutex<Box<dyn MarketStream>>>;
+
 /// The unified multi-exchange Engine.
 /// 
 /// Manages multiple strategies across multiple exchanges:
@@ -32,12 +36,13 @@ impl Default for EngineConfig {
 /// 2. Periodically calls `discover_subscriptions()` to update subscriptions
 /// 3. Routes market events to interested strategies
 /// 4. Provides an `ExecutionRouter` for strategies to place orders
+/// 5. Uses refcounting to manage subscriptions - instruments stay subscribed while any strategy needs them
 pub struct Engine {
     strategies: Vec<Arc<dyn Strategy>>,
-    streams: HashMap<Exchange, Box<dyn MarketStream>>,
+    streams: HashMap<Exchange, SharedStream>,
     exec_router: SharedExecutionRouter,
-    /// Current subscriptions per exchange
-    current_subs: HashMap<Exchange, HashSet<Instrument>>,
+    /// Current subscription refcounts per exchange: HashMap<Exchange, HashMap<Instrument, usize>>
+    current_subs: HashMap<Exchange, HashMap<Instrument, usize>>,
     /// Routing table: instrument -> strategy indices
     routing_table: HashMap<Instrument, Vec<usize>>,
     config: EngineConfig,
@@ -51,7 +56,7 @@ impl Engine {
     pub fn new(strategies: Vec<Arc<dyn Strategy>>) -> Self {
         // Build initial routing table based on static subscriptions
         let mut routing_table: HashMap<Instrument, Vec<usize>> = HashMap::new();
-        let mut current_subs: HashMap<Exchange, HashSet<Instrument>> = HashMap::new();
+        let mut current_subs: HashMap<Exchange, HashMap<Instrument, usize>> = HashMap::new();
 
         for (idx, strategy) in strategies.iter().enumerate() {
             // Use deprecated method for backwards compatibility
@@ -79,10 +84,12 @@ impl Engine {
                     .or_default()
                     .push(idx);
                 
-                current_subs
+                // Initialize with refcount of 1 for legacy subscriptions
+                *current_subs
                     .entry(instrument.exchange())
                     .or_default()
-                    .insert(instrument);
+                    .entry(instrument)
+                    .or_insert(0) += 1;
             }
         }
 
@@ -104,7 +111,7 @@ impl Engine {
 
     /// Adds a market data stream for an exchange.
     pub fn with_stream(mut self, exchange: Exchange, stream: Box<dyn MarketStream>) -> Self {
-        self.streams.insert(exchange, stream);
+        self.streams.insert(exchange, Arc::new(Mutex::new(stream)));
         self
     }
 
@@ -135,49 +142,83 @@ impl Engine {
     }
 
     /// Refreshes subscriptions by calling discover_subscriptions() on all strategies.
+    /// 
+    /// Uses refcounting to manage overlapping subscriptions:
+    /// - Subscribes when new_count > 0 and old_count == 0
+    /// - Unsubscribes when new_count == 0 and old_count > 0
+    /// - No-op otherwise (refcount changes don't require WS messages)
     pub async fn refresh_subscriptions(&mut self) {
+        debug!("Engine: Refreshing subscriptions...");
+        
+        // Build new refcounts from all strategies
+        let mut new_refcounts: HashMap<Exchange, HashMap<Instrument, usize>> = HashMap::new();
         let mut new_routing: HashMap<Instrument, Vec<usize>> = HashMap::new();
-        let mut new_subs: HashMap<Exchange, HashSet<Instrument>> = HashMap::new();
 
         for (idx, strategy) in self.strategies.iter().enumerate() {
             let instruments = strategy.discover_subscriptions().await;
             for instrument in instruments {
                 new_routing.entry(instrument.clone()).or_default().push(idx);
-                new_subs
+                *new_refcounts
                     .entry(instrument.exchange())
                     .or_default()
-                    .insert(instrument);
+                    .entry(instrument)
+                    .or_insert(0) += 1;
             }
         }
 
-        // Calculate diff and update subscriptions
-        for (exchange, stream) in &mut self.streams {
-            let old = self.current_subs.get(exchange).cloned().unwrap_or_default();
-            let new = new_subs.get(exchange).cloned().unwrap_or_default();
+        // Calculate diff and update subscriptions for each exchange
+        for (exchange, stream) in &self.streams {
+            let old_counts = self.current_subs.get(exchange).cloned().unwrap_or_default();
+            let new_counts = new_refcounts.get(exchange).cloned().unwrap_or_default();
 
-            let to_add: Vec<Instrument> = new.difference(&old).cloned().collect();
-            let to_remove: Vec<Instrument> = old.difference(&new).cloned().collect();
+            // Find instruments to subscribe (new_count > 0, old_count == 0)
+            let to_add: Vec<Instrument> = new_counts
+                .keys()
+                .filter(|inst| {
+                    let new_count = new_counts.get(*inst).copied().unwrap_or(0);
+                    let old_count = old_counts.get(*inst).copied().unwrap_or(0);
+                    new_count > 0 && old_count == 0
+                })
+                .cloned()
+                .collect();
 
+            // Find instruments to unsubscribe (new_count == 0, old_count > 0)
+            let to_remove: Vec<Instrument> = old_counts
+                .keys()
+                .filter(|inst| {
+                    let new_count = new_counts.get(*inst).copied().unwrap_or(0);
+                    let old_count = old_counts.get(*inst).copied().unwrap_or(0);
+                    new_count == 0 && old_count > 0
+                })
+                .cloned()
+                .collect();
+
+            let mut stream_guard = stream.lock().await;
+            
             if !to_add.is_empty() {
                 info!("Engine: Subscribing to {} new instruments on {:?}", to_add.len(), exchange);
-                if let Err(e) = stream.subscribe(&to_add).await {
+                if let Err(e) = stream_guard.subscribe(&to_add).await {
                     warn!("Engine: Failed to subscribe on {:?}: {}", exchange, e);
                 }
             }
 
             if !to_remove.is_empty() {
                 info!("Engine: Unsubscribing from {} instruments on {:?}", to_remove.len(), exchange);
-                if let Err(e) = stream.unsubscribe(&to_remove).await {
+                if let Err(e) = stream_guard.unsubscribe(&to_remove).await {
                     warn!("Engine: Failed to unsubscribe on {:?}: {}", exchange, e);
                 }
             }
         }
 
-        self.current_subs = new_subs;
+        self.current_subs = new_refcounts;
         self.routing_table = new_routing;
+        
+        debug!("Engine: Subscription refresh complete. {} total instruments across {} exchanges",
+            self.routing_table.len(), self.current_subs.len());
     }
 
     /// Runs the engine, processing events from all streams concurrently.
+    /// Uses tokio::select! to handle both market events and periodic subscription refresh.
     pub async fn run(mut self) {
         info!("Engine: Starting event loop with {} exchanges", self.streams.len());
 
@@ -185,17 +226,34 @@ impl Engine {
         self.refresh_subscriptions().await;
 
         // Create a channel for all streams to send events to
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<(Exchange, MarketEvent)>(1000);
+        let (tx, mut rx) = mpsc::channel::<(Exchange, MarketEvent)>(1000);
 
         // Spawn a task for each stream to forward events to the channel
+        // Keep the Arc<Mutex<Stream>> references so we can still call subscribe/unsubscribe
         let mut stream_handles = Vec::new();
-        for (exchange, mut stream) in self.streams.drain() {
+        for (exchange, stream) in &self.streams {
             let tx = tx.clone();
+            let stream_clone = Arc::clone(stream);
+            let exchange = *exchange;
             let handle = tokio::spawn(async move {
-                while let Some(event) = stream.next().await {
-                    if tx.send((exchange, event)).await.is_err() {
-                        // Channel closed, stop this stream
-                        break;
+                loop {
+                    // Lock the stream to get the next event
+                    let event = {
+                        let mut stream_guard = stream_clone.lock().await;
+                        stream_guard.next().await
+                    };
+                    
+                    match event {
+                        Some(evt) => {
+                            if tx.send((exchange, evt)).await.is_err() {
+                                // Channel closed, stop this stream
+                                break;
+                            }
+                        }
+                        None => {
+                            // Stream ended
+                            break;
+                        }
                     }
                 }
                 info!("Engine: Stream for {:?} ended", exchange);
@@ -206,9 +264,32 @@ impl Engine {
         // Drop our sender so the channel closes when all stream tasks finish
         drop(tx);
 
-        // Process events as they arrive from any stream
-        while let Some((_exchange, event)) = rx.recv().await {
-            self.route_event(event).await;
+        // Create interval for periodic subscription refresh
+        let mut refresh_interval = tokio::time::interval(self.config.subscription_refresh_interval);
+        // Don't tick immediately - we just did an initial refresh
+        refresh_interval.reset();
+
+        // Process events as they arrive from any stream, with periodic refresh
+        loop {
+            tokio::select! {
+                // Handle incoming market events
+                event_result = rx.recv() => {
+                    match event_result {
+                        Some((_exchange, event)) => {
+                            self.route_event(event).await;
+                        }
+                        None => {
+                            // Channel closed, all streams have ended
+                            break;
+                        }
+                    }
+                }
+                // Handle periodic subscription refresh
+                _ = refresh_interval.tick() => {
+                    debug!("Engine: Periodic subscription refresh triggered");
+                    self.refresh_subscriptions().await;
+                }
+            }
         }
 
         // Wait for all stream tasks to complete

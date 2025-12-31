@@ -4,8 +4,9 @@ use crate::models::{DeribitResponse, DeribitTickerData, Instrument, MarketEvent,
 use crate::traits::{ExecutionClient, MarketStream, SharedExecutionClient};
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use serde_json::json;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -13,24 +14,35 @@ use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
 
+/// Commands sent from the stream to the actor for dynamic subscription management.
+#[derive(Debug, Clone)]
+pub enum DeribitCommand {
+    Subscribe(Vec<String>),
+    Unsubscribe(Vec<String>),
+}
+
 pub struct DeribitStream {
     receiver: mpsc::Receiver<DeribitTickerData>,
+    /// Channel to send commands to the actor
+    cmd_tx: mpsc::Sender<DeribitCommand>,
 }
 
 impl DeribitStream {
     pub async fn new(instruments: Vec<String>) -> Self {
         let (tx, rx) = mpsc::channel(1000);
+        let (cmd_tx, cmd_rx) = mpsc::channel(100);
 
         tokio::spawn(async move {
             let actor = DeribitActor {
-                instruments,
+                initial_instruments: instruments,
                 tx,
+                cmd_rx,
                 url: Url::parse("wss://www.deribit.com/ws/api/v2").unwrap(),
             };
             actor.run().await;
         });
 
-        Self { receiver: rx }
+        Self { receiver: rx, cmd_tx }
     }
 }
 
@@ -58,10 +70,10 @@ impl MarketStream for DeribitStream {
 
     async fn subscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
         // Filter to only Deribit instruments
-        let deribit_instruments: Vec<&str> = instruments
+        let deribit_instruments: Vec<String> = instruments
             .iter()
             .filter_map(|i| match i {
-                Instrument::Deribit(s) => Some(s.as_str()),
+                Instrument::Deribit(s) => Some(s.clone()),
                 _ => None,
             })
             .collect();
@@ -70,17 +82,19 @@ impl MarketStream for DeribitStream {
             return Ok(());
         }
         
-        // TODO: Implement dynamic subscription via WebSocket
-        warn!("DeribitStream: Dynamic subscription not yet implemented");
-        Ok(())
+        debug!("DeribitStream: Sending subscribe command for {} instruments", deribit_instruments.len());
+        self.cmd_tx
+            .send(DeribitCommand::Subscribe(deribit_instruments))
+            .await
+            .map_err(|e| format!("Failed to send subscribe command: {}", e))
     }
 
     async fn unsubscribe(&mut self, instruments: &[Instrument]) -> Result<(), String> {
         // Filter to only Deribit instruments
-        let deribit_instruments: Vec<&str> = instruments
+        let deribit_instruments: Vec<String> = instruments
             .iter()
             .filter_map(|i| match i {
-                Instrument::Deribit(s) => Some(s.as_str()),
+                Instrument::Deribit(s) => Some(s.clone()),
                 _ => None,
             })
             .collect();
@@ -89,32 +103,38 @@ impl MarketStream for DeribitStream {
             return Ok(());
         }
         
-        // TODO: Implement dynamic unsubscription via WebSocket
-        warn!("DeribitStream: Dynamic unsubscription not yet implemented");
-        Ok(())
+        debug!("DeribitStream: Sending unsubscribe command for {} instruments", deribit_instruments.len());
+        self.cmd_tx
+            .send(DeribitCommand::Unsubscribe(deribit_instruments))
+            .await
+            .map_err(|e| format!("Failed to send unsubscribe command: {}", e))
     }
 }
 
 // --- 3. The Private Actor (Background Task) ---
-// This handles the dirty work: Reconnects, JSON parsing, Pings.
+// This handles the dirty work: Reconnects, JSON parsing, Pings, and dynamic subscriptions.
 struct DeribitActor {
-    instruments: Vec<String>,
+    initial_instruments: Vec<String>,
     tx: mpsc::Sender<DeribitTickerData>,
+    cmd_rx: mpsc::Receiver<DeribitCommand>,
     url: Url,
 }
 
 impl DeribitActor {
-    pub async fn run(self) {
+    pub async fn run(mut self) {
+        // Track current subscriptions for reconnect resubscription
+        let mut current_subs: HashSet<String> = self.initial_instruments.iter().cloned().collect();
+        
         loop {
-            info!("Connecting to Deribit...");
+            info!("Deribit: Connecting...");
             match connect_async(&self.url).await {
                 Ok((ws_stream, _)) => {
-                    info!("Connected.");
+                    info!("Deribit: Connected.");
                     let (mut write, mut read) = ws_stream.split();
 
-                    // 1. Subscribe
-                    let channels: Vec<String> = self
-                        .instruments
+                    // 1. Subscribe to all current instruments on connect/reconnect
+                    if !current_subs.is_empty() {
+                        let channels: Vec<String> = current_subs
                         .iter()
                         .map(|i| format!("ticker.{}.100ms", i))
                         .collect();
@@ -129,51 +149,129 @@ impl DeribitActor {
                     });
 
                     if let Err(e) = write.send(Message::Text(subscribe_msg.to_string())).await {
-                        error!("Failed to send subscription: {}", e);
+                            error!("Deribit: Failed to send subscription: {}", e);
                         continue; // Reconnect loop
+                        }
+                        info!("Deribit: Subscribed to {} instruments on connect", current_subs.len());
                     }
 
-                    // 2. Process Loop
-                    while let Some(msg_result) = read.next().await {
+                    // 2. Process Loop with command handling
+                    loop {
+                        tokio::select! {
+                            // Handle incoming WebSocket messages
+                            msg_result = read.next() => {
                         match msg_result {
-                            Ok(Message::Text(text)) => {
+                                    Some(Ok(Message::Text(text))) => {
                                 // Parse and forward
                                 if let Ok(parsed) = serde_json::from_str::<DeribitResponse>(&text) {
                                     if let Some(params) = parsed.params {
                                         let mut data = params.data;
-
-                                        // Logic from your Python code: Normalize IVs
                                         Self::normalize_ivs(&mut data);
-
-                                        // Send to Strategy
                                         if self.tx.send(data).await.is_err() {
-                                            warn!("Receiver dropped, closing connection.");
-                                            return; // Stop the actor, no one is listening
+                                                    warn!("Deribit: Receiver dropped, closing connection.");
+                                                    return;
+                                                }
+                                            }
                                         }
                                     }
-                                } else if text.contains("heartbeat") {
-                                    // Respond to app-level heartbeats if Deribit requires them
-                                    // (Deribit usually keeps alive via standard pings)
+                                    Some(Ok(Message::Ping(_))) => {
+                                        // Tungstenite handles Pong automatically
+                                    }
+                                    Some(Err(e)) => {
+                                        error!("Deribit: WebSocket error: {}", e);
+                                        break; // Break to trigger reconnect
+                                    }
+                                    None => {
+                                        info!("Deribit: Stream ended");
+                                        break; // Break to trigger reconnect
+                                    }
+                                    _ => {}
                                 }
                             }
-                            Ok(Message::Ping(_)) => {
-                                // Tungstenite handles Pong automatically
+                            // Handle subscription commands from the stream
+                            cmd = self.cmd_rx.recv() => {
+                                match cmd {
+                                    Some(DeribitCommand::Subscribe(instruments)) => {
+                                        // Filter out already subscribed instruments
+                                        let new_instruments: Vec<String> = instruments
+                                            .into_iter()
+                                            .filter(|i| !current_subs.contains(i))
+                                            .collect();
+                                        
+                                        if new_instruments.is_empty() {
+                                            continue;
+                                        }
+                                        
+                                        let channels: Vec<String> = new_instruments
+                                            .iter()
+                                            .map(|i| format!("ticker.{}.100ms", i))
+                                            .collect();
+                                        
+                                        let msg = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "public/subscribe",
+                                            "id": 2,
+                                            "params": { "channels": channels }
+                                        });
+                                        
+                                        if let Err(e) = write.send(Message::Text(msg.to_string())).await {
+                                            warn!("Deribit: Failed to send subscribe: {}", e);
+                                            break; // Reconnect
+                                        }
+                                        
+                                        info!("Deribit: Subscribed to {} new instruments", new_instruments.len());
+                                        current_subs.extend(new_instruments);
+                                    }
+                                    Some(DeribitCommand::Unsubscribe(instruments)) => {
+                                        // Filter to only currently subscribed instruments
+                                        let to_unsub: Vec<String> = instruments
+                                            .into_iter()
+                                            .filter(|i| current_subs.contains(i))
+                                            .collect();
+                                        
+                                        if to_unsub.is_empty() {
+                                            continue;
+                                        }
+                                        
+                                        let channels: Vec<String> = to_unsub
+                                            .iter()
+                                            .map(|i| format!("ticker.{}.100ms", i))
+                                            .collect();
+                                        
+                                        let msg = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "public/unsubscribe",
+                                            "id": 3,
+                                            "params": { "channels": channels }
+                                        });
+                                        
+                                        if let Err(e) = write.send(Message::Text(msg.to_string())).await {
+                                            warn!("Deribit: Failed to send unsubscribe: {}", e);
+                                            break; // Reconnect
+                                        }
+                                        
+                                        info!("Deribit: Unsubscribed from {} instruments", to_unsub.len());
+                                        for inst in to_unsub {
+                                            current_subs.remove(&inst);
+                                        }
+                                    }
+                                    None => {
+                                        // Command channel closed, stream is being dropped
+                                        info!("Deribit: Command channel closed, shutting down actor");
+                                        return;
+                                    }
+                                }
                             }
-                            Err(e) => {
-                                error!("WebSocket error: {}", e);
-                                break; // Break inner loop to trigger reconnect
-                            }
-                            _ => {}
                         }
                     }
                 }
                 Err(e) => {
-                    error!("Connection failed: {}", e);
+                    error!("Deribit: Connection failed: {}", e);
                 }
             }
 
-            // Reconnection Backoff (Exponential-ish)
-            warn!("Disconnected. Reconnecting in 5 seconds...");
+            // Reconnection Backoff
+            warn!("Deribit: Disconnected. Reconnecting in 5 seconds...");
             sleep(Duration::from_secs(5)).await;
         }
     }
