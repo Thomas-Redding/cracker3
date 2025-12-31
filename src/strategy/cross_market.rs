@@ -585,7 +585,22 @@ impl CrossMarketStrategy {
             })
             .collect();
         
-        println!(
+        if !atm_ivs.is_empty() {
+            let msg = format!("Vol surface updated: {} expiries, spot=${:.0}", atm_ivs.len(), state.vol_surface.spot());
+            // We can't use self.add_log here because we have a mutable borrow of state
+            // But we can add it to the state.log directly
+            let entry = LogEntry {
+                time: chrono::Utc::now().format("%H:%M:%S").to_string(),
+                level: "info".to_string(),
+                message: msg,
+            };
+            state.log.push_back(entry);
+            if state.log.len() > MAX_LOG_ENTRIES {
+                state.log.pop_front();
+            }
+        }
+        
+        debug!(
             "VOL SURFACE: spot=${:.0}, {} expiries, {} iv_points",
             state.vol_surface.spot(),
             state.vol_surface.num_expiries(),
@@ -597,7 +612,7 @@ impl CrossMarketStrategy {
             let date = chrono::DateTime::from_timestamp_millis(*exp)
                 .map(|dt| dt.format("%Y-%m-%d").to_string())
                 .unwrap_or_else(|| "?".to_string());
-            println!("  Expiry {}: ATM IV = {:.4} ({:.1}%)", date, iv, iv * 100.0);
+            debug!("  Expiry {}: ATM IV = {:.4} ({:.1}%)", date, iv, iv * 100.0);
         }
         
         // Sample a few strikes to verify the distribution
@@ -605,7 +620,7 @@ impl CrossMarketStrategy {
             let spot = state.vol_surface.spot();
             let expiries = dist.expiries();
             
-            println!("DISTRIBUTION: {} expiries available", expiries.len());
+            debug!("DISTRIBUTION: {} expiries available", expiries.len());
             
             if spot > 0.0 && !expiries.is_empty() {
                 // Use the first actual expiry
@@ -626,15 +641,15 @@ impl CrossMarketStrategy {
                 // Show price range of the distribution grid
                 if let Some(exp_dist) = dist.get(sample_expiry) {
                     let (min_price, max_price) = exp_dist.price_range();
-                    println!("DISTRIBUTION (expiry {}): grid ${:.0} - ${:.0}, ATM IV={:.4}", 
+                    debug!("DISTRIBUTION (expiry {}): grid ${:.0} - ${:.0}, ATM IV={:.4}", 
                         expiry_date, min_price, max_price, exp_dist.atm_iv);
                 } else {
-                    println!("DISTRIBUTION SAMPLE (expiry {}):", expiry_date);
+                    debug!("DISTRIBUTION SAMPLE (expiry {}):", expiry_date);
                 }
                 
                 for strike in strikes {
                     let prob = dist.probability_above(strike, sample_expiry);
-                    println!("  P(S > ${:.0}) = {:?}", strike, prob);
+                    debug!("  P(S > ${:.0}) = {:?}", strike, prob);
                 }
             }
         }
@@ -1022,6 +1037,29 @@ impl Dashboard for CrossMarketStrategy {
             "max_drawdown": format!("{:.1}%", p.max_drawdown * 100.0),
         }));
 
+        // Build IV chart data from the volatility surface
+        // Each point includes strike, IV, and expiry label for multi-series display
+        let mut iv_chart_data: Vec<Value> = Vec::new();
+        let expiries = state.vol_surface.expiries();
+        
+        for expiry_ts in &expiries {
+            if let Some(smile) = state.vol_surface.get_smile(*expiry_ts) {
+                let expiry_label = chrono::DateTime::from_timestamp_millis(*expiry_ts)
+                    .map(|dt| dt.format("%b %d").to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                
+                for strike in smile.strikes() {
+                    if let Some(iv) = smile.get_iv(strike) {
+                        iv_chart_data.push(json!({
+                            "strike": strike,
+                            "iv": iv * 100.0, // Convert to percentage
+                            "expiry": expiry_label,
+                        }));
+                    }
+                }
+            }
+        }
+
         json!({
             "spot_price": state.vol_surface.spot(),
             "num_expiries": state.vol_surface.num_expiries(),
@@ -1034,6 +1072,7 @@ impl Dashboard for CrossMarketStrategy {
             "portfolio_stats": portfolio_stats,
             "last_recalc": state.last_recalc,
             "log": state.log.iter().collect::<Vec<_>>(),
+            "iv_chart": iv_chart_data,
         })
     }
 
@@ -1054,6 +1093,12 @@ impl Dashboard for CrossMarketStrategy {
                     label: "IV Data Points".to_string(),
                     key: "total_iv_points".to_string(),
                     format: None,
+                },
+                Widget::Divider,
+                Widget::Chart {
+                    title: "Implied Volatility Surface".to_string(),
+                    data_key: "iv_chart".to_string(),
+                    chart_type: "line".to_string(),
                 },
                 Widget::Divider,
                 Widget::Table {

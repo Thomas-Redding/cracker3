@@ -103,8 +103,8 @@ impl DashboardServer {
         let app = Router::new()
             .route("/", get(serve_frontend))
             .route("/api/strategies", get(list_strategies))
-            .route("/api/strategies/{name}", get(get_strategy_state))
-            .route("/api/strategies/{name}/schema", get(get_strategy_schema))
+            .route("/api/strategies/:name", get(get_strategy_state))
+            .route("/api/strategies/:name/schema", get(get_strategy_schema))
             .route("/ws", get(websocket_handler))
             .layer(cors)
             .with_state(state);
@@ -263,6 +263,7 @@ const FRONTEND_HTML: &str = r##"<!DOCTYPE html>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
             --bg-primary: #0a0a0f;
@@ -506,6 +507,53 @@ const FRONTEND_HTML: &str = r##"<!DOCTYPE html>
             color: var(--warning);
         }
 
+        .table-container {
+            grid-column: 1 / -1;
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 12px;
+            font-size: 14px;
+        }
+
+        th {
+            text-align: left;
+            padding: 12px;
+            color: var(--text-secondary);
+            font-weight: 500;
+            border-bottom: 2px solid var(--border);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-size: 12px;
+        }
+
+        td {
+            padding: 12px;
+            border-bottom: 1px solid var(--border);
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        tr:hover td {
+            background: var(--bg-tertiary);
+        }
+
+        .chart-container {
+            grid-column: 1 / -1;
+            height: 400px;
+            position: relative;
+        }
+
+        .divider {
+            grid-column: 1 / -1;
+            height: 1px;
+            background: var(--border);
+            margin: 12px 0;
+        }
+
         .instruments {
             display: flex;
             flex-wrap: wrap;
@@ -583,8 +631,10 @@ const FRONTEND_HTML: &str = r##"<!DOCTYPE html>
         // State
         let strategies = [];
         let strategyStates = {};
+        let strategySchemas = {};
         let activeStrategy = null;
         let ws = null;
+        let charts = {}; // Store Chart.js instances
 
         // Initialize
         async function init() {
@@ -599,10 +649,23 @@ const FRONTEND_HTML: &str = r##"<!DOCTYPE html>
                 
                 if (strategies.length > 0) {
                     activeStrategy = strategies[0].name;
+                    await loadSchema(activeStrategy);
                     renderTabs();
                 }
             } catch (err) {
-                console.error('Failed to load strategies:', err);
+                // Strategy loading failed
+            }
+        }
+
+        async function loadSchema(name) {
+            if (strategySchemas[name]) return;
+            try {
+                const res = await fetch(`/api/strategies/${encodeURIComponent(name)}/schema`);
+                if (res.ok) {
+                    strategySchemas[name] = await res.json();
+                }
+            } catch (err) {
+                // Schema loading failed - will use fallback rendering
             }
         }
 
@@ -618,7 +681,6 @@ const FRONTEND_HTML: &str = r##"<!DOCTYPE html>
             ws.onclose = () => {
                 document.getElementById('statusDot').classList.add('disconnected');
                 document.getElementById('statusText').textContent = 'Disconnected';
-                // Reconnect after 2 seconds
                 setTimeout(connectWebSocket, 2000);
             };
 
@@ -631,7 +693,7 @@ const FRONTEND_HTML: &str = r##"<!DOCTYPE html>
                         renderDashboard(update.state);
                     }
                 } catch (err) {
-                    console.error('Failed to parse update:', err);
+                    // Parse error
                 }
             };
         }
@@ -646,9 +708,18 @@ const FRONTEND_HTML: &str = r##"<!DOCTYPE html>
             `).join('');
         }
 
-        function selectStrategy(name) {
+        async function selectStrategy(name) {
             activeStrategy = name;
+            await loadSchema(name);
+            
+            // Guard against race condition: user may have clicked another strategy during await
+            if (activeStrategy !== name) return;
+            
             renderTabs();
+            
+            // Clear existing charts when switching strategies
+            Object.values(charts).forEach(chart => chart.destroy());
+            charts = {};
             
             if (strategyStates[name]) {
                 renderDashboard(strategyStates[name]);
@@ -657,16 +728,179 @@ const FRONTEND_HTML: &str = r##"<!DOCTYPE html>
 
         function renderDashboard(state) {
             const dashboard = document.getElementById('dashboard');
+            const schema = strategySchemas[activeStrategy];
             
             if (!state) {
                 dashboard.innerHTML = '<div class="empty-state"><h2>No data available</h2></div>';
                 return;
             }
 
-            // Build cards from state
+            // If no schema, fallback to basic metric rendering
+            if (!schema || !schema.widgets) {
+                renderFallbackDashboard(state, dashboard);
+                return;
+            }
+
+            // Create or update dashboard layout based on schema
+            // We reuse elements where possible to avoid flickering
+            let currentMetrics = [];
             let html = '';
 
-            // Key metrics
+            schema.widgets.forEach((widget, index) => {
+                if (widget.type === 'key_value') {
+                    currentMetrics.push(widget);
+                    // If next widget is not key_value, or this is the last widget, flush metrics
+                    const next = schema.widgets[index + 1];
+                    if (!next || next.type !== 'key_value') {
+                        html += `
+                            <div class="card">
+                                <div class="card-header"><span class="card-title">Metrics</span></div>
+                                <div class="metric-grid">
+                                    ${currentMetrics.map(m => `
+                                        <div class="metric">
+                                            <div class="metric-label">${m.label}</div>
+                                            <div class="metric-value">${formatValue(state[m.key], m.format)}</div>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        `;
+                        currentMetrics = [];
+                    }
+                } else if (widget.type === 'divider') {
+                    html += '<div class="divider"></div>';
+                } else if (widget.type === 'chart') {
+                    html += `
+                        <div class="card chart-container">
+                            <div class="card-header"><span class="card-title">${widget.title}</span></div>
+                            <canvas id="chart-${index}"></canvas>
+                        </div>
+                    `;
+                    // Chart initialization needs to happen after HTML is set
+                    setTimeout(() => updateChart(`chart-${index}`, widget, state[widget.data_key]), 0);
+                } else if (widget.type === 'table') {
+                    const data = state[widget.data_key] || [];
+                    html += `
+                        <div class="card table-container">
+                            <div class="card-header"><span class="card-title">${widget.title}</span></div>
+                            <table>
+                                <thead>
+                                    <tr>
+                                        ${widget.columns.map(c => `<th>${c.header}</th>`).join('')}
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    ${data.map(row => `
+                                        <tr>
+                                            ${widget.columns.map(c => `<td>${formatValue(row[c.key], c.format)}</td>`).join('')}
+                                        </tr>
+                                    `).join('')}
+                                </tbody>
+                            </table>
+                        </div>
+                    `;
+                } else if (widget.type === 'log') {
+                    const data = state[widget.data_key] || [];
+                    html += `
+                        <div class="card log-container">
+                            <div class="card-header"><span class="card-title">${widget.title}</span></div>
+                            <div class="log">
+                                ${data.slice(-(widget.max_lines || 50)).reverse().map(entry => `
+                                    <div class="log-entry">
+                                        <span class="log-time">${entry.time || ''}</span>
+                                        <span class="log-message ${entry.level}">${entry.message}</span>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
+                    `;
+                }
+            });
+
+            dashboard.innerHTML = html;
+        }
+
+        function updateChart(id, widget, data) {
+            const ctx = document.getElementById(id);
+            if (!ctx) return;
+
+            if (!data || !Array.isArray(data) || data.length === 0) {
+                // No data - if chart exists, clear it
+                if (charts[id]) {
+                    charts[id].destroy();
+                    delete charts[id];
+                }
+                // Show "no data" message in the canvas context
+                const context = ctx.getContext('2d');
+                context.clearRect(0, 0, ctx.width, ctx.height);
+                context.fillStyle = '#555566';
+                context.textAlign = 'center';
+                context.fillText('Waiting for IV data...', ctx.width / 2, ctx.height / 2);
+                return;
+            }
+            
+            // Group data by series (e.g., expiry)
+            const series = {};
+            data.forEach(d => {
+                const group = d.expiry || 'Value';
+                if (!series[group]) series[group] = [];
+                series[group].push({ x: d.strike, y: d.iv });
+            });
+
+            const datasets = Object.entries(series).map(([label, points], i) => {
+                const colors = ['#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899'];
+                return {
+                    label: label,
+                    data: points.sort((a, b) => a.x - b.x),
+                    borderColor: colors[i % colors.length],
+                    backgroundColor: colors[i % colors.length] + '22',
+                    borderWidth: 2,
+                    pointRadius: 3,
+                    tension: 0.1
+                };
+            });
+
+            // If chart exists but canvas changed (due to innerHTML overwrite), destroy it
+            if (charts[id] && charts[id].canvas !== ctx) {
+                charts[id].destroy();
+                delete charts[id];
+            }
+
+            if (charts[id]) {
+                charts[id].data.datasets = datasets;
+                charts[id].update('none');
+            } else {
+                charts[id] = new Chart(ctx, {
+                    type: 'line',
+                    data: { datasets },
+                    options: {
+                        animation: false, // Disable animation for performance during rapid updates
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        interaction: { intersect: false, mode: 'index' },
+                        scales: {
+                            x: {
+                                type: 'linear',
+                                grid: { color: '#2a2a3d' },
+                                ticks: { color: '#8888a0' },
+                                title: { display: true, text: 'Strike', color: '#8888a0' }
+                            },
+                            y: {
+                                grid: { color: '#2a2a3d' },
+                                ticks: { color: '#8888a0' },
+                                title: { display: true, text: 'IV %', color: '#8888a0' }
+                            }
+                        },
+                        plugins: {
+                            legend: { labels: { color: '#f0f0f5' } }
+                        }
+                    }
+                });
+            }
+        }
+
+        function renderFallbackDashboard(state, dashboard) {
+            let html = '';
             const metrics = [];
             for (const [key, value] of Object.entries(state)) {
                 if (typeof value === 'number' || typeof value === 'string') {
@@ -677,13 +911,11 @@ const FRONTEND_HTML: &str = r##"<!DOCTYPE html>
             if (metrics.length > 0) {
                 html += `
                     <div class="card">
-                        <div class="card-header">
-                            <span class="card-title">Metrics</span>
-                        </div>
+                        <div class="card-header"><span class="card-title">Metrics</span></div>
                         <div class="metric-grid">
                             ${metrics.map(m => `
                                 <div class="metric">
-                                    <div class="metric-label">${formatLabel(m.key)}</div>
+                                    <div class="metric-label">${m.key.replace(/_/g, ' ').toUpperCase()}</div>
                                     <div class="metric-value">${formatValue(m.value)}</div>
                                 </div>
                             `).join('')}
@@ -692,70 +924,37 @@ const FRONTEND_HTML: &str = r##"<!DOCTYPE html>
                 `;
             }
 
-            // Instruments
-            const strategy = strategies.find(s => s.name === activeStrategy);
-            if (strategy && strategy.instruments.length > 0) {
-                html += `
-                    <div class="card">
-                        <div class="card-header">
-                            <span class="card-title">Instruments</span>
-                        </div>
-                        <div class="instruments">
-                            ${strategy.instruments.map(i => `
-                                <span class="instrument-tag">${i}</span>
-                            `).join('')}
-                        </div>
-                    </div>
-                `;
-            }
-
-            // Log entries
-            if (state.log && Array.isArray(state.log)) {
+            if (Array.isArray(state.log)) {
                 html += `
                     <div class="card log-container">
-                        <div class="card-header">
-                            <span class="card-title">Activity Log</span>
-                        </div>
+                        <div class="card-header"><span class="card-title">Activity Log</span></div>
                         <div class="log">
                             ${state.log.slice(-50).reverse().map(entry => `
                                 <div class="log-entry">
                                     <span class="log-time">${entry.time || ''}</span>
-                                    <span class="log-message ${entry.type === 'signal' ? 'signal' : ''}">${entry.message}</span>
+                                    <span class="log-message">${entry.message}</span>
                                 </div>
                             `).join('')}
                         </div>
                     </div>
                 `;
             }
-
-            // Price history chart placeholder
-            if (state.price_history && Array.isArray(state.price_history)) {
-                html += `
-                    <div class="card">
-                        <div class="card-header">
-                            <span class="card-title">Price History</span>
-                        </div>
-                        <div class="metric-grid">
-                            ${state.price_history.slice(-4).map((p, i) => `
-                                <div class="metric">
-                                    <div class="metric-label">Tick ${i + 1}</div>
-                                    <div class="metric-value">${formatValue(p)}</div>
-                                </div>
-                            `).join('')}
-                        </div>
-                    </div>
-                `;
-            }
-
-            dashboard.innerHTML = html || '<div class="empty-state"><h2>No data available</h2></div>';
+            dashboard.innerHTML = html;
         }
 
-        function formatLabel(key) {
-            return key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-        }
-
-        function formatValue(value) {
+        function formatValue(value, format) {
+            if (value === null || value === undefined) return '-';
+            
             if (typeof value === 'number') {
+                if (format) {
+                    // Simple format support (e.g., "${:,.0}")
+                    if (format.startsWith('${')) {
+                        return '$' + value.toLocaleString(undefined, { maximumFractionDigits: 0 });
+                    }
+                    if (format.includes('.2f')) return value.toFixed(2);
+                    if (format.includes('.1f')) return value.toFixed(1);
+                    if (format.includes('.4f')) return value.toFixed(4);
+                }
                 if (Math.abs(value) < 0.01) return value.toFixed(6);
                 if (Math.abs(value) < 1) return value.toFixed(4);
                 if (Math.abs(value) < 100) return value.toFixed(2);
