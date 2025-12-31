@@ -829,6 +829,7 @@ impl CrossMarketStrategy {
                 now_ms,
                 Some(&market.yes_token_id),
                 Some(&market.no_token_id),
+                Some(time_to_expiry), // Pass vol-weighted time
             );
             
             if !opps.is_empty() {
@@ -856,6 +857,20 @@ impl CrossMarketStrategy {
             let liquidity = ticker.best_bid_amount.unwrap_or(0.0)
                 .min(ticker.best_ask_amount.unwrap_or(0.0));
 
+            // Calculate vol-weighted time for Derive options too
+            let time_to_expiry = if let Some(ref calc) = state.vol_time_calculator {
+                let now_dt = chrono::DateTime::from_timestamp_millis(now_ms)
+                    .unwrap_or_else(|| chrono::Utc::now())
+                    .with_timezone(&chrono::Utc);
+                let expiry_dt = chrono::DateTime::from_timestamp_millis(ticker.expiry_timestamp)
+                    .unwrap_or_else(|| chrono::Utc::now())
+                    .with_timezone(&chrono::Utc);
+                let vol_weighted_seconds = calc.get_vol_time(now_dt, expiry_dt);
+                Some(VolTimeCalculator::vol_seconds_to_years(vol_weighted_seconds))
+            } else {
+                None // Will use calendar time in scanner
+            };
+
             let opps = self.scanner.scan_vanilla_option(
                 &ticker.instrument_name,
                 option_type,
@@ -866,6 +881,7 @@ impl CrossMarketStrategy {
                 liquidity,
                 &state.vol_surface,
                 now_ms,
+                time_to_expiry, // Pass vol-weighted time
             );
             
             if !opps.is_empty() {

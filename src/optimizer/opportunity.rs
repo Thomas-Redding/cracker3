@@ -153,6 +153,7 @@ impl OpportunityScanner {
     /// * `now_ms` - Current timestamp
     /// * `yes_token_id` - Token ID for YES
     /// * `no_token_id` - Token ID for NO
+    /// * `time_to_expiry` - Optional vol-weighted time to expiry in years. If None, uses calendar time.
     pub fn scan_binary_option(
         &self,
         market_id: &str,
@@ -167,11 +168,14 @@ impl OpportunityScanner {
         now_ms: i64,
         yes_token_id: Option<&str>,
         no_token_id: Option<&str>,
+        time_to_expiry: Option<f64>,
     ) -> Vec<Opportunity> {
         let mut opportunities = Vec::new();
 
-        // Calculate time to expiry
-        let time_to_expiry = (expiry_timestamp - now_ms) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0);
+        // Use provided time_to_expiry or calculate using calendar time
+        let time_to_expiry = time_to_expiry.unwrap_or_else(|| {
+            (expiry_timestamp - now_ms) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0)
+        });
         
         if time_to_expiry <= 0.0 || time_to_expiry > self.config.max_time_to_expiry {
             return opportunities;
@@ -248,6 +252,7 @@ impl OpportunityScanner {
     }
 
     /// Scans a vanilla option for opportunities.
+    /// * `time_to_expiry` - Optional vol-weighted time to expiry in years. If None, uses calendar time.
     pub fn scan_vanilla_option(
         &self,
         instrument_id: &str,
@@ -259,10 +264,14 @@ impl OpportunityScanner {
         liquidity: f64,
         surface: &VolatilitySurface,
         now_ms: i64,
+        time_to_expiry: Option<f64>,
     ) -> Vec<Opportunity> {
         let mut opportunities = Vec::new();
 
-        let time_to_expiry = (expiry_timestamp - now_ms) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0);
+        // Use provided time_to_expiry or calculate using calendar time
+        let time_to_expiry = time_to_expiry.unwrap_or_else(|| {
+            (expiry_timestamp - now_ms) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0)
+        });
         
         if time_to_expiry <= 0.0 || time_to_expiry > self.config.max_time_to_expiry {
             return opportunities;
@@ -487,6 +496,7 @@ mod tests {
             now_ms,
             Some("yes_token"),
             Some("no_token"),
+            None, // Use calendar time in tests
         );
 
         assert!(!opps.is_empty());
@@ -526,6 +536,7 @@ mod tests {
             10.0,
             &surface,
             now_ms,
+            None, // Use calendar time in tests
         );
 
         assert!(!opps.is_empty());
@@ -555,6 +566,7 @@ mod tests {
             now_ms,
             Some("yes_token"),
             Some("no_token"),
+            None, // Use calendar time in tests
         );
 
         // Should find no opportunities since edge < min_edge (10%)
@@ -584,6 +596,7 @@ mod tests {
             now_ms,
             Some("yes_token"),
             Some("no_token"),
+            None, // Use calendar time in tests
         );
 
         assert!(opps.is_empty());
@@ -609,6 +622,7 @@ mod tests {
             now_ms,
             Some("yes_token"),
             Some("no_token"),
+            None, // Use calendar time in tests
         );
 
         assert!(opps.is_empty());
@@ -635,6 +649,7 @@ mod tests {
             now_ms,
             Some("yes_token"),
             Some("no_token"),
+            None, // Use calendar time in tests
         );
 
         assert!(opps.is_empty());
@@ -672,6 +687,7 @@ mod tests {
             10.0,
             &surface,
             now_ms,
+            None, // Use calendar time in tests
         );
 
         assert!(!opps.is_empty());
@@ -710,6 +726,7 @@ mod tests {
             10.0,
             &surface,
             now_ms,
+            None, // Use calendar time in tests
         );
 
         assert!(!opps.is_empty());
@@ -788,6 +805,7 @@ mod tests {
             now_ms,
             Some("yes_token"),
             Some("no_token"),
+            None, // Use calendar time in tests
         );
 
         // Should find opportunity on NO side
