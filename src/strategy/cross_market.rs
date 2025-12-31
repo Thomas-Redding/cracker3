@@ -15,7 +15,9 @@ use crate::pricing::{
 };
 use crate::traits::{Dashboard, DashboardSchema, SharedExecutionRouter, Strategy, Widget, TableColumn};
 use async_trait::async_trait;
-use log::{debug, info};
+use chrono::{Datelike, TimeZone};
+use chrono_tz::America::New_York;
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -396,7 +398,18 @@ impl CrossMarketStrategy {
         
         let now_ms = chrono::Utc::now().timestamp_millis();
         
-        let discoveries: Vec<PolymarketDiscovery> = markets
+        // Collect markets into a vector so we can reference them later
+        let markets_vec: Vec<_> = markets;
+        
+        // Build map for end_date_iso lookup (for debugging)
+        let mut end_date_map: HashMap<String, String> = HashMap::new();
+        for m in &markets_vec {
+            if let Some(end_date) = m.extra.get("end_date_iso").and_then(|v| v.as_str()) {
+                end_date_map.insert(m.id.clone(), end_date.to_string());
+            }
+        }
+        
+        let discoveries: Vec<PolymarketDiscovery> = markets_vec
             .into_iter()
             .filter_map(|m| {
                 // Must have "bitcoin" in slug (case insensitive check)
@@ -440,13 +453,19 @@ impl CrossMarketStrategy {
         
         println!("Polymarket: Found {} active BTC price markets:", discoveries.len());
         for d in &discoveries {
+            let expiry_str = chrono::DateTime::from_timestamp_millis(d.expiry_ms)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| "?".to_string());
+            
             println!("  - {} @ ${:.0} (expires {})", 
                 d.question.chars().take(60).collect::<String>(),
                 d.strike,
-                chrono::DateTime::from_timestamp_millis(d.expiry_ms)
-                    .map(|dt| dt.format("%Y-%m-%d").to_string())
-                    .unwrap_or_else(|| "?".to_string())
+                expiry_str
             );
+            
+            if let Some(end_date) = end_date_map.get(&d.condition_id) {
+                println!("    end_date_iso: {}", end_date);
+            }
         }
         Ok(discoveries)
     }
@@ -491,13 +510,41 @@ impl CrossMarketStrategy {
     }
 
     /// Parses expiry timestamp from market extra fields.
+    /// 
+    /// For Polymarket BTC markets, checks the description for "12:00 in the ET timezone"
+    /// and uses that time instead of the midnight UTC in end_date_iso.
+    /// ET (Eastern Time) is UTC-5 (EST) or UTC-4 (EDT) depending on daylight saving time.
     fn parse_expiry_from_market(market: &crate::catalog::MarketInfo) -> Option<i64> {
         // Look for end_date_iso in extra
         let end_date = market.extra.get("end_date_iso")?.as_str()?;
         
-        // Parse ISO 8601 date
-        let dt = chrono::DateTime::parse_from_rfc3339(end_date).ok()?;
-        Some(dt.timestamp_millis())
+        // Parse ISO 8601 date to get the date
+        let dt_utc = chrono::DateTime::parse_from_rfc3339(end_date).ok()?;
+        let date = dt_utc.date_naive();
+        
+        // Check description for "12:00 in the ET timezone" or similar patterns
+        let use_et_noon = market.description.as_ref()
+            .map(|desc| {
+                desc.contains("12:00") && 
+                (desc.contains("ET timezone") || desc.contains("ET") || desc.contains("Eastern"))
+            })
+            .unwrap_or(false);
+        
+        if use_et_noon {
+            // Markets resolve at 12:00 ET (noon Eastern Time)
+            // Use chrono-tz for accurate DST handling (America/New_York timezone)
+            // This automatically handles EST (UTC-5) vs EDT (UTC-4) transitions
+            let et_noon = date.and_hms_opt(12, 0, 0)?;
+            
+            // Convert 12:00 ET to UTC using proper timezone with DST support
+            let et_datetime = New_York.from_local_datetime(&et_noon).single()?;
+            let utc_datetime = et_datetime.with_timezone(&chrono::Utc);
+            
+            Some(utc_datetime.timestamp_millis())
+        } else {
+            // Fall back to the time specified in end_date_iso
+            Some(dt_utc.timestamp_millis())
+        }
     }
 
     /// Parses YES/NO tokens from market.
@@ -1006,27 +1053,55 @@ impl Dashboard for CrossMarketStrategy {
         let state = self.state.read().await;
 
         let opportunities: Vec<Value> = state.opportunities.iter()
-            .map(|o| json!({
-                "id": o.id,
-                "type": format!("{:?}", o.opportunity_type),
-                "exchange": o.exchange,
-                "description": o.description,
-                "strike": o.strike,
-                "edge": format!("{:.1}%", o.edge * 100.0),
-                "market_price": format!("{:.4}", o.market_price),
-                "fair_value": format!("{:.4}", o.fair_value),
-                "liquidity": o.liquidity,
-            }))
+            .map(|o| {
+                let expiry_str = chrono::DateTime::from_timestamp_millis(o.expiry_timestamp)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                
+                json!({
+                    "id": o.id,
+                    "type": format!("{:?}", o.opportunity_type),
+                    "exchange": o.exchange,
+                    "description": o.description,
+                    "strike": format!("${:.0}", o.strike),
+                    "expiry": expiry_str,
+                    "edge": format!("{:.1}%", o.edge * 100.0),
+                    "market_price": format!("{:.4}", o.market_price),
+                    "fair_value": format!("{:.4}", o.fair_value),
+                    "liquidity": o.liquidity,
+                })
+            })
+            .collect();
+
+        // Build a map of opportunity_id -> (strike, expiry) for position lookups
+        let opp_map: HashMap<String, (f64, i64)> = state.opportunities.iter()
+            .map(|o| (o.id.clone(), (o.strike, o.expiry_timestamp)))
             .collect();
 
         let positions: Vec<Value> = state.portfolio.as_ref()
             .map(|p| p.positions.iter()
-                .map(|pos| json!({
-                    "opportunity_id": pos.opportunity_id,
-                    "size": format!("{:.2}", pos.size),
-                    "dollar_value": format!("${:.2}", pos.dollar_value),
-                    "expected_profit": format!("${:.2}", pos.expected_profit),
-                }))
+                .filter_map(|pos| {
+                    match opp_map.get(&pos.opportunity_id) {
+                        Some((strike, expiry_ts)) => {
+                            let expiry_str = chrono::DateTime::from_timestamp_millis(*expiry_ts)
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                                .unwrap_or_else(|| "?".to_string());
+                            
+                            Some(json!({
+                                "opportunity_id": pos.opportunity_id,
+                                "strike": format!("${:.0}", strike),
+                                "expiry": expiry_str,
+                                "size": format!("{:.2}", pos.size),
+                                "dollar_value": format!("${:.2}", pos.dollar_value),
+                                "expected_profit": format!("${:.2}", pos.expected_profit),
+                            }))
+                        }
+                        None => {
+                            warn!("Position references missing opportunity_id: {}", pos.opportunity_id);
+                            None
+                        }
+                    }
+                })
                 .collect())
             .unwrap_or_default();
 
@@ -1107,6 +1182,8 @@ impl Dashboard for CrossMarketStrategy {
                         TableColumn { header: "ID".to_string(), key: "id".to_string(), format: None },
                         TableColumn { header: "Type".to_string(), key: "type".to_string(), format: None },
                         TableColumn { header: "Exchange".to_string(), key: "exchange".to_string(), format: None },
+                        TableColumn { header: "Strike".to_string(), key: "strike".to_string(), format: None },
+                        TableColumn { header: "Expiry".to_string(), key: "expiry".to_string(), format: None },
                         TableColumn { header: "Edge".to_string(), key: "edge".to_string(), format: None },
                         TableColumn { header: "Market".to_string(), key: "market_price".to_string(), format: None },
                         TableColumn { header: "Fair".to_string(), key: "fair_value".to_string(), format: None },
@@ -1118,6 +1195,8 @@ impl Dashboard for CrossMarketStrategy {
                     title: "Optimized Positions".to_string(),
                     columns: vec![
                         TableColumn { header: "Opportunity".to_string(), key: "opportunity_id".to_string(), format: None },
+                        TableColumn { header: "Strike".to_string(), key: "strike".to_string(), format: None },
+                        TableColumn { header: "Expiry".to_string(), key: "expiry".to_string(), format: None },
                         TableColumn { header: "Size".to_string(), key: "size".to_string(), format: None },
                         TableColumn { header: "Value".to_string(), key: "dollar_value".to_string(), format: None },
                         TableColumn { header: "E[Profit]".to_string(), key: "expected_profit".to_string(), format: None },
