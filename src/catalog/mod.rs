@@ -123,7 +123,8 @@ pub trait Catalog: Send + Sync {
     fn last_updated(&self) -> u64;
 
     /// Returns all historical diffs, newest first.
-    fn diffs(&self) -> &[CatalogDiff<Self::Item>];
+    /// Returns an owned Vec since the data is typically behind a lock.
+    fn diffs(&self) -> Vec<CatalogDiff<Self::Item>>;
 
     /// Returns the number of items currently in the catalog.
     fn len(&self) -> usize {
@@ -342,6 +343,200 @@ pub trait MarketCatalog: Send + Sync {
 
 /// Shared catalog for use across strategies.
 pub type SharedMarketCatalog = Arc<dyn MarketCatalog>;
+
+// =============================================================================
+// Generic Catalog Core (shared state management)
+// =============================================================================
+
+/// Internal state for catalog implementations.
+/// This struct encapsulates the common state pattern used across all catalogs.
+#[derive(Default)]
+pub struct CatalogState<T: Clone> {
+    /// Current items indexed by ID.
+    pub items: HashMap<String, T>,
+    /// Historical diffs, newest first.
+    pub diffs: Vec<CatalogDiff<T>>,
+    /// Unix timestamp of last update.
+    pub last_updated: u64,
+}
+
+impl<T: Clone> CatalogState<T> {
+    /// Create a new empty state.
+    pub fn new() -> Self {
+        Self {
+            items: HashMap::new(),
+            diffs: Vec::new(),
+            last_updated: 0,
+        }
+    }
+
+    /// Get item count.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Check if empty.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+/// Core catalog functionality that can be shared across implementations.
+/// 
+/// Provides common patterns for loading, saving, and time-travel operations.
+/// Catalog implementations can use these helper methods to reduce duplication.
+pub struct CatalogCore;
+
+impl CatalogCore {
+    /// Load catalog state from a JSONL file.
+    /// 
+    /// File format:
+    /// - Line 1: Current state snapshot
+    /// - Line 2+: Historical diffs (newest first)
+    pub fn load_from_disk<T>(
+        path: &str,
+        id_fn: fn(&T) -> String,
+    ) -> Option<CatalogState<T>>
+    where
+        T: Clone + serde::de::DeserializeOwned,
+    {
+        use std::fs::File;
+        use std::io::{BufRead, BufReader};
+        
+        let file = File::open(path).ok()?;
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+
+        let first_line = lines.next()?.ok()?;
+        let first_entry: CatalogFileEntry<T> = serde_json::from_str(&first_line).ok()?;
+
+        let (items, last_updated) = match first_entry {
+            CatalogFileEntry::Current { timestamp, items: item_list } => {
+                let map: HashMap<String, T> = item_list
+                    .into_iter()
+                    .map(|i| (id_fn(&i), i))
+                    .collect();
+                (map, timestamp)
+            }
+            _ => return None,
+        };
+
+        let mut diffs = Vec::new();
+        for line in lines {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let entry: CatalogFileEntry<T> = match serde_json::from_str(&line) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            if let CatalogFileEntry::Diff(diff) = entry {
+                diffs.push(diff);
+            }
+        }
+
+        Some(CatalogState {
+            items,
+            diffs,
+            last_updated,
+        })
+    }
+
+    /// Save catalog state to a JSONL file.
+    pub fn save_to_disk<T>(
+        path: &str,
+        state: &CatalogState<T>,
+    ) -> Result<(), String>
+    where
+        T: Clone + Serialize,
+    {
+        use std::fs::File;
+        use std::io::Write;
+        
+        let mut file = File::create(path)
+            .map_err(|e| format!("Failed to create cache file: {}", e))?;
+
+        let current_entry = CatalogFileEntry::Current {
+            timestamp: state.last_updated,
+            items: state.items.values().cloned().collect(),
+        };
+        writeln!(file, "{}", serde_json::to_string(&current_entry).unwrap())
+            .map_err(|e| format!("Failed to write current state: {}", e))?;
+
+        for diff in &state.diffs {
+            let diff_entry: CatalogFileEntry<T> = CatalogFileEntry::Diff(diff.clone());
+            writeln!(file, "{}", serde_json::to_string(&diff_entry).unwrap())
+                .map_err(|e| format!("Failed to write diff: {}", e))?;
+        }
+
+        Ok(())
+    }
+
+    /// Reconstruct state as of a given timestamp using diffs.
+    pub fn as_of<T, F>(
+        current_items: &HashMap<String, T>,
+        diffs: &[CatalogDiff<T>],
+        timestamp: u64,
+        id_fn: F,
+    ) -> HashMap<String, T>
+    where
+        T: Clone,
+        F: Fn(&T) -> String,
+    {
+        let mut result = current_items.clone();
+
+        for diff in diffs {
+            if diff.timestamp <= timestamp {
+                break;
+            }
+            let inverted = invert_diff(diff);
+            apply_diff(&mut result, &inverted, &id_fn);
+        }
+
+        result
+    }
+
+    /// Check if a timestamp is stale relative to a threshold.
+    pub fn is_stale(last_updated: u64, threshold_secs: u64) -> bool {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        now - last_updated > threshold_secs
+    }
+}
+
+// =============================================================================
+// Default Stale Thresholds
+// =============================================================================
+
+/// Default stale threshold for options exchanges (1 hour).
+pub const DEFAULT_OPTIONS_STALE_THRESHOLD_SECS: u64 = 3600;
+
+/// Default stale threshold for prediction markets (1 day).
+pub const DEFAULT_MARKET_STALE_THRESHOLD_SECS: u64 = 86400;
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+/// Format a Unix timestamp for logging.
+pub fn format_timestamp(ts: u64) -> String {
+    if ts == 0 {
+        return "never".to_string();
+    }
+    chrono::DateTime::from_timestamp(ts as i64, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| format!("unix:{}", ts))
+}
 
 // =============================================================================
 // Tests

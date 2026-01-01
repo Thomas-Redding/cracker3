@@ -186,7 +186,7 @@ async fn test_polymarket_connector_live() {
 
     // Step 1: Load catalog and find the market
     println!("Step 1: Loading Polymarket catalog...");
-    let catalog = PolymarketCatalog::new(None).await;
+    let catalog = PolymarketCatalog::new(None, None).await;
     
     // Wait for catalog to be populated
     assert!(
@@ -345,7 +345,7 @@ async fn test_market_lookup() {
 
     println!("\n=== Market Lookup Test ===");
     
-    let catalog = PolymarketCatalog::new(None).await;
+    let catalog = PolymarketCatalog::new(None, None).await;
     
     assert!(
         ensure_catalog_populated(&catalog, TEST_MARKET_SLUG).await,
@@ -394,7 +394,7 @@ async fn test_order_book_consistency() {
 
     println!("\n=== Order Book Consistency Test ===");
     
-    let catalog = PolymarketCatalog::new(None).await;
+    let catalog = PolymarketCatalog::new(None, None).await;
     
     assert!(
         ensure_catalog_populated(&catalog, TEST_MARKET_SLUG).await,

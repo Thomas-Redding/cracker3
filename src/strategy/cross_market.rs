@@ -414,7 +414,7 @@ impl CrossMarketStrategy {
     /// Fetches Polymarket markets matching a pattern (e.g., "bitcoin-above").
     async fn fetch_polymarket_markets(pattern: &str) -> Result<Vec<PolymarketDiscovery>, String> {
         // Create catalog (loads from cache or fetches)
-        let catalog = PolymarketCatalog::new(None).await;
+        let catalog = PolymarketCatalog::new(None, None).await;
         
         // Search for markets matching the pattern
         let markets = catalog.find_by_slug_regex(pattern)

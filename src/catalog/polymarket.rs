@@ -5,8 +5,9 @@
 // Tracks all changes (added/removed/modified) for historical reconstruction.
 
 use super::{
-    apply_diff, compute_diff, invert_diff, Catalog, CatalogDiff, CatalogFileEntry,
-    MarketCatalog, MarketInfo, SearchResult, TokenInfo,
+    apply_diff, compute_diff, format_timestamp, invert_diff, Catalog, CatalogDiff,
+    CatalogFileEntry, MarketCatalog, MarketInfo, SearchResult, TokenInfo,
+    DEFAULT_MARKET_STALE_THRESHOLD_SECS,
 };
 use async_trait::async_trait;
 use log::{error, info, warn};
@@ -21,7 +22,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const POLYMARKET_CLOB_URL: &str = "https://clob.polymarket.com";
 const DEFAULT_CACHE_PATH: &str = "polymarket_markets.jsonl";
-const STALE_THRESHOLD_SECS: u64 = 86400; // 1 day
 
 /// Static flag to prevent multiple concurrent auto-refreshes.
 /// Only one background refresh can run at a time across all catalog instances.
@@ -92,14 +92,20 @@ pub struct PolymarketCatalog {
     inner: RwLock<CatalogState>,
     cache_path: String,
     http_client: reqwest::Client,
+    /// Stale threshold in seconds (triggers auto-refresh when exceeded)
+    stale_threshold_secs: u64,
 }
 
 impl PolymarketCatalog {
     /// Create a new catalog, loading from cache if available.
     /// 
-    /// If the cache is stale (>1 day), spawns a background refresh task.
-    pub async fn new(cache_path: Option<&str>) -> Arc<Self> {
+    /// If the cache is stale, spawns a background refresh task.
+    pub async fn new(
+        cache_path: Option<&str>,
+        stale_threshold_secs: Option<u64>,
+    ) -> Arc<Self> {
         let cache_path = cache_path.unwrap_or(DEFAULT_CACHE_PATH).to_string();
+        let stale_threshold_secs = stale_threshold_secs.unwrap_or(DEFAULT_MARKET_STALE_THRESHOLD_SECS);
         let state = Self::load_from_disk(&cache_path).unwrap_or_default();
         
         let loaded_count = state.markets.len();
@@ -110,6 +116,7 @@ impl PolymarketCatalog {
             inner: RwLock::new(state),
             cache_path,
             http_client: reqwest::Client::new(),
+            stale_threshold_secs,
         });
 
         if loaded_count > 0 {
@@ -157,6 +164,7 @@ impl PolymarketCatalog {
             inner: RwLock::new(CatalogState::default()),
             cache_path: DEFAULT_CACHE_PATH.to_string(),
             http_client: reqwest::Client::new(),
+            stale_threshold_secs: DEFAULT_MARKET_STALE_THRESHOLD_SECS,
         })
     }
 
@@ -165,7 +173,7 @@ impl PolymarketCatalog {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        now - last_updated > STALE_THRESHOLD_SECS
+        now - last_updated > self.stale_threshold_secs
     }
 
     /// Check if the catalog cache is stale.
@@ -443,10 +451,8 @@ impl Catalog for PolymarketCatalog {
         self.inner.read().unwrap().last_updated
     }
 
-    fn diffs(&self) -> &[CatalogDiff<MarketInfo>] {
-        // Note: This is a limitation - we can't return a reference to data behind RwLock
-        // In practice, callers should use as_of() instead
-        &[]
+    fn diffs(&self) -> Vec<CatalogDiff<MarketInfo>> {
+        self.inner.read().unwrap().diffs.clone()
     }
 
     fn len(&self) -> usize {
@@ -588,16 +594,6 @@ impl MarketCatalog for PolymarketCatalog {
     }
 }
 
-/// Format a Unix timestamp for logging.
-fn format_timestamp(ts: u64) -> String {
-    if ts == 0 {
-        return "never".to_string();
-    }
-    chrono::DateTime::from_timestamp(ts as i64, 0)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_else(|| format!("unix:{}", ts))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,7 +627,11 @@ mod tests {
         let catalog = PolymarketCatalog {
             inner: RwLock::new(state),
             cache_path: "test.jsonl".to_string(),
-            http_client: reqwest::Client::new(),
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            stale_threshold_secs: DEFAULT_MARKET_STALE_THRESHOLD_SECS,
         };
 
         let result = catalog.as_of(500);
