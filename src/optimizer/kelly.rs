@@ -334,7 +334,7 @@ impl KellyOptimizer {
                     expiry_dist.ppf(percentile)
                 } else {
                     // For non-matching expiries (e.g., Polymarket), use price interpolation
-                    distribution.ppf_interpolated(percentile, time_to_expiry)
+                    distribution.ppf_interpolated(percentile, expiry_ts)
                         .unwrap_or_else(|| {
                             // Fallback: use spot price with simple lognormal assumption
                             let spot = distribution.spot();

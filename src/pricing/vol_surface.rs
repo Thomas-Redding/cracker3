@@ -11,6 +11,9 @@
 use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 use log::{debug, warn};
+use chrono::{DateTime, Utc};
+
+use super::vol_time::VolTimeStrategy;
 
 /// A single IV point on the surface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,15 +194,35 @@ impl VolatilitySurface {
         self.smiles.get(&expiry_timestamp)?.get_iv(strike)
     }
 
-    /// Gets the IV at a specific strike and time to expiry.
+    /// Gets the IV at a specific strike and expiry timestamp.
+    /// 
     /// Uses total variance interpolation between expiries for calendar arbitrage-free pricing.
-    pub fn get_iv_interpolated(&self, strike: f64, time_to_expiry: f64, now_ms: i64) -> Option<f64> {
+    /// When a vol-time strategy is provided, uses vol-weighted time for interpolation weights
+    /// but calendar time for variance calculations and final IV recovery.
+    /// 
+    /// # Arguments
+    /// * `strike` - The strike price
+    /// * `target_expiry_ms` - Target expiry timestamp in milliseconds (calendar time)
+    /// * `now_ms` - Current timestamp in milliseconds
+    /// * `vol_time_strategy` - Optional vol-time strategy for interpolation weights.
+    ///   If None, uses calendar time for interpolation (standard behavior).
+    pub fn get_iv_interpolated(
+        &self,
+        strike: f64,
+        target_expiry_ms: i64,
+        now_ms: i64,
+        vol_time_strategy: Option<&dyn VolTimeStrategy>,
+    ) -> Option<f64> {
         if self.smiles.is_empty() {
             return None;
         }
 
-        // Target expiry timestamp
-        let target_expiry_ms = now_ms + (time_to_expiry * 365.25 * 24.0 * 3600.0 * 1000.0) as i64;
+        // Calculate calendar time to target expiry
+        let t_target_calendar = (target_expiry_ms - now_ms) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0);
+        
+        if t_target_calendar <= 0.0 {
+            return None;
+        }
 
         // Find surrounding expiries
         let mut near_expiry: Option<(i64, &VolSmile)> = None;
@@ -221,43 +244,127 @@ impl VolatilitySurface {
                 near_smile.get_iv(strike)
             }
             // Both bounds exist - interpolate using total variance
-            (Some((_near_ts, near_smile)), Some((_far_ts, far_smile))) => {
+            (Some((near_ts, near_smile)), Some((far_ts, far_smile))) => {
                 let near_iv = near_smile.get_iv(strike)?;
                 let far_iv = far_smile.get_iv(strike)?;
 
-                let t_near = near_smile.time_to_expiry;
-                let t_far = far_smile.time_to_expiry;
+                // Calendar times for variance calculations (from smiles)
+                let t_near_calendar = near_smile.time_to_expiry;
+                let t_far_calendar = far_smile.time_to_expiry;
 
-                if (t_far - t_near).abs() < 1e-10 {
+                if (t_far_calendar - t_near_calendar).abs() < 1e-10 {
                     return Some(near_iv);
                 }
 
-                // Total variance interpolation: Var = σ² × T
-                let var_near = near_iv.powi(2) * t_near;
-                let var_far = far_iv.powi(2) * t_far;
+                // Total variance at each Deribit expiry (using calendar time - ground truth)
+                let var_near = near_iv.powi(2) * t_near_calendar;
+                let var_far = far_iv.powi(2) * t_far_calendar;
 
-                // Interpolation weight
-                let w = (time_to_expiry - t_near) / (t_far - t_near);
+                // Calculate interpolation weight
+                // If vol-time strategy provided, use vol-weighted time for the weight
+                // Otherwise use calendar time
+                let w = if let Some(strategy) = vol_time_strategy {
+                    // Convert timestamps to DateTime for vol-time calculation
+                    let now_dt = DateTime::from_timestamp_millis(now_ms)
+                        .unwrap_or_else(|| Utc::now());
+                    let near_dt = DateTime::from_timestamp_millis(near_ts)
+                        .unwrap_or_else(|| Utc::now());
+                    let far_dt = DateTime::from_timestamp_millis(far_ts)
+                        .unwrap_or_else(|| Utc::now());
+                    let target_dt = DateTime::from_timestamp_millis(target_expiry_ms)
+                        .unwrap_or_else(|| Utc::now());
+                    
+                    // Vol-weighted times from now to each expiry
+                    let tau_near = strategy.get_vol_time(now_dt, near_dt);
+                    let tau_far = strategy.get_vol_time(now_dt, far_dt);
+                    let tau_target = strategy.get_vol_time(now_dt, target_dt);
+                    
+                    if (tau_far - tau_near).abs() < 1e-10 {
+                        0.5 // Fallback if vol-times are equal
+                    } else {
+                        (tau_target - tau_near) / (tau_far - tau_near)
+                    }
+                } else {
+                    // Standard calendar time interpolation
+                    (t_target_calendar - t_near_calendar) / (t_far_calendar - t_near_calendar)
+                };
+                
                 let w = w.clamp(0.0, 1.0);
 
+                // Interpolate total variance
                 let var_target = var_near * (1.0 - w) + var_far * w;
 
-                // Recover IV from total variance
-                if time_to_expiry > 1e-10 && var_target >= 0.0 {
-                    Some((var_target / time_to_expiry).sqrt())
+                // Recover IV from total variance using CALENDAR time
+                // (IV is quoted in standard annualized terms against calendar time)
+                if t_target_calendar > 1e-10 && var_target >= 0.0 {
+                    Some((var_target / t_target_calendar).sqrt())
                 } else {
                     Some(near_iv)
                 }
             }
-            // Only near expiry - extrapolate flat
-            (Some((_, near_smile)), None) => {
+            // Only near expiry - extrapolate using vol-weighted ratio
+            (Some((near_ts, near_smile)), None) => {
                 debug!("Vol surface: extrapolating beyond far expiry");
-                near_smile.get_iv(strike)
+                let near_iv = near_smile.get_iv(strike)?;
+                
+                // For extrapolation beyond the farthest expiry, we can use vol-weighted
+                // time to estimate how much additional variance accumulates
+                if let Some(strategy) = vol_time_strategy {
+                    let now_dt = DateTime::from_timestamp_millis(now_ms)
+                        .unwrap_or_else(|| Utc::now());
+                    let near_dt = DateTime::from_timestamp_millis(near_ts)
+                        .unwrap_or_else(|| Utc::now());
+                    let target_dt = DateTime::from_timestamp_millis(target_expiry_ms)
+                        .unwrap_or_else(|| Utc::now());
+                    
+                    let tau_near = strategy.get_vol_time(now_dt, near_dt);
+                    let tau_target = strategy.get_vol_time(now_dt, target_dt);
+                    
+                    if tau_near > 1e-10 {
+                        // Variance scales with vol-weighted time
+                        let t_near_calendar = near_smile.time_to_expiry;
+                        let var_near = near_iv.powi(2) * t_near_calendar;
+                        let var_target = var_near * (tau_target / tau_near);
+                        
+                        if t_target_calendar > 1e-10 && var_target >= 0.0 {
+                            return Some((var_target / t_target_calendar).sqrt());
+                        }
+                    }
+                }
+                // Fallback to flat IV extrapolation
+                Some(near_iv)
             }
-            // Only far expiry - extrapolate flat
-            (None, Some((_, far_smile))) => {
+            // Only far expiry - extrapolate using vol-weighted ratio
+            (None, Some((far_ts, far_smile))) => {
                 debug!("Vol surface: extrapolating before near expiry");
-                far_smile.get_iv(strike)
+                let far_iv = far_smile.get_iv(strike)?;
+                
+                // For extrapolation before the nearest expiry, we estimate what fraction
+                // of the nearest expiry's variance falls in the shorter period
+                if let Some(strategy) = vol_time_strategy {
+                    let now_dt = DateTime::from_timestamp_millis(now_ms)
+                        .unwrap_or_else(|| Utc::now());
+                    let far_dt = DateTime::from_timestamp_millis(far_ts)
+                        .unwrap_or_else(|| Utc::now());
+                    let target_dt = DateTime::from_timestamp_millis(target_expiry_ms)
+                        .unwrap_or_else(|| Utc::now());
+                    
+                    let tau_far = strategy.get_vol_time(now_dt, far_dt);
+                    let tau_target = strategy.get_vol_time(now_dt, target_dt);
+                    
+                    if tau_far > 1e-10 {
+                        // Variance scales with vol-weighted time
+                        let t_far_calendar = far_smile.time_to_expiry;
+                        let var_far = far_iv.powi(2) * t_far_calendar;
+                        let var_target = var_far * (tau_target / tau_far);
+                        
+                        if t_target_calendar > 1e-10 && var_target >= 0.0 {
+                            return Some((var_target / t_target_calendar).sqrt());
+                        }
+                    }
+                }
+                // Fallback to flat IV extrapolation
+                Some(far_iv)
             }
             _ => None,
         }
@@ -466,7 +573,8 @@ mod tests {
         surface.add_smile(far_expiry_ms, far_smile);
 
         // Interpolate at T=0.5 (6 months)
-        let iv_6m = surface.get_iv_interpolated(100_000.0, 0.5, now_ms);
+        let target_expiry_ms = now_ms + (0.5 * 365.25 * 24.0 * 3600.0 * 1000.0) as i64;
+        let iv_6m = surface.get_iv_interpolated(100_000.0, target_expiry_ms, now_ms, None);
         assert!(iv_6m.is_some());
         let iv = iv_6m.unwrap();
         

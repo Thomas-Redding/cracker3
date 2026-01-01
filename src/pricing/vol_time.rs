@@ -6,6 +6,10 @@
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
 
 /// Trait for calculating volatility-weighted time between timestamps.
+/// 
+/// Vol-weighted time adjusts calendar time based on historical volatility patterns.
+/// This allows interpolation to correctly account for periods of higher/lower volatility
+/// (e.g., market hours vs weekends, FOMC announcements, etc.)
 pub trait VolTimeStrategy: Send + Sync {
     /// Calculates the total "vol-weighted seconds" between two timestamps.
     /// 
@@ -71,7 +75,7 @@ impl WeightedVolTimeStrategy {
     /// * `regime_scaler` - Recent volatility / Long-term average (typically 0.5-2.0)
     /// * `event_overrides` - Specific time windows with custom multipliers
     pub fn new(
-        historical_vols: Vec<f64>, // Raw hourly vols from Deribit
+        historical_vols: Vec<f64>,
         regime_scaler: f64,
         event_overrides: Vec<(DateTime<Utc>, DateTime<Utc>, f64)>,
     ) -> Self {
@@ -97,6 +101,27 @@ impl WeightedVolTimeStrategy {
         }
     }
 
+    /// Gets the volatility weight at a specific timestamp.
+    /// 
+    /// Priority order:
+    /// 1. Event overrides (highest priority)
+    /// 2. Hourly weights based on day of week and hour
+    /// 3. Default weight of 1.0 if no data available
+    fn get_weight_at(&self, dt: DateTime<Utc>) -> f64 {
+        // 1. Check Event Overrides first (highest priority)
+        for (start, end, mult) in &self.event_overrides {
+            if dt >= *start && dt < *end {
+                return *mult;
+            }
+        }
+
+        // 2. Fallback to Hourly Map
+        // Monday is 0 in chrono's weekday().num_days_from_monday()
+        let day_idx = dt.weekday().num_days_from_monday();
+        let hour_idx = (day_idx * 24 + dt.hour()) as usize;
+
+        *self.hourly_weights.get(hour_idx).unwrap_or(&1.0)
+    }
 }
 
 impl VolTimeStrategy for WeightedVolTimeStrategy {
@@ -126,30 +151,6 @@ impl VolTimeStrategy for WeightedVolTimeStrategy {
         }
 
         total_weighted_seconds
-    }
-}
-
-impl WeightedVolTimeStrategy {
-    /// Gets the volatility weight at a specific timestamp.
-    /// 
-    /// Priority order:
-    /// 1. Event overrides (highest priority)
-    /// 2. Hourly weights based on day of week and hour
-    /// 3. Default weight of 1.0 if no data available
-    fn get_weight_at(&self, dt: DateTime<Utc>) -> f64 {
-        // 1. Check Event Overrides first (highest priority)
-        for (start, end, mult) in &self.event_overrides {
-            if dt >= *start && dt < *end {
-                return *mult;
-            }
-        }
-
-        // 2. Fallback to Hourly Map
-        // Monday is 0 in chrono's weekday().num_days_from_monday()
-        let day_idx = dt.weekday().num_days_from_monday();
-        let hour_idx = (day_idx * 24 + dt.hour()) as usize;
-
-        *self.hourly_weights.get(hour_idx).unwrap_or(&1.0)
     }
 }
 
@@ -285,4 +286,3 @@ mod tests {
         assert!((seconds - expected).abs() < 1e-6);
     }
 }
-

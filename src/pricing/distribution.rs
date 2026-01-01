@@ -5,6 +5,8 @@
 
 use super::black_scholes::norm_cdf;
 use super::vol_surface::VolatilitySurface;
+use super::vol_time::VolTimeStrategy;
+use chrono::{DateTime, Utc};
 
 /// Number of points for the price grid (higher = more accuracy, more memory).
 const DEFAULT_GRID_SIZE: usize = 500;
@@ -90,8 +92,9 @@ impl ExpiryDistribution {
         // Calculate CDF at each price point using Black-Scholes
         for &price in &prices {
             // P(S_T < K) = N(-d2) for a put
+            // For exact Deribit expiries, no vol-time strategy needed (just strike interpolation)
             let iv = surface
-                .get_iv_interpolated(price, time_to_expiry, now_ms)
+                .get_iv_interpolated(price, expiry_timestamp, now_ms, None)
                 .unwrap_or(atm_iv);
 
             if iv <= 0.0 || time_to_expiry <= 0.0 {
@@ -263,37 +266,120 @@ impl PriceDistribution {
         self.distributions.get(&expiry_timestamp)
     }
 
-    /// Interpolates IV for a given time to expiry using total variance method.
+    /// Interpolates IV for a given expiry using total variance method.
     /// This is calendar-arbitrage-free interpolation.
-    fn interpolate_iv(&self, time_to_expiry: f64) -> Option<f64> {
-        if self.expiry_data.is_empty() || time_to_expiry <= 0.0 {
+    /// 
+    /// When a vol-time strategy is provided, uses vol-weighted time for interpolation weights
+    /// but calendar time for variance calculations and final IV recovery.
+    fn interpolate_iv(
+        &self,
+        target_expiry_ms: i64,
+        vol_time_strategy: Option<&dyn VolTimeStrategy>,
+    ) -> Option<f64> {
+        if self.expiry_data.is_empty() {
             return None;
         }
 
-        // Find bracketing expiries
-        let mut before: Option<(f64, f64)> = None; // (T, σ)
-        let mut after: Option<(f64, f64)> = None;
+        let time_to_expiry_calendar = (target_expiry_ms - self.now_ms) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0);
+        if time_to_expiry_calendar <= 0.0 {
+            return None;
+        }
 
-        for &(_exp, t, iv) in &self.expiry_data {
-            if t <= time_to_expiry {
-                before = Some((t, iv));
+        // Find bracketing expiries: (expiry_ms, time_to_expiry, atm_iv)
+        let mut before: Option<(i64, f64, f64)> = None;
+        let mut after: Option<(i64, f64, f64)> = None;
+
+        for &(exp_ms, t, iv) in &self.expiry_data {
+            if exp_ms <= target_expiry_ms {
+                before = Some((exp_ms, t, iv));
             } else if after.is_none() {
-                after = Some((t, iv));
+                after = Some((exp_ms, t, iv));
             }
         }
 
         match (before, after) {
             // Interpolate using total variance: Var = σ² × T
-            (Some((t1, iv1)), Some((t2, iv2))) => {
+            (Some((exp1, t1, iv1)), Some((exp2, t2, iv2))) => {
+                // Calendar-based variance at each Deribit expiry (ground truth)
                 let var1 = iv1 * iv1 * t1;
                 let var2 = iv2 * iv2 * t2;
-                let w = (time_to_expiry - t1) / (t2 - t1);
+                
+                // Interpolation weight: use vol-weighted time if strategy provided
+                let w = if let Some(strategy) = vol_time_strategy {
+                    let now_dt = DateTime::from_timestamp_millis(self.now_ms)
+                        .unwrap_or_else(|| Utc::now());
+                    let exp1_dt = DateTime::from_timestamp_millis(exp1)
+                        .unwrap_or_else(|| Utc::now());
+                    let exp2_dt = DateTime::from_timestamp_millis(exp2)
+                        .unwrap_or_else(|| Utc::now());
+                    let target_dt = DateTime::from_timestamp_millis(target_expiry_ms)
+                        .unwrap_or_else(|| Utc::now());
+                    
+                    let tau1 = strategy.get_vol_time(now_dt, exp1_dt);
+                    let tau2 = strategy.get_vol_time(now_dt, exp2_dt);
+                    let tau_target = strategy.get_vol_time(now_dt, target_dt);
+                    
+                    if (tau2 - tau1).abs() < 1e-10 {
+                        0.5 // Fallback
+                    } else {
+                        (tau_target - tau1) / (tau2 - tau1)
+                    }
+                } else {
+                    // Standard calendar time interpolation
+                    (time_to_expiry_calendar - t1) / (t2 - t1)
+                };
+                
+                let w = w.clamp(0.0, 1.0);
                 let var_interp = var1 + w * (var2 - var1);
-                Some((var_interp / time_to_expiry).sqrt())
+                
+                // Recover IV using CALENDAR time
+                Some((var_interp / time_to_expiry_calendar).sqrt())
             }
-            // Extrapolate flat (use nearest)
-            (Some((_, iv)), None) => Some(iv),
-            (None, Some((_, iv))) => Some(iv),
+            // Extrapolate using vol-weighted ratio if strategy provided
+            (Some((exp1, t1, iv1)), None) => {
+                if let Some(strategy) = vol_time_strategy {
+                    let now_dt = DateTime::from_timestamp_millis(self.now_ms)
+                        .unwrap_or_else(|| Utc::now());
+                    let exp1_dt = DateTime::from_timestamp_millis(exp1)
+                        .unwrap_or_else(|| Utc::now());
+                    let target_dt = DateTime::from_timestamp_millis(target_expiry_ms)
+                        .unwrap_or_else(|| Utc::now());
+                    
+                    let tau1 = strategy.get_vol_time(now_dt, exp1_dt);
+                    let tau_target = strategy.get_vol_time(now_dt, target_dt);
+                    
+                    if tau1 > 1e-10 {
+                        let var1 = iv1 * iv1 * t1;
+                        let var_target = var1 * (tau_target / tau1);
+                        if time_to_expiry_calendar > 1e-10 && var_target >= 0.0 {
+                            return Some((var_target / time_to_expiry_calendar).sqrt());
+                        }
+                    }
+                }
+                Some(iv1) // Flat IV extrapolation fallback
+            }
+            (None, Some((exp2, t2, iv2))) => {
+                if let Some(strategy) = vol_time_strategy {
+                    let now_dt = DateTime::from_timestamp_millis(self.now_ms)
+                        .unwrap_or_else(|| Utc::now());
+                    let exp2_dt = DateTime::from_timestamp_millis(exp2)
+                        .unwrap_or_else(|| Utc::now());
+                    let target_dt = DateTime::from_timestamp_millis(target_expiry_ms)
+                        .unwrap_or_else(|| Utc::now());
+                    
+                    let tau2 = strategy.get_vol_time(now_dt, exp2_dt);
+                    let tau_target = strategy.get_vol_time(now_dt, target_dt);
+                    
+                    if tau2 > 1e-10 {
+                        let var2 = iv2 * iv2 * t2;
+                        let var_target = var2 * (tau_target / tau2);
+                        if time_to_expiry_calendar > 1e-10 && var_target >= 0.0 {
+                            return Some((var_target / time_to_expiry_calendar).sqrt());
+                        }
+                    }
+                }
+                Some(iv2) // Flat IV extrapolation fallback
+            }
             (None, None) => None,
         }
     }
@@ -301,24 +387,46 @@ impl PriceDistribution {
     /// Gets the probability that S > strike at a given expiry using interpolated IV.
     /// This properly handles expiries that don't match Deribit expiries exactly.
     pub fn probability_above(&self, strike: f64, expiry_timestamp: i64) -> Option<f64> {
+        self.probability_above_with_strategy(strike, expiry_timestamp, None)
+    }
+
+    /// Gets the probability that S > strike at a given expiry using interpolated IV.
+    /// When a vol-time strategy is provided, uses vol-weighted time for interpolation.
+    pub fn probability_above_with_strategy(
+        &self,
+        strike: f64,
+        expiry_timestamp: i64,
+        vol_time_strategy: Option<&dyn VolTimeStrategy>,
+    ) -> Option<f64> {
         // First try exact match (fast path for Deribit expiries)
         if let Some(d) = self.distributions.get(&expiry_timestamp) {
             return Some(d.probability_above(strike));
         }
         
         // Interpolate for non-standard expiries (e.g., Polymarket)
-        self.probability_above_interpolated(strike, expiry_timestamp)
+        self.probability_above_interpolated_with_strategy(strike, expiry_timestamp, vol_time_strategy)
     }
 
     /// Computes P(S > K) using interpolated IV and Black-Scholes.
     pub fn probability_above_interpolated(&self, strike: f64, expiry_timestamp: i64) -> Option<f64> {
+        self.probability_above_interpolated_with_strategy(strike, expiry_timestamp, None)
+    }
+
+    /// Computes P(S > K) using interpolated IV and Black-Scholes.
+    /// When a vol-time strategy is provided, uses vol-weighted time for IV interpolation.
+    pub fn probability_above_interpolated_with_strategy(
+        &self,
+        strike: f64,
+        expiry_timestamp: i64,
+        vol_time_strategy: Option<&dyn VolTimeStrategy>,
+    ) -> Option<f64> {
         let time_to_expiry = (expiry_timestamp - self.now_ms) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0);
         
         if time_to_expiry <= 0.0 || self.spot <= 0.0 || strike <= 0.0 {
             return None;
         }
 
-        let iv = self.interpolate_iv(time_to_expiry)?;
+        let iv = self.interpolate_iv(expiry_timestamp, vol_time_strategy)?;
         
         // P(S > K) = N(d2) where d2 = (ln(S/K) + (r - 0.5σ²)T) / (σ√T)
         let sqrt_t = time_to_expiry.sqrt();
@@ -338,16 +446,28 @@ impl PriceDistribution {
         self.distributions.get(&expiry_timestamp).map(|d| d.ppf(percentile))
     }
 
-    /// Gets the PPF value for a given percentile and time to expiry using interpolation.
+    /// Gets the PPF value for a given percentile and expiry timestamp using interpolation.
     /// 
     /// This handles Polymarket expiries that don't match Deribit expiries exactly.
     /// Uses interpolated IV and lognormal price assumption.
-    pub fn ppf_interpolated(&self, percentile: f64, time_to_expiry: f64) -> Option<f64> {
+    pub fn ppf_interpolated(&self, percentile: f64, expiry_timestamp: i64) -> Option<f64> {
+        self.ppf_interpolated_with_strategy(percentile, expiry_timestamp, None)
+    }
+
+    /// Gets the PPF value for a given percentile and expiry timestamp using interpolation.
+    /// When a vol-time strategy is provided, uses vol-weighted time for IV interpolation.
+    pub fn ppf_interpolated_with_strategy(
+        &self,
+        percentile: f64,
+        expiry_timestamp: i64,
+        vol_time_strategy: Option<&dyn VolTimeStrategy>,
+    ) -> Option<f64> {
+        let time_to_expiry = (expiry_timestamp - self.now_ms) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0);
         if time_to_expiry <= 0.0 || self.spot <= 0.0 {
             return None;
         }
 
-        let iv = self.interpolate_iv(time_to_expiry)?;
+        let iv = self.interpolate_iv(expiry_timestamp, vol_time_strategy)?;
         
         // For lognormal: S_T = S_0 * exp((r - 0.5σ²)T + σ√T * Z)
         // where Z = Φ^(-1)(percentile)

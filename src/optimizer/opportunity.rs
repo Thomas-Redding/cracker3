@@ -3,7 +3,7 @@
 // Opportunity identification for binary options, vanilla options, and spreads.
 // Scans markets for mispricings relative to the calibrated volatility surface.
 
-use crate::pricing::{BlackScholes, OptionType, PriceDistribution, VolatilitySurface};
+use crate::pricing::{BlackScholes, OptionType, PriceDistribution, VolatilitySurface, VolTimeStrategy};
 use serde::{Deserialize, Serialize};
 
 /// Type of trading opportunity.
@@ -153,7 +153,7 @@ impl OpportunityScanner {
     /// * `now_ms` - Current timestamp
     /// * `yes_token_id` - Token ID for YES
     /// * `no_token_id` - Token ID for NO
-    /// * `time_to_expiry` - Optional vol-weighted time to expiry in years. If None, uses calendar time.
+    /// * `vol_time_strategy` - Optional vol-time strategy for interpolation. If None, uses calendar time.
     pub fn scan_binary_option(
         &self,
         market_id: &str,
@@ -168,21 +168,23 @@ impl OpportunityScanner {
         now_ms: i64,
         yes_token_id: Option<&str>,
         no_token_id: Option<&str>,
-        time_to_expiry: Option<f64>,
+        vol_time_strategy: Option<&dyn VolTimeStrategy>,
     ) -> Vec<Opportunity> {
         let mut opportunities = Vec::new();
 
-        // Use provided time_to_expiry or calculate using calendar time
-        let time_to_expiry = time_to_expiry.unwrap_or_else(|| {
-            (expiry_timestamp - now_ms) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0)
-        });
+        // Calculate calendar time for filtering and opportunity struct
+        let time_to_expiry = (expiry_timestamp - now_ms) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0);
         
         if time_to_expiry <= 0.0 || time_to_expiry > self.config.max_time_to_expiry {
             return opportunities;
         }
 
-        // Get model probability from distribution
-        let model_prob = match distribution.probability_above(strike, expiry_timestamp) {
+        // Get model probability from distribution using vol-weighted interpolation
+        let model_prob = match distribution.probability_above_with_strategy(
+            strike,
+            expiry_timestamp,
+            vol_time_strategy,
+        ) {
             Some(p) => p,
             None => return opportunities,
         };
@@ -252,7 +254,7 @@ impl OpportunityScanner {
     }
 
     /// Scans a vanilla option for opportunities.
-    /// * `time_to_expiry` - Optional vol-weighted time to expiry in years. If None, uses calendar time.
+    /// * `vol_time_strategy` - Optional vol-time strategy for IV interpolation. If None, uses calendar time.
     pub fn scan_vanilla_option(
         &self,
         instrument_id: &str,
@@ -264,14 +266,12 @@ impl OpportunityScanner {
         liquidity: f64,
         surface: &VolatilitySurface,
         now_ms: i64,
-        time_to_expiry: Option<f64>,
+        vol_time_strategy: Option<&dyn VolTimeStrategy>,
     ) -> Vec<Opportunity> {
         let mut opportunities = Vec::new();
 
-        // Use provided time_to_expiry or calculate using calendar time
-        let time_to_expiry = time_to_expiry.unwrap_or_else(|| {
-            (expiry_timestamp - now_ms) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0)
-        });
+        // Calendar time for filtering, Black-Scholes, and opportunity struct
+        let time_to_expiry = (expiry_timestamp - now_ms) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0);
         
         if time_to_expiry <= 0.0 || time_to_expiry > self.config.max_time_to_expiry {
             return opportunities;
@@ -281,12 +281,19 @@ impl OpportunityScanner {
             return opportunities;
         }
 
-        // Get model IV
-        let model_iv = match surface.get_iv_interpolated(strike, time_to_expiry, now_ms) {
+        // Get model IV using vol-weighted interpolation
+        // IV is returned in calendar-convention (annualized against calendar time)
+        let model_iv = match surface.get_iv_interpolated(
+            strike,
+            expiry_timestamp,
+            now_ms,
+            vol_time_strategy,
+        ) {
             Some(iv) => iv,
             None => return opportunities,
         };
 
+        // Black-Scholes uses calendar time (standard convention)
         let spot = surface.spot();
         let bs = BlackScholes::new(spot, strike, time_to_expiry, self.config.rate, model_iv, option_type);
         let fair_value = bs.price();
@@ -376,6 +383,7 @@ impl OpportunityScanner {
         liquidity: f64,
         surface: &VolatilitySurface,
         now_ms: i64,
+        vol_time_strategy: Option<&dyn VolTimeStrategy>,
     ) -> Option<Opportunity> {
         let time_to_expiry = (expiry_timestamp - now_ms) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0);
         
@@ -398,10 +406,11 @@ impl OpportunityScanner {
             return None; // Must be a credit spread
         }
 
-        // Model fair values
-        let short_iv = surface.get_iv_interpolated(short_strike, time_to_expiry, now_ms)?;
-        let long_iv = surface.get_iv_interpolated(long_strike, time_to_expiry, now_ms)?;
+        // Model fair values using vol-weighted interpolation
+        let short_iv = surface.get_iv_interpolated(short_strike, expiry_timestamp, now_ms, vol_time_strategy)?;
+        let long_iv = surface.get_iv_interpolated(long_strike, expiry_timestamp, now_ms, vol_time_strategy)?;
 
+        // Black-Scholes uses calendar time (standard convention)
         let spot = surface.spot();
         let short_bs = BlackScholes::new(spot, short_strike, time_to_expiry, self.config.rate, short_iv, option_type);
         let long_bs = BlackScholes::new(spot, long_strike, time_to_expiry, self.config.rate, long_iv, option_type);

@@ -16,7 +16,7 @@ use crate::pricing::{
 };
 use crate::traits::{Dashboard, DashboardSchema, SharedExecutionRouter, Strategy, Widget, TableColumn};
 use async_trait::async_trait;
-use chrono::{Datelike, TimeZone};
+use chrono::TimeZone;
 use chrono_tz::America::New_York;
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
@@ -782,21 +782,22 @@ impl CrossMarketStrategy {
         let mut opportunities = Vec::new();
         let mut scan_stats = ScanStats::default();
 
+        // Get the vol-time strategy reference for passing to scanner functions
+        let vol_time_strategy: Option<&dyn VolTimeStrategy> = Some(state.vol_time_strategy.as_ref());
+
         // Scan Polymarket binary options
         for market in state.polymarket_markets.values() {
             scan_stats.polymarket_scanned += 1;
             
-            // Get model probability for diagnostics
-            let model_prob = distribution.probability_above(market.strike, market.expiry_timestamp);
-            // Calculate vol-weighted time using the configured strategy
-            let now_dt = chrono::DateTime::from_timestamp_millis(now_ms)
-                .unwrap_or_else(|| chrono::Utc::now())
-                .with_timezone(&chrono::Utc);
-            let expiry_dt = chrono::DateTime::from_timestamp_millis(market.expiry_timestamp)
-                .unwrap_or_else(|| chrono::Utc::now())
-                .with_timezone(&chrono::Utc);
-            let vol_weighted_seconds = state.vol_time_strategy.get_vol_time(now_dt, expiry_dt);
-            let time_to_expiry = state.vol_time_strategy.vol_seconds_to_years(vol_weighted_seconds);
+            // Get model probability for diagnostics (uses vol-weighted interpolation)
+            let model_prob = distribution.probability_above_with_strategy(
+                market.strike,
+                market.expiry_timestamp,
+                vol_time_strategy,
+            );
+            
+            // Calculate calendar time for logging
+            let time_to_expiry = (market.expiry_timestamp - now_ms) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0);
             
             // Log every market for debugging
             debug!("SCAN PM: {} strike=${:.0} expiry={:.3}y | YES={:.2} NO={:.2} | model_prob={:?}",
@@ -840,7 +841,7 @@ impl CrossMarketStrategy {
                 now_ms,
                 Some(&market.yes_token_id),
                 Some(&market.no_token_id),
-                Some(time_to_expiry), // Pass vol-weighted time
+                vol_time_strategy, // Pass vol-time strategy for interpolation
             );
             
             if !opps.is_empty() {
@@ -868,16 +869,6 @@ impl CrossMarketStrategy {
             let liquidity = ticker.best_bid_amount.unwrap_or(0.0)
                 .min(ticker.best_ask_amount.unwrap_or(0.0));
 
-            // Calculate vol-weighted time for Derive options using the configured strategy
-            let now_dt = chrono::DateTime::from_timestamp_millis(now_ms)
-                .unwrap_or_else(|| chrono::Utc::now())
-                .with_timezone(&chrono::Utc);
-            let expiry_dt = chrono::DateTime::from_timestamp_millis(ticker.expiry_timestamp)
-                .unwrap_or_else(|| chrono::Utc::now())
-                .with_timezone(&chrono::Utc);
-            let vol_weighted_seconds = state.vol_time_strategy.get_vol_time(now_dt, expiry_dt);
-            let time_to_expiry = Some(state.vol_time_strategy.vol_seconds_to_years(vol_weighted_seconds));
-
             let opps = self.scanner.scan_vanilla_option(
                 &ticker.instrument_name,
                 option_type,
@@ -888,7 +879,7 @@ impl CrossMarketStrategy {
                 liquidity,
                 &state.vol_surface,
                 now_ms,
-                time_to_expiry, // Pass vol-weighted time
+                vol_time_strategy, // Pass vol-time strategy for interpolation
             );
             
             if !opps.is_empty() {
