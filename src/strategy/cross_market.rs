@@ -10,12 +10,13 @@ use crate::optimizer::{
     OptimizedPortfolio, ScannerConfig,
 };
 use crate::pricing::{
-    OptionType, PriceDistribution, VolatilitySurface,
+    OptionType, PriceDistribution, VolatilitySurface, VolTimeStrategy,
+    CalendarVolTimeStrategy, WeightedVolTimeStrategy,
     vol_surface::DeribitTickerInput,
 };
 use crate::traits::{Dashboard, DashboardSchema, SharedExecutionRouter, Strategy, Widget, TableColumn};
 use async_trait::async_trait;
-use chrono::{Datelike, TimeZone};
+use chrono::TimeZone;
 use chrono_tz::America::New_York;
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
@@ -70,6 +71,25 @@ pub struct CrossMarketConfig {
     pub polymarket_pattern: String,
     /// How often to recalculate (seconds)
     pub recalc_interval_secs: u64,
+    /// Vol time strategy type: "calendar" or "weighted"
+    #[serde(default = "default_vol_time_strategy")]
+    pub vol_time_strategy: String,
+    /// Historical hourly volatilities for weighted strategy (168 values = 7 days × 24 hours)
+    /// Only used if vol_time_strategy is "weighted"
+    #[serde(default)]
+    pub hourly_vols: Vec<f64>,
+    /// Regime scaler: recent volatility / long-term average (GARCH-lite)
+    /// Only used if vol_time_strategy is "weighted"
+    #[serde(default = "default_regime_scaler")]
+    pub regime_scaler: f64,
+}
+
+fn default_regime_scaler() -> f64 {
+    1.0
+}
+
+fn default_vol_time_strategy() -> String {
+    "calendar".to_string()
 }
 
 impl Default for CrossMarketConfig {
@@ -85,6 +105,9 @@ impl Default for CrossMarketConfig {
             // Pattern matches Polymarket slugs like "bitcoin-above-100000-on-december-31"
             polymarket_pattern: r"bitcoin-above-\d+".to_string(),
             recalc_interval_secs: 60,
+            vol_time_strategy: "calendar".to_string(),
+            hourly_vols: Vec::new(),
+            regime_scaler: 1.0,
         }
     }
 }
@@ -95,6 +118,8 @@ struct CrossMarketState {
     vol_surface: VolatilitySurface,
     /// Price distribution
     distribution: Option<PriceDistribution>,
+    /// Volatility-weighted time strategy (required)
+    vol_time_strategy: Box<dyn VolTimeStrategy>,
     /// Current opportunities
     opportunities: Vec<Opportunity>,
     /// Optimized portfolio
@@ -120,6 +145,7 @@ impl Default for CrossMarketState {
         Self {
             vol_surface: VolatilitySurface::new(0.0),
             distribution: None,
+            vol_time_strategy: Box::new(CalendarVolTimeStrategy),
             opportunities: Vec::new(),
             portfolio: None,
             deribit_tickers: HashMap::new(),
@@ -624,6 +650,30 @@ impl CrossMarketStrategy {
             self.config.rate,
         ));
 
+        // Initialize vol time strategy based on config
+        state.vol_time_strategy = match self.config.vol_time_strategy.as_str() {
+            "weighted" => {
+                if self.config.hourly_vols.is_empty() {
+                    warn!("VOL TIME: 'weighted' strategy specified but hourly_vols is empty, falling back to calendar");
+                    Box::new(CalendarVolTimeStrategy)
+                } else {
+                    debug!("VOL TIME: Initialized weighted strategy with {} hourly weights, regime_scaler={:.2}",
+                        self.config.hourly_vols.len(),
+                        self.config.regime_scaler
+                    );
+                    Box::new(WeightedVolTimeStrategy::new(
+                        self.config.hourly_vols.clone(),
+                        self.config.regime_scaler,
+                        vec![], // Event overrides can be added later if needed
+                    ))
+                }
+            }
+            "calendar" | _ => {
+                debug!("VOL TIME: Using calendar strategy");
+                Box::new(CalendarVolTimeStrategy)
+            }
+        };
+
         // Log vol surface update with ATM IV for debugging
         let atm_ivs: Vec<(i64, f64)> = state.vol_surface.expiries()
             .iter()
@@ -732,12 +782,21 @@ impl CrossMarketStrategy {
         let mut opportunities = Vec::new();
         let mut scan_stats = ScanStats::default();
 
+        // Get the vol-time strategy reference for passing to scanner functions
+        let vol_time_strategy: Option<&dyn VolTimeStrategy> = Some(state.vol_time_strategy.as_ref());
+
         // Scan Polymarket binary options
         for market in state.polymarket_markets.values() {
             scan_stats.polymarket_scanned += 1;
             
-            // Get model probability for diagnostics
-            let model_prob = distribution.probability_above(market.strike, market.expiry_timestamp);
+            // Get model probability for diagnostics (uses vol-weighted interpolation)
+            let model_prob = distribution.probability_above_with_strategy(
+                market.strike,
+                market.expiry_timestamp,
+                vol_time_strategy,
+            );
+            
+            // Calculate calendar time for logging
             let time_to_expiry = (market.expiry_timestamp - now_ms) as f64 / (365.25 * 24.0 * 3600.0 * 1000.0);
             
             // Log every market for debugging
@@ -782,6 +841,7 @@ impl CrossMarketStrategy {
                 now_ms,
                 Some(&market.yes_token_id),
                 Some(&market.no_token_id),
+                vol_time_strategy, // Pass vol-time strategy for interpolation
             );
             
             if !opps.is_empty() {
@@ -819,6 +879,7 @@ impl CrossMarketStrategy {
                 liquidity,
                 &state.vol_surface,
                 now_ms,
+                vol_time_strategy, // Pass vol-time strategy for interpolation
             );
             
             if !opps.is_empty() {
@@ -1741,6 +1802,9 @@ mod tests {
             scanner_config: ScannerConfig::default(),
             polymarket_pattern: "ethereum-above-\\d+".to_string(),
             recalc_interval_secs: 120,
+            vol_time_strategy: "calendar".to_string(),
+            hourly_vols: Vec::new(),
+            regime_scaler: 1.0,
         };
 
         let exec = Arc::new(ExecutionRouter::empty());
