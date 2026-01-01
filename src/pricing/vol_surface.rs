@@ -583,6 +583,138 @@ mod tests {
     }
 
     #[test]
+    fn test_vol_weighted_interpolation() {
+        use super::super::vol_time::WeightedVolTimeStrategy;
+        
+        let mut surface = VolatilitySurface::new(100_000.0);
+        let now_ms = 1704067200000i64; // Jan 1, 2024 00:00 UTC (Monday)
+        
+        // Near expiry: T=0.25 (3 months), IV=0.50
+        let near_expiry_ms = now_ms + (0.25 * 365.25 * 24.0 * 3600.0 * 1000.0) as i64;
+        // Far expiry: T=1.0 (1 year), IV=0.40
+        let far_expiry_ms = now_ms + (1.0 * 365.25 * 24.0 * 3600.0 * 1000.0) as i64;
+        // Target: T=0.5 (6 months)
+        let target_expiry_ms = now_ms + (0.5 * 365.25 * 24.0 * 3600.0 * 1000.0) as i64;
+
+        let mut near_smile = VolSmile::new(0.25, 100_000.0);
+        near_smile.add_point(100_000.0, 0.50, None, None);
+        surface.add_smile(near_expiry_ms, near_smile);
+
+        let mut far_smile = VolSmile::new(1.0, 100_000.0);
+        far_smile.add_point(100_000.0, 0.40, None, None);
+        surface.add_smile(far_expiry_ms, far_smile);
+
+        // Test with calendar time (None strategy)
+        let iv_calendar = surface.get_iv_interpolated(100_000.0, target_expiry_ms, now_ms, None);
+        assert!(iv_calendar.is_some());
+        let iv_cal = iv_calendar.unwrap();
+        assert!(iv_cal > 0.40 && iv_cal < 0.50, "Calendar IV at 6m: {}", iv_cal);
+
+        // Create a weighted strategy where early periods have higher vol weight
+        // This should shift the interpolation weight
+        let mut hourly_vols = vec![1.0; 168];
+        // Make first half of week (Mon-Wed) have 2x weight
+        for i in 0..72 {
+            hourly_vols[i] = 2.0;
+        }
+        // Second half (Thu-Sun) has 0.5x weight
+        for i in 72..168 {
+            hourly_vols[i] = 0.5;
+        }
+        
+        let weighted_strategy = WeightedVolTimeStrategy::new(hourly_vols, 1.0, vec![]);
+        
+        // Test with weighted strategy
+        let iv_weighted = surface.get_iv_interpolated(
+            100_000.0,
+            target_expiry_ms,
+            now_ms,
+            Some(&weighted_strategy),
+        );
+        assert!(iv_weighted.is_some());
+        let iv_wt = iv_weighted.unwrap();
+        assert!(iv_wt > 0.40 && iv_wt < 0.50, "Weighted IV at 6m: {}", iv_wt);
+        
+        // The weighted and calendar IVs may differ slightly due to different interpolation weights
+        // Both should be valid and in range
+        println!("Calendar IV: {:.4}, Weighted IV: {:.4}", iv_cal, iv_wt);
+    }
+
+    #[test]
+    fn test_vol_weighted_extrapolation_before_nearest() {
+        use super::super::vol_time::WeightedVolTimeStrategy;
+        
+        let mut surface = VolatilitySurface::new(100_000.0);
+        let now_ms = 1704067200000i64; // Jan 1, 2024 00:00 UTC
+        
+        // Only one expiry at T=0.5 (6 months), IV=0.50
+        let expiry_ms = now_ms + (0.5 * 365.25 * 24.0 * 3600.0 * 1000.0) as i64;
+        let mut smile = VolSmile::new(0.5, 100_000.0);
+        smile.add_point(100_000.0, 0.50, None, None);
+        surface.add_smile(expiry_ms, smile);
+
+        // Target before the only expiry: T=0.25 (3 months)
+        let target_expiry_ms = now_ms + (0.25 * 365.25 * 24.0 * 3600.0 * 1000.0) as i64;
+
+        // Test with calendar (flat extrapolation)
+        let iv_calendar = surface.get_iv_interpolated(100_000.0, target_expiry_ms, now_ms, None);
+        assert!(iv_calendar.is_some());
+        
+        // Test with weighted strategy (should use vol-weighted ratio)
+        let weighted_strategy = WeightedVolTimeStrategy::new(vec![1.0; 168], 1.0, vec![]);
+        let iv_weighted = surface.get_iv_interpolated(
+            100_000.0,
+            target_expiry_ms,
+            now_ms,
+            Some(&weighted_strategy),
+        );
+        assert!(iv_weighted.is_some());
+        
+        // With uniform weights, both should give similar results
+        let diff = (iv_calendar.unwrap() - iv_weighted.unwrap()).abs();
+        assert!(diff < 0.01, "Calendar vs weighted diff: {}", diff);
+    }
+
+    #[test]
+    fn test_vol_weighted_extrapolation_after_farthest() {
+        use super::super::vol_time::WeightedVolTimeStrategy;
+        
+        let mut surface = VolatilitySurface::new(100_000.0);
+        let now_ms = 1704067200000i64; // Jan 1, 2024 00:00 UTC
+        
+        // Only one expiry at T=0.25 (3 months), IV=0.50
+        let expiry_ms = now_ms + (0.25 * 365.25 * 24.0 * 3600.0 * 1000.0) as i64;
+        let mut smile = VolSmile::new(0.25, 100_000.0);
+        smile.add_point(100_000.0, 0.50, None, None);
+        surface.add_smile(expiry_ms, smile);
+
+        // Target after the only expiry: T=0.5 (6 months)
+        let target_expiry_ms = now_ms + (0.5 * 365.25 * 24.0 * 3600.0 * 1000.0) as i64;
+
+        // Test with calendar (flat extrapolation)
+        let iv_calendar = surface.get_iv_interpolated(100_000.0, target_expiry_ms, now_ms, None);
+        assert!(iv_calendar.is_some());
+        
+        // Test with weighted strategy
+        let weighted_strategy = WeightedVolTimeStrategy::new(vec![1.0; 168], 1.0, vec![]);
+        let iv_weighted = surface.get_iv_interpolated(
+            100_000.0,
+            target_expiry_ms,
+            now_ms,
+            Some(&weighted_strategy),
+        );
+        assert!(iv_weighted.is_some());
+        
+        // With uniform weights, calendar extrapolation returns flat IV
+        // Weighted extrapolation scales variance by vol-time ratio
+        // Both should give reasonable values
+        let iv_cal = iv_calendar.unwrap();
+        let iv_wt = iv_weighted.unwrap();
+        assert!(iv_cal > 0.0 && iv_cal < 1.0);
+        assert!(iv_wt > 0.0 && iv_wt < 1.0);
+    }
+
+    #[test]
     fn test_parse_deribit_instrument() {
         let result = parse_deribit_instrument("BTC-29MAR24-60000-C");
         assert!(result.is_some());

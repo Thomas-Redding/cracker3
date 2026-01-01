@@ -285,4 +285,196 @@ mod tests {
         let expected = 365.25 * 24.0 * 3600.0;
         assert!((seconds - expected).abs() < 1e-6);
     }
+
+    #[test]
+    fn test_start_equals_end() {
+        let strategy = CalendarVolTimeStrategy;
+        let time = DateTime::parse_from_rfc3339("2024-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        
+        let vol_time = strategy.get_vol_time(time, time);
+        assert!((vol_time - 0.0).abs() < 1e-10);
+        
+        // Also test weighted strategy
+        let weighted = WeightedVolTimeStrategy::new(vec![1.0; 168], 1.0, vec![]);
+        let vol_time_weighted = weighted.get_vol_time(time, time);
+        assert!((vol_time_weighted - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_start_after_end_returns_zero() {
+        let strategy = CalendarVolTimeStrategy;
+        let start = DateTime::parse_from_rfc3339("2024-01-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        
+        let vol_time = strategy.get_vol_time(start, end);
+        assert!((vol_time - 0.0).abs() < 1e-10);
+        
+        // Also test weighted strategy
+        let weighted = WeightedVolTimeStrategy::new(vec![1.0; 168], 1.0, vec![]);
+        let vol_time_weighted = weighted.get_vol_time(start, end);
+        assert!((vol_time_weighted - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_multi_day_span() {
+        // Create weights where weekdays have 2x vol and weekends have 0.5x vol
+        let mut vols = vec![0.0; 168];
+        // Monday-Friday (0-119): higher vol
+        for i in 0..120 {
+            vols[i] = 2.0;
+        }
+        // Saturday-Sunday (120-167): lower vol
+        for i in 120..168 {
+            vols[i] = 0.5;
+        }
+        
+        let calc = WeightedVolTimeStrategy::new(vols, 1.0, vec![]);
+        
+        // Monday 00:00 to Sunday 23:59 (full week)
+        let monday = DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let sunday_end = DateTime::parse_from_rfc3339("2024-01-07T23:59:59Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        
+        let vol_time = calc.get_vol_time(monday, sunday_end);
+        let calendar_seconds = (sunday_end - monday).num_seconds() as f64;
+        
+        // Vol time should be different from calendar time due to weighting
+        // With normalized weights, total should be roughly calendar time
+        // (since mean of weights is normalized to 1.0)
+        assert!(vol_time > 0.0);
+        // Should be approximately calendar time since weights are normalized
+        assert!((vol_time - calendar_seconds).abs() / calendar_seconds < 0.1);
+    }
+
+    #[test]
+    fn test_partial_hour_handling() {
+        let uniform_vols = vec![1.0; 168];
+        let calc = WeightedVolTimeStrategy::new(uniform_vols, 1.0, vec![]);
+        
+        // Test 30 minutes
+        let start = DateTime::parse_from_rfc3339("2024-01-01T10:15:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339("2024-01-01T10:45:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        
+        let vol_time = calc.get_vol_time(start, end);
+        // Should be 30 minutes = 1800 seconds
+        assert!((vol_time - 1800.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_crossing_hour_boundary() {
+        // Create weights where hour 10 has weight 1.0 and hour 11 has weight 2.0
+        let mut vols = vec![1.0; 168];
+        vols[10] = 1.0; // Monday 10:00 - hour index for Monday
+        vols[11] = 2.0; // Monday 11:00
+        
+        let calc = WeightedVolTimeStrategy::new(vols, 1.0, vec![]);
+        
+        // 10:30 to 11:30 - crosses hour boundary
+        let start = DateTime::parse_from_rfc3339("2024-01-01T10:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339("2024-01-01T11:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        
+        let vol_time = calc.get_vol_time(start, end);
+        
+        // 30 mins at weight ~1.0 + 30 mins at weight ~2.0
+        // With normalization, weights are adjusted, but the relative difference should show
+        // Total calendar time is 3600 seconds
+        // The weighted time should reflect the higher weight in the second half
+        assert!(vol_time > 0.0);
+        assert!(vol_time != 3600.0); // Should differ from uniform
+    }
+
+    #[test]
+    fn test_event_override_partial_overlap() {
+        let uniform_vols = vec![1.0; 168];
+        
+        // Event from 10:00-11:00 with 5x multiplier
+        let event_start = DateTime::parse_from_rfc3339("2024-01-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let event_end = DateTime::parse_from_rfc3339("2024-01-01T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        
+        let calc = WeightedVolTimeStrategy::new(
+            uniform_vols,
+            1.0,
+            vec![(event_start, event_end, 5.0)],
+        );
+        
+        // Query 09:30-10:30 - only 30 mins overlap with event
+        let query_start = DateTime::parse_from_rfc3339("2024-01-01T09:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let query_end = DateTime::parse_from_rfc3339("2024-01-01T10:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        
+        let vol_time = calc.get_vol_time(query_start, query_end);
+        
+        // 30 mins at weight 1.0 = 1800 seconds
+        // 30 mins at weight 5.0 = 1800 * 5 = 9000 seconds
+        // Total = 10800 seconds (but weights are normalized, so this is approximate)
+        assert!(vol_time > 3600.0); // Should be more than calendar time
+    }
+
+    #[test]
+    fn test_multiple_event_overrides() {
+        let uniform_vols = vec![1.0; 168];
+        
+        // Two events with different multipliers
+        let event1_start = DateTime::parse_from_rfc3339("2024-01-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let event1_end = DateTime::parse_from_rfc3339("2024-01-01T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let event2_start = DateTime::parse_from_rfc3339("2024-01-01T14:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let event2_end = DateTime::parse_from_rfc3339("2024-01-01T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        
+        let calc = WeightedVolTimeStrategy::new(
+            uniform_vols,
+            1.0,
+            vec![
+                (event1_start, event1_end, 3.0),
+                (event2_start, event2_end, 2.0),
+            ],
+        );
+        
+        // Query covers both events
+        let query_start = DateTime::parse_from_rfc3339("2024-01-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let query_end = DateTime::parse_from_rfc3339("2024-01-01T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        
+        let vol_time = calc.get_vol_time(query_start, query_end);
+        
+        // 1 hour at 3x + 3 hours at 1x + 1 hour at 2x = 3 + 3 + 2 = 8 hours worth
+        // Calendar time is 5 hours = 18000 seconds
+        // Expected vol time ≈ 8 * 3600 = 28800 seconds
+        let calendar_seconds = 5.0 * 3600.0;
+        assert!(vol_time > calendar_seconds);
+    }
 }
