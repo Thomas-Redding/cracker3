@@ -495,7 +495,13 @@ impl CatalogCore {
     {
         use std::fs::File;
         use std::io::Write;
-        
+
+        // Ensure parent directory exists
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create cache directory: {}", e))?;
+        }
+
         let mut file = File::create(path)
             .map_err(|e| format!("Failed to create cache file: {}", e))?;
 
