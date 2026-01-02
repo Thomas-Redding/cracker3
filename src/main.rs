@@ -336,13 +336,11 @@ async fn run_backtest_mode(args: &Args) {
     }
 
     // Build and run engine
-    // For backtest, we use a single stream
-    #[allow(deprecated)]
-    {
-        use trading_bot::engine::MarketRouter;
-    let router = MarketRouter::new(stream, strategies);
-    router.run().await;
-}
+    // For backtest, we use a single stream registered for all exchanges
+    let engine = Engine::new(strategies)
+        .with_stream(Exchange::Deribit, Box::new(stream))
+        .with_exec_router(exec_router);
+    engine.run().await;
 
     println!("\nBacktest complete!");
 
@@ -469,7 +467,7 @@ async fn run_demo_mode(args: &Args) {
         MomentumStrategy::new(
             "Momentum-ETH",
             vec![Instrument::Deribit("ETH-29MAR24-4000-C".to_string())],
-            exec_router,
+            exec_router.clone(),
             3,
             0.01,
         ),
@@ -482,12 +480,10 @@ async fn run_demo_mode(args: &Args) {
 
     // Run with backtest stream
     let stream = backtest::BacktestStream::new(mock_data);
-    #[allow(deprecated)]
-    {
-        use trading_bot::engine::MarketRouter;
-        let router = MarketRouter::new(stream, strategies);
-        router.run().await;
-    }
+    let engine = Engine::new(strategies)
+        .with_stream(Exchange::Deribit, Box::new(stream))
+        .with_exec_router(exec_router);
+    engine.run().await;
 
     println!("\nDemo complete!");
 

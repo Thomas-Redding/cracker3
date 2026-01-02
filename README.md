@@ -453,8 +453,9 @@ Options:
 * P1: ~~Engine-coordinated catalog refresh for dynamic market discovery.~~ ✅ DONE
 * P1: Add execution logic to actually place trades on identified opportunities.
 * P2: ~~Unified Refreshable + Catalog trait hierarchy.~~ ✅ DONE
+* P2: ~~Remove deprecated `MarketRouter`, `EngineBuilder`, and `required_subscriptions()`.~~ ✅ DONE
 * P2: Allow dashboard to enable/disable strategies.
-* P3: Remove deprecated `MarketCatalog` trait (v1.0).
+* P3: Remove deprecated `MarketCatalog` trait and move methods to `PolymarketCatalog`.
 * P3: Implement real trading execution for the various exchanges.
 
 ## LLM Context Cheatsheet
