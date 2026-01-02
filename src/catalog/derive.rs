@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DERIVE_API_URL: &str = "https://api.lyra.finance/public";
-const DEFAULT_CACHE_PATH: &str = "derive_instruments.jsonl";
+const DEFAULT_CACHE_PATH: &str = "cache/derive_instruments.jsonl";
 
 /// Static flag to prevent multiple concurrent auto-refreshes.
 static AUTO_REFRESH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -230,6 +230,12 @@ impl DeriveCatalog {
 
     fn save_to_disk(&self) -> Result<(), String> {
         let state = self.inner.read().unwrap();
+
+        // Ensure parent directory exists
+        if let Some(parent) = std::path::Path::new(&self.cache_path).parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create cache directory: {}", e))?;
+        }
 
         let mut file = File::create(&self.cache_path)
             .map_err(|e| format!("Failed to create cache file: {}", e))?;

@@ -21,7 +21,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const POLYMARKET_CLOB_URL: &str = "https://clob.polymarket.com";
-const DEFAULT_CACHE_PATH: &str = "polymarket_markets.jsonl";
+const DEFAULT_CACHE_PATH: &str = "cache/polymarket_markets.jsonl";
 
 /// Static flag to prevent multiple concurrent auto-refreshes.
 /// Only one background refresh can run at a time across all catalog instances.
@@ -235,7 +235,13 @@ impl PolymarketCatalog {
 
     fn save_to_disk(&self) -> Result<(), String> {
         let state = self.inner.read().unwrap();
-        
+
+        // Ensure parent directory exists
+        if let Some(parent) = std::path::Path::new(&self.cache_path).parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create cache directory: {}", e))?;
+        }
+
         let mut file = File::create(&self.cache_path)
             .map_err(|e| format!("Failed to create cache file: {}", e))?;
 

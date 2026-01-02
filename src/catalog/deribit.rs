@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DERIBIT_API_URL: &str = "https://www.deribit.com/api/v2";
-const DEFAULT_CACHE_PATH: &str = "deribit_instruments.jsonl";
+const DEFAULT_CACHE_PATH: &str = "cache/deribit_instruments.jsonl";
 
 /// Static flag to prevent multiple concurrent auto-refreshes.
 static AUTO_REFRESH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -240,6 +240,12 @@ impl DeribitCatalog {
 
     fn save_to_disk(&self) -> Result<(), String> {
         let state = self.inner.read().unwrap();
+
+        // Ensure parent directory exists
+        if let Some(parent) = std::path::Path::new(&self.cache_path).parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create cache directory: {}", e))?;
+        }
 
         let mut file = File::create(&self.cache_path)
             .map_err(|e| format!("Failed to create cache file: {}", e))?;

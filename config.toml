@@ -29,6 +29,17 @@ n_scenarios = 10000            # Monte Carlo scenarios
 # This matches slugs like "bitcoin-above-100000-on-december-31"
 polymarket_pattern = "bitcoin-above-\\d+"
 
+# =============================================================================
+# VOL-WEIGHTED TIME (optional)
+# =============================================================================
+# Vol-weighted time adjusts interpolation based on historical intraday/weekly
+# volatility patterns. Generate hourly_vols.json by running:
+#   python generate_hourly_vols.py
+#
+# vol_time_strategy = "weighted"   # "calendar" (default) or "weighted"
+# hourly_vols_file = "cache/hourly_vols.json"  # Path to JSON with 168 hourly vol values
+# regime_scaler = 1.0              # Recent vol / long-term vol (GARCH-lite)
+
 # Example Polymarket market to track
 # Find real markets at: https://polymarket.com (look for BTC price prediction markets)
 # 
