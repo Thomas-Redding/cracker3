@@ -515,6 +515,32 @@ impl CatalogCore {
 }
 
 // =============================================================================
+// Auto-Refresh Guard
+// =============================================================================
+
+/// RAII guard that resets an `AtomicBool` flag to `false` on drop.
+/// 
+/// This ensures the flag is reset even if the guarded code panics,
+/// preventing permanent blocking of auto-refresh.
+pub struct AutoRefreshGuard<'a> {
+    flag: &'a std::sync::atomic::AtomicBool,
+}
+
+impl<'a> AutoRefreshGuard<'a> {
+    /// Create a new guard for the given flag.
+    /// The flag should already be set to `true` before creating the guard.
+    pub fn new(flag: &'a std::sync::atomic::AtomicBool) -> Self {
+        Self { flag }
+    }
+}
+
+impl Drop for AutoRefreshGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+// =============================================================================
 // Default Stale Thresholds
 // =============================================================================
 

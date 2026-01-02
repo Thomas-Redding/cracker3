@@ -5,8 +5,8 @@
 // Options only add/remove (they don't change after listing, they just expire).
 
 use super::{
-    apply_diff, compute_diff, format_timestamp, invert_diff, Catalog, CatalogDiff,
-    CatalogFileEntry, DEFAULT_OPTIONS_STALE_THRESHOLD_SECS,
+    apply_diff, compute_diff, format_timestamp, invert_diff, AutoRefreshGuard, Catalog,
+    CatalogDiff, CatalogFileEntry, DEFAULT_OPTIONS_STALE_THRESHOLD_SECS,
 };
 use async_trait::async_trait;
 use log::{error, info, warn};
@@ -133,6 +133,8 @@ impl DeriveCatalog {
                 info!("DeriveCatalog: Cache is stale, spawning background refresh...");
                 let catalog_clone = catalog.clone();
                 tokio::spawn(async move {
+                    // Guard ensures flag is reset even if this task panics
+                    let _guard = AutoRefreshGuard::new(&AUTO_REFRESH_IN_PROGRESS);
                     match catalog_clone.refresh_internal().await {
                         Ok(diff) => info!(
                             "DeriveCatalog: Background refresh complete, {} changes",
@@ -140,7 +142,6 @@ impl DeriveCatalog {
                         ),
                         Err(e) => error!("DeriveCatalog: Background refresh failed: {}", e),
                     }
-                    AUTO_REFRESH_IN_PROGRESS.store(false, Ordering::SeqCst);
                 });
             } else {
                 info!("DeriveCatalog: Cache is stale, but refresh already in progress");

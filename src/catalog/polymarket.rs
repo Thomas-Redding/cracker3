@@ -5,8 +5,8 @@
 // Tracks all changes (added/removed/modified) for historical reconstruction.
 
 use super::{
-    apply_diff, compute_diff, format_timestamp, invert_diff, Catalog, CatalogDiff,
-    CatalogFileEntry, MarketCatalog, MarketInfo, SearchResult, TokenInfo,
+    apply_diff, compute_diff, format_timestamp, invert_diff, AutoRefreshGuard, Catalog,
+    CatalogDiff, CatalogFileEntry, MarketCatalog, MarketInfo, SearchResult, TokenInfo,
     DEFAULT_MARKET_STALE_THRESHOLD_SECS,
 };
 use async_trait::async_trait;
@@ -140,6 +140,8 @@ impl PolymarketCatalog {
                 info!("PolymarketCatalog: Cache is stale, spawning background refresh...");
                 let catalog_clone = catalog.clone();
                 tokio::spawn(async move {
+                    // Guard ensures flag is reset even if this task panics
+                    let _guard = AutoRefreshGuard::new(&AUTO_REFRESH_IN_PROGRESS);
                     match MarketCatalog::refresh(catalog_clone.as_ref()).await {
                         Ok(count) => info!(
                             "PolymarketCatalog: Background refresh complete, {} markets",
@@ -147,8 +149,6 @@ impl PolymarketCatalog {
                         ),
                         Err(e) => error!("PolymarketCatalog: Background refresh failed: {}", e),
                     }
-                    // Release the lock
-                    AUTO_REFRESH_IN_PROGRESS.store(false, Ordering::SeqCst);
                 });
             } else {
                 info!("PolymarketCatalog: Cache is stale, but refresh already in progress");
