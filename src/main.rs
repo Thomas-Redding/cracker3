@@ -133,12 +133,14 @@ async fn run_live_mode(args: &Args) {
                 exec_clients.insert(Exchange::Derive, client);
             }
             Exchange::Polymarket => {
-                let api_key = std::env::var("POLYMARKET_KEY")
+                // Polymarket requires a private key for order signing (EIP-712)
+                // Use POLYMARKET_PRIVATE_KEY env var (hex string, with or without 0x prefix)
+                let private_key = std::env::var("POLYMARKET_PRIVATE_KEY")
                     .unwrap_or_else(|_| {
-                        println!("Note: POLYMARKET_KEY not set - trading disabled, read-only mode");
+                        println!("Note: POLYMARKET_PRIVATE_KEY not set - trading disabled, read-only mode");
                         "read_only".to_string()
                     });
-                let client = polymarket::PolymarketExec::new(api_key).await.shared();
+                let client = polymarket::PolymarketExec::new(private_key).await.shared();
                 exec_clients.insert(Exchange::Polymarket, client);
             }
         }

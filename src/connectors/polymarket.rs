@@ -466,26 +466,123 @@ impl MarketStream for PolymarketStream {
     }
 }
 
-// --- Execution Stub ---
-// Note: Real Poly trading requires EIP-712 signing (complex).
-// This is a placeholder structure matching your interface.
+// --- Execution Client using Official Polymarket SDK ---
 
-/// Polymarket execution client.
+use alloy::signers::local::PrivateKeySigner;
+use alloy::signers::Signer;
+use polymarket_client_sdk::auth::state::Authenticated;
+use polymarket_client_sdk::auth::Normal;
+use polymarket_client_sdk::clob::types::{Amount, OrderType as PolyOrderType, Side as PolySide};
+use polymarket_client_sdk::clob::{Client as PolyClient, Config as PolyConfig};
+use polymarket_client_sdk::types::Decimal as PolyDecimal;
+use polymarket_client_sdk::POLYGON;
+use rust_decimal::prelude::FromPrimitive;
+use std::str::FromStr;
+
+/// Type alias for the authenticated Polymarket client.
+type AuthenticatedPolyClient = PolyClient<Authenticated<Normal>>;
+
+/// Polymarket execution client using the official SDK.
 /// 
 /// Clone + thread-safe for sharing across strategies.
+/// If no private key is provided, trading is disabled and orders will fail.
 #[derive(Clone)]
 pub struct PolymarketExec {
     inner: Arc<PolymarketExecInner>,
 }
 
+/// Inner state - uses RwLock because we need interior mutability for the async client.
 struct PolymarketExecInner {
-    api_key: String,
+    /// The authenticated client (None if trading is disabled)
+    client: Option<AuthenticatedPolyClient>,
+    /// The signer for signing orders (None if trading is disabled)
+    signer: Option<PrivateKeySigner>,
+    /// Whether trading is enabled
+    trading_enabled: bool,
 }
 
 impl PolymarketExec {
-    pub async fn new(api_key: String) -> Self {
+    /// Creates a new Polymarket execution client.
+    /// 
+    /// # Arguments
+    /// * `private_key` - Ethereum private key (hex string with or without 0x prefix).
+    ///                   If empty or "read_only", trading will be disabled.
+    /// 
+    /// # Trading Disabled Mode
+    /// When no valid private key is provided, the client operates in read-only mode:
+    /// - All `place_order` calls will return an error
+    /// - Market data streaming (via PolymarketStream) still works normally
+    pub async fn new(private_key: String) -> Self {
+        // Check if trading should be disabled
+        if private_key.is_empty() || private_key == "read_only" {
+            info!("PolymarketExec: Trading disabled (no private key)");
+            return Self {
+                inner: Arc::new(PolymarketExecInner {
+                    client: None,
+                    signer: None,
+                    trading_enabled: false,
+                }),
+            };
+        }
+
+        // Try to create signer from private key
+        let signer = match PrivateKeySigner::from_str(&private_key) {
+            Ok(s) => s.with_chain_id(Some(POLYGON)),
+            Err(e) => {
+                error!("PolymarketExec: Invalid private key: {}. Trading disabled.", e);
+                return Self {
+                    inner: Arc::new(PolymarketExecInner {
+                        client: None,
+                        signer: None,
+                        trading_enabled: false,
+                    }),
+                };
+            }
+        };
+
+        // Create the CLOB client
+        let config = PolyConfig::builder().use_server_time(true).build();
+        let base_client = match PolyClient::new("https://clob.polymarket.com", config) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("PolymarketExec: Failed to create client: {}. Trading disabled.", e);
+                return Self {
+                    inner: Arc::new(PolymarketExecInner {
+                        client: None,
+                        signer: None,
+                        trading_enabled: false,
+                    }),
+                };
+            }
+        };
+
+        // Authenticate with Polymarket
+        let authenticated_client = match base_client
+            .authentication_builder(&signer)
+            .authenticate()
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                error!("PolymarketExec: Authentication failed: {}. Trading disabled.", e);
+                return Self {
+                    inner: Arc::new(PolymarketExecInner {
+                        client: None,
+                        signer: None,
+                        trading_enabled: false,
+                    }),
+                };
+            }
+        };
+
+        info!("PolymarketExec: Authenticated successfully, trading enabled");
+        
         Self {
-            inner: Arc::new(PolymarketExecInner { api_key }),
+            inner: Arc::new(PolymarketExecInner {
+                client: Some(authenticated_client),
+                signer: Some(signer),
+                trading_enabled: true,
+            }),
         }
     }
 
@@ -493,16 +590,93 @@ impl PolymarketExec {
     pub fn shared(self) -> SharedExecutionClient {
         Arc::new(self)
     }
+
+    /// Returns whether trading is enabled.
+    pub fn is_trading_enabled(&self) -> bool {
+        self.inner.trading_enabled
+    }
 }
 
 #[async_trait]
 impl ExecutionClient for PolymarketExec {
-    async fn place_order(&self, _order: Order) -> Result<OrderId, String> {
-        info!(
-            "POLY EXEC: (Stub) Placing order with key {}",
-            self.inner.api_key
-        );
-        Ok("poly_fake_id".to_string())
+    async fn place_order(&self, order: Order) -> Result<OrderId, String> {
+        // Check if trading is enabled
+        if !self.inner.trading_enabled {
+            return Err("Trading disabled: no private key configured".to_string());
+        }
+
+        let signer = self.inner.signer.as_ref()
+            .ok_or_else(|| "Signer not available".to_string())?;
+
+        let client = self.inner.client.as_ref()
+            .ok_or_else(|| "Client not initialized".to_string())?;
+
+        // Extract token_id from instrument
+        let token_id = match &order.instrument {
+            Instrument::Polymarket(id) => id.clone(),
+            _ => return Err(format!("Invalid instrument for Polymarket: {:?}", order.instrument)),
+        };
+
+        // Convert order side
+        let side = match order.side {
+            crate::models::OrderSide::Buy => PolySide::Buy,
+            crate::models::OrderSide::Sell => PolySide::Sell,
+        };
+
+        // Convert quantity to Decimal
+        let size = PolyDecimal::from_f64(order.quantity)
+            .ok_or_else(|| format!("Invalid quantity: {}", order.quantity))?;
+
+        // Build and sign the order based on type
+        let signed_order = match order.order_type {
+            crate::models::OrderType::Market => {
+                // Market orders use USDC amount
+                let amount = Amount::usdc(size)
+                    .map_err(|e| format!("Invalid amount: {}", e))?;
+                
+                let market_order = client
+                    .market_order()
+                    .token_id(&token_id)
+                    .amount(amount)
+                    .side(side)
+                    .build()
+                    .await
+                    .map_err(|e| format!("Failed to build market order: {}", e))?;
+                
+                client.sign(signer, market_order).await
+                    .map_err(|e| format!("Failed to sign market order: {}", e))?
+            }
+            crate::models::OrderType::Limit => {
+                let price = order.price
+                    .ok_or_else(|| "Limit order requires price".to_string())?;
+                
+                let price_decimal = rust_decimal::Decimal::from_f64(price)
+                    .ok_or_else(|| format!("Invalid price: {}", price))?;
+
+                let limit_order = client
+                    .limit_order()
+                    .token_id(&token_id)
+                    .order_type(PolyOrderType::GTC) // Good-til-cancelled
+                    .price(price_decimal)
+                    .size(size)
+                    .side(side)
+                    .build()
+                    .await
+                    .map_err(|e| format!("Failed to build limit order: {}", e))?;
+                
+                client.sign(signer, limit_order).await
+                    .map_err(|e| format!("Failed to sign limit order: {}", e))?
+            }
+        };
+
+        // Submit the order
+        let response = client.post_order(signed_order).await
+            .map_err(|e| format!("Failed to post order: {}", e))?;
+
+        info!("PolymarketExec: Order placed successfully: {:?}", response);
+        
+        // Return the order ID from the response
+        Ok(response.order_id.to_string())
     }
 }
 
