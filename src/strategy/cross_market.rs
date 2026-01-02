@@ -223,6 +223,12 @@ pub struct CrossMarketStrategy {
     exec: SharedExecutionRouter,
     scanner: OpportunityScanner,
     optimizer: KellyOptimizer,
+    /// Polymarket catalog for market discovery (refreshed by Engine)
+    polymarket_catalog: Option<Arc<PolymarketCatalog>>,
+    /// Deribit catalog for instrument discovery (refreshed by Engine)
+    deribit_catalog: Option<Arc<DeribitCatalog>>,
+    /// Derive catalog for instrument discovery (refreshed by Engine)
+    derive_catalog: Option<Arc<DeriveCatalog>>,
 }
 
 impl CrossMarketStrategy {
@@ -242,6 +248,38 @@ impl CrossMarketStrategy {
             exec,
             scanner,
             optimizer,
+            polymarket_catalog: None,
+            deribit_catalog: None,
+            derive_catalog: None,
+        })
+    }
+
+    /// Creates a new cross-market strategy with catalog references.
+    /// 
+    /// Catalogs are used for live market discovery in `discover_subscriptions()`.
+    /// The Engine refreshes catalogs before calling discover_subscriptions,
+    /// ensuring strategies see newly listed markets.
+    pub fn with_catalogs(
+        name: impl Into<String>,
+        config: CrossMarketConfig,
+        exec: SharedExecutionRouter,
+        polymarket_catalog: Option<Arc<PolymarketCatalog>>,
+        deribit_catalog: Option<Arc<DeribitCatalog>>,
+        derive_catalog: Option<Arc<DeriveCatalog>>,
+    ) -> Arc<Self> {
+        let scanner = OpportunityScanner::new(config.scanner_config.clone());
+        let optimizer = KellyOptimizer::new(config.kelly_config.clone());
+
+        Arc::new(Self {
+            name: name.into(),
+            config,
+            state: RwLock::new(CrossMarketState::default()),
+            exec,
+            scanner,
+            optimizer,
+            polymarket_catalog,
+            deribit_catalog,
+            derive_catalog,
         })
     }
 
@@ -1295,24 +1333,138 @@ impl Strategy for CrossMarketStrategy {
     }
 
     async fn discover_subscriptions(&self) -> Vec<Instrument> {
-        let state = self.state.read().await;
+        use crate::catalog::Catalog;
+        
         let mut instruments = Vec::new();
+        let currency = &self.config.currency;
+        let max_expiry_days = self.config.max_expiry_days;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let max_expiry_ms = now_ms + (max_expiry_days as i64 * 24 * 3600 * 1000);
 
-        // Deribit subscriptions
-        for inst in &state.deribit_subscriptions {
-            instruments.push(Instrument::Deribit(inst.clone()));
+        // Query Deribit catalog if available, otherwise fall back to cached state
+        if let Some(catalog) = &self.deribit_catalog {
+            for instrument in catalog.current().values() {
+                // Filter by currency and expiry
+                if instrument.base_currency == *currency 
+                    && instrument.expiration_timestamp <= max_expiry_ms 
+                {
+                    instruments.push(Instrument::Deribit(instrument.instrument_name.clone()));
+                }
+            }
+            debug!("discover_subscriptions: {} Deribit instruments from catalog", instruments.len());
+        } else {
+            // Fall back to cached state (legacy path)
+            let state = self.state.read().await;
+            for inst in &state.deribit_subscriptions {
+                instruments.push(Instrument::Deribit(inst.clone()));
+            }
         }
 
-        // Derive subscriptions
-        for inst in &state.derive_subscriptions {
-            instruments.push(Instrument::Derive(inst.clone()));
+        let deribit_count = instruments.len();
+
+        // Query Derive catalog if available
+        if let Some(catalog) = &self.derive_catalog {
+            let max_expiry_date = chrono::Utc::now() + chrono::Duration::days(max_expiry_days as i64);
+            for instrument in catalog.current().values() {
+                // Filter by currency and expiry
+                if instrument.base_currency == *currency {
+                    // Check expiry using the helper method
+                    if let Some(expiry_dt) = instrument.expiration_datetime() {
+                        if expiry_dt <= max_expiry_date {
+                            instruments.push(Instrument::Derive(instrument.instrument_name.clone()));
+                        }
+                    }
+                }
+            }
+            debug!(
+                "discover_subscriptions: {} Derive instruments from catalog",
+                instruments.len() - deribit_count
+            );
+        } else {
+            // Fall back to cached state (legacy path)
+            let state = self.state.read().await;
+            for inst in &state.derive_subscriptions {
+                instruments.push(Instrument::Derive(inst.clone()));
+            }
         }
 
-        // Polymarket subscriptions (token IDs)
-        for market in state.polymarket_markets.values() {
-            instruments.push(Instrument::Polymarket(market.yes_token_id.clone()));
-            instruments.push(Instrument::Polymarket(market.no_token_id.clone()));
+        let derive_count = instruments.len() - deribit_count;
+
+        // Query Polymarket catalog if available
+        if let Some(catalog) = &self.polymarket_catalog {
+            let pattern = &self.config.polymarket_pattern;
+            match catalog.find_by_slug_regex(pattern) {
+                Ok(markets) => {
+                    let mut polymarket_count = 0;
+                    for market in markets {
+                        // Must have "bitcoin" in slug
+                        let slug = match &market.slug {
+                            Some(s) if s.to_lowercase().contains("bitcoin") => s,
+                            _ => continue,
+                        };
+
+                        // Parse strike and expiry from market
+                        let strike = match Self::parse_strike_from_market(&market) {
+                            Some(s) if s >= 10_000.0 && s <= 1_000_000.0 => s,
+                            _ => continue,
+                        };
+                        let expiry_ms = match Self::parse_expiry_from_market(&market) {
+                            Some(e) if e > now_ms => e,
+                            _ => continue,
+                        };
+
+                        // Get YES/NO tokens
+                        let yes_token = match market.yes_token() {
+                            Some(t) => t.token_id.clone(),
+                            None => continue,
+                        };
+                        let no_token = match market.no_token() {
+                            Some(t) => t.token_id.clone(),
+                            None => continue,
+                        };
+
+                        // Register market in state for price tracking
+                        self.register_polymarket_market(
+                            &market.id,
+                            market.question.as_deref().unwrap_or(slug),
+                            strike,
+                            expiry_ms,
+                            &yes_token,
+                            &no_token,
+                        ).await;
+
+                        instruments.push(Instrument::Polymarket(yes_token));
+                        instruments.push(Instrument::Polymarket(no_token));
+                        polymarket_count += 2;
+                    }
+                    debug!("discover_subscriptions: {} Polymarket tokens from catalog", polymarket_count);
+                }
+                Err(e) => {
+                    warn!("discover_subscriptions: Polymarket regex failed: {}", e);
+                    // Fall back to cached state
+                    let state = self.state.read().await;
+                    for market in state.polymarket_markets.values() {
+                        instruments.push(Instrument::Polymarket(market.yes_token_id.clone()));
+                        instruments.push(Instrument::Polymarket(market.no_token_id.clone()));
+                    }
+                }
+            }
+        } else {
+            // Fall back to cached state (legacy path)
+            let state = self.state.read().await;
+            for market in state.polymarket_markets.values() {
+                instruments.push(Instrument::Polymarket(market.yes_token_id.clone()));
+                instruments.push(Instrument::Polymarket(market.no_token_id.clone()));
+            }
         }
+
+        info!(
+            "discover_subscriptions: {} total ({} Deribit, {} Derive, {} Polymarket)",
+            instruments.len(),
+            deribit_count,
+            derive_count,
+            instruments.len() - deribit_count - derive_count
+        );
 
         instruments
     }

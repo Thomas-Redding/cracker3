@@ -139,15 +139,6 @@ pub trait Strategy: Dashboard + Send + Sync {
         Vec::new()
     }
 
-    /// Legacy: returns static list of instruments.
-    /// 
-    /// For backwards compatibility. New strategies should use
-    /// `discover_subscriptions()` instead.
-    #[deprecated(note = "Use discover_subscriptions() instead")]
-    fn required_subscriptions(&self) -> Vec<String> {
-        Vec::new()
-    }
-
     /// Called by the engine when a market event arrives for an instrument
     /// this strategy is subscribed to.
     async fn on_event(&self, event: MarketEvent);

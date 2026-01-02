@@ -1,5 +1,6 @@
 // src/engine/mod.rs
 
+use crate::catalog::SharedRefreshable;
 use crate::models::{Exchange, Instrument, MarketEvent};
 use crate::traits::{ExecutionRouter, MarketStream, SharedExecutionRouter, Strategy};
 use log::{debug, info, warn};
@@ -34,7 +35,7 @@ pub type SharedStream = Arc<dyn MarketStream>;
 /// 
 /// Manages multiple strategies across multiple exchanges:
 /// 1. Aggregates `required_exchanges()` from all strategies to determine connections
-/// 2. Periodically calls `discover_subscriptions()` to update subscriptions
+/// 2. Periodically refreshes catalogs, then calls `discover_subscriptions()` to update subscriptions
 /// 3. Routes market events to interested strategies
 /// 4. Provides an `ExecutionRouter` for strategies to place orders
 /// 5. Uses refcounting to manage subscriptions - instruments stay subscribed while any strategy needs them
@@ -42,6 +43,8 @@ pub struct Engine {
     strategies: Vec<Arc<dyn Strategy>>,
     streams: HashMap<Exchange, SharedStream>,
     exec_router: SharedExecutionRouter,
+    /// Catalogs for market discovery, keyed by exchange
+    catalogs: HashMap<Exchange, SharedRefreshable>,
     /// Current subscription refcounts per exchange: HashMap<Exchange, HashMap<Instrument, usize>>
     current_subs: HashMap<Exchange, HashMap<Instrument, usize>>,
     /// Routing table: instrument -> strategy indices
@@ -54,58 +57,20 @@ impl Engine {
     /// 
     /// Call `with_stream()` for each exchange to add market data streams,
     /// then call `run()` to start processing events.
+    /// 
+    /// Note: The routing table starts empty and is populated by `refresh_subscriptions()`
+    /// at the start of `run()`. Strategies should implement `discover_subscriptions()`
+    /// to declare their subscriptions.
     pub fn new(strategies: Vec<Arc<dyn Strategy>>) -> Self {
-        // Build initial routing table based on static subscriptions
-        let mut routing_table: HashMap<Instrument, Vec<usize>> = HashMap::new();
-        let mut current_subs: HashMap<Exchange, HashMap<Instrument, usize>> = HashMap::new();
-
-        for (idx, strategy) in strategies.iter().enumerate() {
-            // Use deprecated method for backwards compatibility
-            #[allow(deprecated)]
-            let legacy_subs = strategy.required_subscriptions();
-            
-            // For now, we can't know which exchange these belong to without parsing
-            // In a full implementation, strategies would use discover_subscriptions()
-            for sub in legacy_subs {
-                // Try to infer exchange from format (this is a heuristic)
-                let instrument = if sub.contains('-') && sub.len() > 20 {
-                    // Looks like an option: BTC-29MAR24-60000-C
-                    // Could be Deribit or Derive, default to Deribit
-                    Instrument::Deribit(sub)
-                } else if sub.chars().all(|c| c.is_numeric()) && sub.len() > 30 {
-                    // Looks like a Polymarket token ID
-                    Instrument::Polymarket(sub)
-                } else {
-                    // Default to Deribit
-                    Instrument::Deribit(sub)
-                };
-
-                routing_table
-                    .entry(instrument.clone())
-                    .or_default()
-                    .push(idx);
-                
-                // Initialize with refcount of 1 for legacy subscriptions
-                *current_subs
-                    .entry(instrument.exchange())
-                    .or_default()
-                    .entry(instrument)
-                    .or_insert(0) += 1;
-            }
-        }
-
-        info!(
-            "Engine initialized with {} strategies, {} unique instruments",
-            strategies.len(),
-            routing_table.len()
-        );
+        info!("Engine initialized with {} strategies", strategies.len());
 
         Self {
             strategies,
             streams: HashMap::new(),
             exec_router: Arc::new(ExecutionRouter::empty()),
-            current_subs,
-            routing_table,
+            catalogs: HashMap::new(),
+            current_subs: HashMap::new(),
+            routing_table: HashMap::new(),
             config: EngineConfig::default(),
         }
     }
@@ -113,6 +78,18 @@ impl Engine {
     /// Adds a market data stream for an exchange.
     pub fn with_stream(mut self, exchange: Exchange, stream: Box<dyn MarketStream>) -> Self {
         self.streams.insert(exchange, Arc::from(stream));
+        self
+    }
+
+    /// Adds a catalog for market discovery on an exchange.
+    /// 
+    /// Catalogs are refreshed before each subscription discovery cycle,
+    /// ensuring strategies see newly listed markets.
+    /// 
+    /// Accepts any type implementing `Refreshable` (via `SharedRefreshable`).
+    /// This includes `DeribitCatalog`, `DeriveCatalog`, and `PolymarketCatalog`.
+    pub fn with_catalog(mut self, exchange: Exchange, catalog: SharedRefreshable) -> Self {
+        self.catalogs.insert(exchange, catalog);
         self
     }
 
@@ -140,6 +117,24 @@ impl Engine {
             exchanges.extend(strategy.required_exchanges());
         }
         exchanges
+    }
+
+    /// Refreshes all catalogs by fetching latest market data from exchanges.
+    /// 
+    /// This is called before `refresh_subscriptions()` to ensure strategies
+    /// can discover newly listed markets.
+    pub async fn refresh_catalogs(&self) {
+        for (exchange, catalog) in &self.catalogs {
+            debug!("Engine: Refreshing {:?} catalog...", exchange);
+            match catalog.refresh().await {
+                Ok(count) => {
+                    info!("Engine: {:?} catalog refreshed, {} markets", exchange, count);
+                }
+                Err(e) => {
+                    warn!("Engine: Failed to refresh {:?} catalog: {}", exchange, e);
+                }
+            }
+        }
     }
 
     /// Refreshes subscriptions by calling discover_subscriptions() on all strategies.
@@ -219,9 +214,14 @@ impl Engine {
     /// Runs the engine, processing events from all streams concurrently.
     /// Uses tokio::select! to handle both market events and periodic subscription refresh.
     pub async fn run(mut self) {
-        info!("Engine: Starting event loop with {} exchanges", self.streams.len());
+        info!(
+            "Engine: Starting event loop with {} exchanges, {} catalogs",
+            self.streams.len(),
+            self.catalogs.len()
+        );
 
-        // Initial subscription refresh
+        // Initial catalog refresh + subscription discovery
+        self.refresh_catalogs().await;
         self.refresh_subscriptions().await;
 
         // Create a channel for all streams to send events to
@@ -278,9 +278,10 @@ impl Engine {
                         }
                     }
                 }
-                // Handle periodic subscription refresh
+                // Handle periodic catalog + subscription refresh
                 _ = refresh_interval.tick() => {
-                    debug!("Engine: Periodic subscription refresh triggered");
+                    debug!("Engine: Periodic refresh triggered");
+                    self.refresh_catalogs().await;
                     self.refresh_subscriptions().await;
                 }
             }
@@ -320,139 +321,3 @@ impl Engine {
     }
 }
 
-// =============================================================================
-// Legacy MarketRouter (for backwards compatibility)
-// =============================================================================
-
-/// The MarketRouter manages multiple strategies and a shared market data stream.
-/// 
-/// DEPRECATED: Use `Engine` instead for multi-exchange support.
-#[deprecated(note = "Use Engine instead for multi-exchange support")]
-pub struct MarketRouter<S: MarketStream> {
-    stream: S,
-    strategies: Vec<Arc<dyn Strategy>>,
-    /// Maps instrument -> list of strategy indices that are interested
-    routing_table: HashMap<Instrument, Vec<usize>>,
-}
-
-#[allow(deprecated)]
-impl<S: MarketStream + 'static> MarketRouter<S> {
-    /// Creates a new MarketRouter.
-    pub fn new(stream: S, strategies: Vec<Arc<dyn Strategy>>) -> Self {
-        let mut routing_table: HashMap<Instrument, Vec<usize>> = HashMap::new();
-        
-        for (idx, strategy) in strategies.iter().enumerate() {
-            #[allow(deprecated)]
-            for sub in strategy.required_subscriptions() {
-                // Infer instrument type (simplified)
-                let instrument = if sub.chars().all(|c| c.is_numeric()) && sub.len() > 30 {
-                    Instrument::Polymarket(sub)
-                } else {
-                    Instrument::Deribit(sub)
-                };
-                routing_table.entry(instrument).or_default().push(idx);
-            }
-        }
-
-        info!(
-            "MarketRouter initialized with {} strategies, {} unique instruments",
-            strategies.len(),
-            routing_table.len()
-        );
-
-        Self {
-            stream,
-            strategies,
-            routing_table,
-        }
-    }
-
-    /// Aggregates all required subscriptions from a list of strategies.
-    #[allow(deprecated)]
-    pub fn aggregate_subscriptions(strategies: &[Arc<dyn Strategy>]) -> Vec<String> {
-        let mut unique: HashSet<String> = HashSet::new();
-        for strategy in strategies {
-            for sub in strategy.required_subscriptions() {
-                unique.insert(sub);
-            }
-        }
-        unique.into_iter().collect()
-    }
-
-    /// Runs the router, distributing market events to interested strategies.
-    pub async fn run(self) {
-        info!("MarketRouter starting event loop...");
-
-        while let Some(event) = self.stream.next().await {
-            let instrument = &event.instrument;
-
-            if let Some(strategy_indices) = self.routing_table.get(instrument) {
-                let mut handles = Vec::new();
-
-                for &idx in strategy_indices {
-                    let strategy = Arc::clone(&self.strategies[idx]);
-                    let event_clone = event.clone();
-
-                    let handle = tokio::spawn(async move {
-                        strategy.on_event(event_clone).await;
-                    });
-                    handles.push(handle);
-                }
-
-                for handle in handles {
-                    if let Err(e) = handle.await {
-                        warn!("Strategy handler panicked: {:?}", e);
-                    }
-                }
-            }
-        }
-
-        info!("MarketRouter: Stream ended, shutting down.");
-    }
-}
-
-/// Builder for constructing a multi-strategy engine.
-#[deprecated(note = "Use Engine::new() instead")]
-pub struct EngineBuilder {
-    strategies: Vec<Arc<dyn Strategy>>,
-}
-
-#[allow(deprecated)]
-impl EngineBuilder {
-    pub fn new() -> Self {
-        Self {
-            strategies: Vec::new(),
-        }
-    }
-
-    pub fn add_strategy(mut self, strategy: Arc<dyn Strategy>) -> Self {
-        self.strategies.push(strategy);
-        self
-    }
-
-    #[allow(deprecated)]
-    pub fn get_required_instruments(&self) -> Vec<String> {
-        MarketRouter::<DummyStream>::aggregate_subscriptions(&self.strategies)
-    }
-
-    pub fn build(self) -> Vec<Arc<dyn Strategy>> {
-        self.strategies
-    }
-}
-
-#[allow(deprecated)]
-impl Default for EngineBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// Dummy stream type for the aggregate_subscriptions function signature
-struct DummyStream;
-
-#[async_trait::async_trait]
-impl MarketStream for DummyStream {
-    async fn next(&self) -> Option<MarketEvent> {
-        None
-    }
-}

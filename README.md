@@ -176,7 +176,7 @@ Unit tests cover:
 * **Execution Router:** Place orders on any exchange via `ExecutionRouter::place_order()`.
 * **Historical Catalogs:** Time-travel support with `as_of(timestamp)` for backtests.
 * **TOML Config:** Define strategies in config files, not code.
-* **Dynamic Subscriptions:** `discover_subscriptions()` called periodically to update subscriptions.
+* **Dynamic Subscriptions:** Engine-coordinated catalog refresh + `discover_subscriptions()` for live market discovery.
 * **Web Dashboard:** Real-time web UI with one tab per strategy.
 
 ## 🏗 Architecture
@@ -313,25 +313,59 @@ pub trait Strategy: Dashboard + Send + Sync {
 
 ## 🕰 Historical Catalogs
 
-Catalogs support **time-travel** for backtesting:
+Catalogs support **time-travel** for backtesting and **Engine-coordinated refresh** for live market discovery.
+
+### Trait Hierarchy
+
+```
+Refreshable          ← Engine uses this for coordinated refresh
+    │
+    ▼
+Catalog              ← Adds time-travel (current, as_of, diffs)
+    │
+    ├── DeribitCatalog
+    ├── DeriveCatalog
+    └── PolymarketCatalog (+ search methods)
+```
+
+### Usage
 
 ```rust
-use crate::catalog::{Catalog, PolymarketCatalog};
+use crate::catalog::{Catalog, Refreshable, PolymarketCatalog};
 
-let catalog = PolymarketCatalog::new(None).await;
+let catalog = PolymarketCatalog::new(None, None).await;
 
 // Current state
 let current = catalog.current();
 
-// State as of a specific timestamp
+// State as of a specific timestamp (time-travel)
 let historical = catalog.as_of(1704067200); // Jan 1, 2024
 
-// Find markets by regex
+// Find markets by regex (Polymarket-specific)
 let btc_markets = catalog.find_by_slug_regex(r"bitcoin-above-\d+")?;
 
-// Refresh and track changes
-let diff = catalog.refresh().await?;
+// Refresh and get change count (Refreshable trait)
+let changes = catalog.refresh().await?;
+
+// Or get full diff (Catalog trait)
+let diff = catalog.refresh_with_diff().await?;
+println!("Added: {}, Removed: {}", diff.added.len(), diff.removed.len());
 ```
+
+### Engine Integration
+
+The Engine coordinates catalog refresh before subscription discovery:
+
+```rust
+// Engine refresh cycle (every 60s):
+// 1. Refresh all catalogs (fetch new markets from exchanges)
+engine.refresh_catalogs().await;
+// 2. Ask strategies to re-discover subscriptions (query fresh catalog state)
+engine.refresh_subscriptions().await;
+// 3. Subscribe to any new instruments
+```
+
+This ensures strategies automatically discover newly listed markets without code changes.
 
 ## 📁 Project Structure
 
@@ -343,12 +377,12 @@ src/
 ├── models.rs            # Instrument, Exchange, MarketEvent, Order
 ├── traits.rs            # Strategy, MarketStream, ExecutionClient, ExecutionRouter
 ├── engine/
-│   └── mod.rs           # Unified Engine, MarketRouter
+│   └── mod.rs           # Unified Engine (catalog refresh, subscription mgmt)
 ├── catalog/
-│   ├── mod.rs           # Catalog trait, CatalogDiff, time-travel helpers
-│   ├── deribit.rs       # DeribitCatalog
-│   ├── derive.rs        # DeriveCatalog
-│   └── polymarket.rs    # PolymarketCatalog (with regex search)
+│   ├── mod.rs           # Refreshable + Catalog traits, CatalogDiff, time-travel
+│   ├── deribit.rs       # DeribitCatalog (options instruments)
+│   ├── derive.rs        # DeriveCatalog (options instruments)
+│   └── polymarket.rs    # PolymarketCatalog (prediction markets, regex search)
 ├── dashboard/
 │   └── mod.rs           # DashboardServer, REST API, WebSocket
 ├── pricing/
@@ -416,9 +450,12 @@ Options:
 ## TODOs
 
 * P1: ~~Implement cross-market BTC trading strategy.~~ ✅ DONE
+* P1: ~~Engine-coordinated catalog refresh for dynamic market discovery.~~ ✅ DONE
 * P1: Add execution logic to actually place trades on identified opportunities.
-* P2: Implement `refresh_subscriptions` in deribit.rs and derive.rs.
+* P2: ~~Unified Refreshable + Catalog trait hierarchy.~~ ✅ DONE
+* P2: ~~Remove deprecated `MarketRouter`, `EngineBuilder`, and `required_subscriptions()`.~~ ✅ DONE
 * P2: Allow dashboard to enable/disable strategies.
+* P3: Remove deprecated `MarketCatalog` trait and move methods to `PolymarketCatalog`.
 * P3: Implement real trading execution for the various exchanges.
 
 ## LLM Context Cheatsheet

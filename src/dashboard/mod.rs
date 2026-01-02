@@ -133,14 +133,20 @@ struct StrategyInfo {
 
 /// GET /api/strategies - Lists all strategies
 async fn list_strategies(State(state): State<Arc<DashboardState>>) -> Json<Vec<StrategyInfo>> {
-    let strategies: Vec<StrategyInfo> = state
-        .strategies
-        .iter()
-        .map(|s| StrategyInfo {
+    let mut strategies = Vec::new();
+    
+    for s in &state.strategies {
+        // Use discover_subscriptions() instead of deprecated required_subscriptions()
+        let instruments = s.discover_subscriptions().await
+            .into_iter()
+            .map(|i| i.symbol().to_string())
+            .collect();
+        
+        strategies.push(StrategyInfo {
             name: s.dashboard_name().to_string(),
-            instruments: s.required_subscriptions(),
-        })
-        .collect();
+            instruments,
+        });
+    }
 
     Json(strategies)
 }
