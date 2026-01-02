@@ -1,5 +1,6 @@
 // src/engine/mod.rs
 
+use crate::catalog::SharedRefreshable;
 use crate::models::{Exchange, Instrument, MarketEvent};
 use crate::traits::{ExecutionRouter, MarketStream, SharedExecutionRouter, Strategy};
 use log::{debug, info, warn};
@@ -34,7 +35,7 @@ pub type SharedStream = Arc<dyn MarketStream>;
 /// 
 /// Manages multiple strategies across multiple exchanges:
 /// 1. Aggregates `required_exchanges()` from all strategies to determine connections
-/// 2. Periodically calls `discover_subscriptions()` to update subscriptions
+/// 2. Periodically refreshes catalogs, then calls `discover_subscriptions()` to update subscriptions
 /// 3. Routes market events to interested strategies
 /// 4. Provides an `ExecutionRouter` for strategies to place orders
 /// 5. Uses refcounting to manage subscriptions - instruments stay subscribed while any strategy needs them
@@ -42,6 +43,8 @@ pub struct Engine {
     strategies: Vec<Arc<dyn Strategy>>,
     streams: HashMap<Exchange, SharedStream>,
     exec_router: SharedExecutionRouter,
+    /// Catalogs for market discovery, keyed by exchange
+    catalogs: HashMap<Exchange, SharedRefreshable>,
     /// Current subscription refcounts per exchange: HashMap<Exchange, HashMap<Instrument, usize>>
     current_subs: HashMap<Exchange, HashMap<Instrument, usize>>,
     /// Routing table: instrument -> strategy indices
@@ -104,6 +107,7 @@ impl Engine {
             strategies,
             streams: HashMap::new(),
             exec_router: Arc::new(ExecutionRouter::empty()),
+            catalogs: HashMap::new(),
             current_subs,
             routing_table,
             config: EngineConfig::default(),
@@ -113,6 +117,18 @@ impl Engine {
     /// Adds a market data stream for an exchange.
     pub fn with_stream(mut self, exchange: Exchange, stream: Box<dyn MarketStream>) -> Self {
         self.streams.insert(exchange, Arc::from(stream));
+        self
+    }
+
+    /// Adds a catalog for market discovery on an exchange.
+    /// 
+    /// Catalogs are refreshed before each subscription discovery cycle,
+    /// ensuring strategies see newly listed markets.
+    /// 
+    /// Accepts any type implementing `Refreshable` (via `SharedRefreshable`).
+    /// This includes `DeribitCatalog`, `DeriveCatalog`, and `PolymarketCatalog`.
+    pub fn with_catalog(mut self, exchange: Exchange, catalog: SharedRefreshable) -> Self {
+        self.catalogs.insert(exchange, catalog);
         self
     }
 
@@ -140,6 +156,24 @@ impl Engine {
             exchanges.extend(strategy.required_exchanges());
         }
         exchanges
+    }
+
+    /// Refreshes all catalogs by fetching latest market data from exchanges.
+    /// 
+    /// This is called before `refresh_subscriptions()` to ensure strategies
+    /// can discover newly listed markets.
+    pub async fn refresh_catalogs(&self) {
+        for (exchange, catalog) in &self.catalogs {
+            debug!("Engine: Refreshing {:?} catalog...", exchange);
+            match catalog.refresh().await {
+                Ok(count) => {
+                    info!("Engine: {:?} catalog refreshed, {} markets", exchange, count);
+                }
+                Err(e) => {
+                    warn!("Engine: Failed to refresh {:?} catalog: {}", exchange, e);
+                }
+            }
+        }
     }
 
     /// Refreshes subscriptions by calling discover_subscriptions() on all strategies.
@@ -219,9 +253,14 @@ impl Engine {
     /// Runs the engine, processing events from all streams concurrently.
     /// Uses tokio::select! to handle both market events and periodic subscription refresh.
     pub async fn run(mut self) {
-        info!("Engine: Starting event loop with {} exchanges", self.streams.len());
+        info!(
+            "Engine: Starting event loop with {} exchanges, {} catalogs",
+            self.streams.len(),
+            self.catalogs.len()
+        );
 
-        // Initial subscription refresh
+        // Initial catalog refresh + subscription discovery
+        self.refresh_catalogs().await;
         self.refresh_subscriptions().await;
 
         // Create a channel for all streams to send events to
@@ -278,9 +317,10 @@ impl Engine {
                         }
                     }
                 }
-                // Handle periodic subscription refresh
+                // Handle periodic catalog + subscription refresh
                 _ = refresh_interval.tick() => {
-                    debug!("Engine: Periodic subscription refresh triggered");
+                    debug!("Engine: Periodic refresh triggered");
+                    self.refresh_catalogs().await;
                     self.refresh_subscriptions().await;
                 }
             }

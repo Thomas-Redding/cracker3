@@ -6,7 +6,7 @@
 
 use super::{
     apply_diff, compute_diff, format_timestamp, invert_diff, AutoRefreshGuard, Catalog,
-    CatalogDiff, CatalogFileEntry, DEFAULT_OPTIONS_STALE_THRESHOLD_SECS,
+    CatalogDiff, CatalogFileEntry, Refreshable, DEFAULT_OPTIONS_STALE_THRESHOLD_SECS,
 };
 use async_trait::async_trait;
 use log::{error, info, warn};
@@ -437,6 +437,21 @@ impl DeriveInstrument {
 }
 
 #[async_trait]
+// Implement Refreshable (used by Engine)
+#[async_trait]
+impl Refreshable for DeriveCatalog {
+    async fn refresh(&self) -> Result<usize, String> {
+        let diff = self.refresh_internal().await?;
+        Ok(diff.change_count())
+    }
+
+    fn last_updated(&self) -> u64 {
+        self.inner.read().unwrap().last_updated
+    }
+}
+
+// Implement Catalog (extends Refreshable with time-travel)
+#[async_trait]
 impl Catalog for DeriveCatalog {
     type Item = DeriveInstrument;
 
@@ -463,12 +478,8 @@ impl Catalog for DeriveCatalog {
         result
     }
 
-    async fn refresh(&mut self) -> Result<CatalogDiff<DeriveInstrument>, String> {
+    async fn refresh_with_diff(&self) -> Result<CatalogDiff<DeriveInstrument>, String> {
         self.refresh_internal().await
-    }
-
-    fn last_updated(&self) -> u64 {
-        self.inner.read().unwrap().last_updated
     }
 
     fn diffs(&self) -> Vec<CatalogDiff<DeriveInstrument>> {

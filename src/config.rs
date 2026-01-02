@@ -3,6 +3,7 @@
 // Configuration file parsing for strategy-centric architecture.
 // Supports TOML config files that specify strategies and their parameters.
 
+use crate::catalog::{DeribitCatalog, DeriveCatalog, PolymarketCatalog};
 use crate::engine::EngineConfig;
 use crate::models::{Exchange, Instrument};
 use crate::optimizer::KellyConfig;
@@ -14,6 +15,25 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+
+// =============================================================================
+// Catalog References for Strategy Construction
+// =============================================================================
+
+/// Holds references to shared catalogs for strategy construction.
+/// 
+/// Catalogs are created once at startup and shared between the Engine
+/// (for refresh coordination) and strategies (for market discovery).
+/// 
+/// Uses concrete types (`Arc<XxxCatalog>`) rather than trait objects
+/// so catalogs can be used with both `Refreshable` (for Engine) and
+/// type-specific methods (for strategies).
+#[derive(Clone, Default)]
+pub struct Catalogs {
+    pub polymarket: Option<Arc<PolymarketCatalog>>,
+    pub deribit: Option<Arc<DeribitCatalog>>,
+    pub derive: Option<Arc<DeriveCatalog>>,
+}
 
 // =============================================================================
 // Configuration Types
@@ -222,16 +242,33 @@ impl Config {
     }
 
     /// Builds strategy instances from the configuration.
+    /// 
+    /// For strategies that need catalog access (like CrossMarket), pass catalogs.
+    /// If catalogs is None, strategies will fall back to their legacy initialization.
     pub fn build_strategies(
         &self,
         exec_router: SharedExecutionRouter,
+    ) -> Vec<Arc<dyn Strategy>> {
+        self.build_strategies_with_catalogs(exec_router, None)
+    }
+
+    /// Builds strategy instances with optional catalog references.
+    /// 
+    /// When catalogs are provided, strategies use them for live market discovery
+    /// instead of caching instruments at startup.
+    pub fn build_strategies_with_catalogs(
+        &self,
+        exec_router: SharedExecutionRouter,
+        catalogs: Option<&Catalogs>,
     ) -> Vec<Arc<dyn Strategy>> {
         self.strategies
             .iter()
             .filter_map(|cfg| match cfg {
                 StrategyConfig::GammaScalp(c) => Some(build_gamma_scalp(c, exec_router.clone())),
                 StrategyConfig::Momentum(c) => Some(build_momentum(c, exec_router.clone())),
-                StrategyConfig::CrossMarket(c) => Some(build_cross_market(c, exec_router.clone())),
+                StrategyConfig::CrossMarket(c) => {
+                    Some(build_cross_market(c, exec_router.clone(), catalogs))
+                }
             })
             .collect()
     }
@@ -304,6 +341,7 @@ fn build_momentum(
 fn build_cross_market(
     config: &CrossMarketConfigFile,
     exec_router: SharedExecutionRouter,
+    catalogs: Option<&Catalogs>,
 ) -> Arc<dyn Strategy> {
     use crate::optimizer::{ScannerConfig, UtilityFunction};
 
@@ -339,23 +377,40 @@ fn build_cross_market(
         regime_scaler: 1.0,
     };
 
-    let max_expiry_days = cross_market_config.max_expiry_days;
-    let strategy = CrossMarketStrategy::new(&config.name, cross_market_config, exec_router);
+    // If catalogs are provided, use them for live discovery (preferred path)
+    // Otherwise, fall back to legacy blocking initialization
+    let strategy = if let Some(cats) = catalogs {
+        CrossMarketStrategy::with_catalogs(
+            &config.name,
+            cross_market_config,
+            exec_router,
+            cats.polymarket.clone(),
+            cats.deribit.clone(),
+            cats.derive.clone(),
+        )
+    } else {
+        // Legacy path: blocking initialization
+        let max_expiry_days = cross_market_config.max_expiry_days;
+        let strategy = CrossMarketStrategy::new(&config.name, cross_market_config, exec_router);
 
-    // Initialize subscriptions from exchange APIs (blocking)
-    let strategy_clone = strategy.clone();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime");
-        rt.block_on(async {
-            strategy_clone.initialize_subscriptions(max_expiry_days).await;
-        });
-    }).join().expect("Failed to initialize subscriptions");
+        // Initialize subscriptions from exchange APIs (blocking)
+        let strategy_clone = strategy.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime");
+            rt.block_on(async {
+                strategy_clone.initialize_subscriptions(max_expiry_days).await;
+            });
+        }).join().expect("Failed to initialize subscriptions");
+
+        strategy
+    };
 
     // Register Polymarket markets from config (blocking to ensure registration
     // completes before the strategy starts receiving events)
+    // Note: This is only for manually-specified markets in config, not catalog discovery
     if !config.polymarket_markets.is_empty() {
         let strategy_clone = strategy.clone();
         let markets = config.polymarket_markets.clone();
