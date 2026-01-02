@@ -49,9 +49,14 @@ cargo run -- --mode backtest --file data.jsonl --realtime --speed 2.0
 |----------|----------|----------|
 | `DERIBIT_KEY` | Deribit | Only for live trading |
 | `DERIVE_KEY` | Derive | Only for live trading |
-| `POLYMARKET_KEY` | Polymarket | Only for live trading |
+| `POLYMARKET_PRIVATE_KEY` | Polymarket | Only for live trading |
 
 **Note**: API keys are NOT required for market data streaming. The strategy will receive real-time prices from all exchanges without keys.
+
+For Polymarket, you need an Ethereum wallet private key (hex format) for EIP-712 order signing:
+```bash
+export POLYMARKET_PRIVATE_KEY="0xabc123..."  # with or without 0x prefix
+```
 
 ## 📋 Configuration File
 
@@ -466,7 +471,8 @@ Options:
 * P2: ~~Remove deprecated `MarketRouter`, `EngineBuilder`, and `required_subscriptions()`.~~ ✅ DONE
 * P2: Allow dashboard to enable/disable strategies.
 * P3: Remove deprecated `MarketCatalog` trait and move methods to `PolymarketCatalog`.
-* P3: Implement real trading execution for the various exchanges.
+* P3: ~~Polymarket execution via official SDK.~~ ✅ DONE (uses [rs-clob-client](https://github.com/Polymarket/rs-clob-client))
+* P3: Implement real trading execution for Deribit and Derive.
 
 ## LLM Context Cheatsheet
 
