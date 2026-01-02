@@ -271,6 +271,16 @@ pub struct PriceDistribution {
 let prob = distribution.probability_above(strike, expiry_timestamp);
 ```
 
+#### Volatility-Weighted Time
+
+Calendar time is not always the best proxy for how much variance should accrue. The `VolTimeStrategy` trait lets us convert timestamps into **volatility-weighted seconds** so intraday seasonality, regime shifts, or one-off events influence interpolation weights. The default `CalendarVolTimeStrategy` is uniform, while `WeightedVolTimeStrategy` supports:
+
+- Hour-of-week weight maps (e.g., higher weight during U.S. market hours)
+- A `regime_scaler` to boost/reduce all weights with a single knob
+- Arbitrary `(start, end, multiplier)` event overrides for FOMC, CPI, etc.
+
+`VolatilitySurface::get_iv_interpolated` (and the related probability/PPF helpers in `PriceDistribution`) accept an optional `&dyn VolTimeStrategy`. When provided, total variance is still computed with calendar time, but interpolation weights use vol-weighted time—so near-term “high-vol hours” receive more influence without breaking calendar arbitrage constraints.
+
 ### Opportunity
 
 ```rust
