@@ -630,8 +630,9 @@ impl ExecutionClient for PolymarketExec {
         // Build and sign the order based on type
         let signed_order = match order.order_type {
             crate::models::OrderType::Market => {
-                // Market orders use USDC amount
-                let amount = Amount::usdc(size)
+                // Market orders use shares (token quantity), not USDC amount.
+                // Note: Polymarket SDK requires sell orders to use shares, not USDC.
+                let amount = Amount::shares(size)
                     .map_err(|e| format!("Invalid amount: {}", e))?;
                 
                 let market_order = client
