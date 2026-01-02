@@ -167,7 +167,9 @@ impl DeriveCatalog {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        now - last_updated > self.stale_threshold_secs
+        // Use saturating_sub to prevent underflow if last_updated > now
+        // (e.g., from clock skew or corrupted cache data)
+        now.saturating_sub(last_updated) > self.stale_threshold_secs
     }
 
     /// Check if the catalog cache is stale.

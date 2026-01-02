@@ -503,6 +503,9 @@ impl CatalogCore {
     }
 
     /// Check if a timestamp is stale relative to a threshold.
+    /// 
+    /// Uses saturating subtraction to handle cases where `last_updated > now`
+    /// (e.g., clock skew, corrupted cache data). In such cases, returns `false`.
     pub fn is_stale(last_updated: u64, threshold_secs: u64) -> bool {
         use std::time::{SystemTime, UNIX_EPOCH};
         
@@ -510,7 +513,7 @@ impl CatalogCore {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        now - last_updated > threshold_secs
+        now.saturating_sub(last_updated) > threshold_secs
     }
 }
 
