@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DERIVE_API_URL: &str = "https://api.lyra.finance/public";
-const DEFAULT_CACHE_PATH: &str = "derive_instruments.jsonl";
+const DEFAULT_CACHE_PATH: &str = "cache/derive_instruments.jsonl";
 
 /// Static flag to prevent multiple concurrent auto-refreshes.
 static AUTO_REFRESH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);

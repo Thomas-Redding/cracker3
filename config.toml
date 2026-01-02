@@ -37,7 +37,7 @@ polymarket_pattern = "bitcoin-above-\\d+"
 #   python generate_hourly_vols.py
 #
 # vol_time_strategy = "weighted"   # "calendar" (default) or "weighted"
-# hourly_vols_file = "hourly_vols.json"  # Path to JSON with 168 hourly vol values
+# hourly_vols_file = "cache/hourly_vols.json"  # Path to JSON with 168 hourly vol values
 # regime_scaler = 1.0              # Recent vol / long-term vol (GARCH-lite)
 
 # Example Polymarket market to track

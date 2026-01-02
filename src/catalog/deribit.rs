@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DERIBIT_API_URL: &str = "https://www.deribit.com/api/v2";
-const DEFAULT_CACHE_PATH: &str = "deribit_instruments.jsonl";
+const DEFAULT_CACHE_PATH: &str = "cache/deribit_instruments.jsonl";
 
 /// Static flag to prevent multiple concurrent auto-refreshes.
 static AUTO_REFRESH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
