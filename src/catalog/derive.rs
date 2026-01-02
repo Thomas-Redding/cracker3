@@ -436,7 +436,6 @@ impl DeriveInstrument {
     }
 }
 
-#[async_trait]
 // Implement Refreshable (used by Engine)
 #[async_trait]
 impl Refreshable for DeriveCatalog {
