@@ -451,6 +451,21 @@ impl Refreshable for DeriveCatalog {
 
 // Implement Catalog (extends Refreshable with time-travel)
 #[async_trait]
+// Implement Refreshable (used by Engine)
+#[async_trait]
+impl Refreshable for DeriveCatalog {
+    async fn refresh(&self) -> Result<usize, String> {
+        let diff = self.refresh_internal().await?;
+        Ok(diff.change_count())
+    }
+
+    fn last_updated(&self) -> u64 {
+        self.inner.read().unwrap().last_updated
+    }
+}
+
+// Implement Catalog (extends Refreshable with time-travel)
+#[async_trait]
 impl Catalog for DeriveCatalog {
     type Item = DeriveInstrument;
 
