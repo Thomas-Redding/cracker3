@@ -7,7 +7,8 @@ use chrono::Utc;
 use clap::Parser;
 use std::collections::HashMap;
 use std::sync::Arc;
-use trading_bot::config::{default_config_template, Config};
+use trading_bot::catalog::{DeribitCatalog, DeriveCatalog, PolymarketCatalog, SharedRefreshable};
+use trading_bot::config::{default_config_template, Catalogs, Config};
 use trading_bot::connectors::{backtest, deribit, derive, polymarket};
 use trading_bot::dashboard::DashboardServer;
 use trading_bot::engine::Engine;
@@ -146,8 +147,30 @@ async fn run_live_mode(args: &Args) {
     // Build execution router
     let exec_router = Arc::new(ExecutionRouter::new(exec_clients));
 
-    // Build strategies from config
-    let strategies = config.build_strategies(exec_router.clone());
+    // Create catalogs for market discovery
+    // These are shared between Engine (for refresh coordination) and strategies (for discovery)
+    println!("Initializing catalogs...");
+    let mut catalogs = Catalogs::default();
+    
+    if required_exchanges.contains(&Exchange::Polymarket) {
+        let catalog = PolymarketCatalog::new(None, None).await;
+        catalogs.polymarket = Some(catalog);
+        println!("Polymarket catalog initialized");
+    }
+    if required_exchanges.contains(&Exchange::Deribit) {
+        // DeribitCatalog needs currencies - extract from config or default to BTC
+        let catalog = DeribitCatalog::new(vec!["BTC".to_string()], None, None).await;
+        catalogs.deribit = Some(catalog);
+        println!("Deribit catalog initialized");
+    }
+    if required_exchanges.contains(&Exchange::Derive) {
+        let catalog = DeriveCatalog::new(vec!["BTC".to_string()], None, None).await;
+        catalogs.derive = Some(catalog);
+        println!("Derive catalog initialized");
+    }
+
+    // Build strategies from config with catalog references
+    let strategies = config.build_strategies_with_catalogs(exec_router.clone(), Some(&catalogs));
     println!("Loaded {} strategies", strategies.len());
 
     // Start dashboard if configured
@@ -167,9 +190,21 @@ async fn run_live_mode(args: &Args) {
         }
     }
 
-    // Build engine with streams for each exchange
+    // Build engine with streams and catalogs for each exchange
     let mut engine = Engine::new(strategies);
     engine = engine.with_exec_router(exec_router);
+
+    // Add all catalogs to engine for coordinated refresh
+    // All catalogs implement Refreshable, so they can be passed as SharedRefreshable
+    if let Some(catalog) = &catalogs.polymarket {
+        engine = engine.with_catalog(Exchange::Polymarket, catalog.clone() as SharedRefreshable);
+    }
+    if let Some(catalog) = &catalogs.deribit {
+        engine = engine.with_catalog(Exchange::Deribit, catalog.clone() as SharedRefreshable);
+    }
+    if let Some(catalog) = &catalogs.derive {
+        engine = engine.with_catalog(Exchange::Derive, catalog.clone() as SharedRefreshable);
+    }
 
     // Create streams for each required exchange
     for exchange in &required_exchanges {
@@ -301,13 +336,11 @@ async fn run_backtest_mode(args: &Args) {
     }
 
     // Build and run engine
-    // For backtest, we use a single stream
-    #[allow(deprecated)]
-    {
-        use trading_bot::engine::MarketRouter;
-    let router = MarketRouter::new(stream, strategies);
-    router.run().await;
-}
+    // For backtest, we use a single stream registered for all exchanges
+    let engine = Engine::new(strategies)
+        .with_stream(Exchange::Deribit, Box::new(stream))
+        .with_exec_router(exec_router);
+    engine.run().await;
 
     println!("\nBacktest complete!");
 
@@ -434,7 +467,7 @@ async fn run_demo_mode(args: &Args) {
         MomentumStrategy::new(
             "Momentum-ETH",
             vec![Instrument::Deribit("ETH-29MAR24-4000-C".to_string())],
-            exec_router,
+            exec_router.clone(),
             3,
             0.01,
         ),
@@ -447,12 +480,10 @@ async fn run_demo_mode(args: &Args) {
 
     // Run with backtest stream
     let stream = backtest::BacktestStream::new(mock_data);
-    #[allow(deprecated)]
-    {
-        use trading_bot::engine::MarketRouter;
-        let router = MarketRouter::new(stream, strategies);
-        router.run().await;
-    }
+    let engine = Engine::new(strategies)
+        .with_stream(Exchange::Deribit, Box::new(stream))
+        .with_exec_router(exec_router);
+    engine.run().await;
 
     println!("\nDemo complete!");
 

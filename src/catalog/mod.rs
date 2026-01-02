@@ -83,18 +83,47 @@ pub enum CatalogFileEntry<T> {
 }
 
 // =============================================================================
-// Catalog Trait
+// Refreshable Trait (Engine Interface)
+// =============================================================================
+
+/// Minimal trait for catalog refresh - used by Engine.
+/// 
+/// This trait captures just the refresh behavior, allowing Engine
+/// to work with any catalog type without knowing about items or time-travel.
+/// All catalog implementations should implement this trait.
+/// 
+/// Uses `&self` with interior mutability (e.g., `RwLock`) to allow
+/// sharing via `Arc<dyn Refreshable>`.
+#[async_trait]
+pub trait Refreshable: Send + Sync {
+    /// Refresh the catalog from the exchange.
+    /// 
+    /// Returns the number of changes (added + removed + modified).
+    async fn refresh(&self) -> Result<usize, String>;
+    
+    /// Returns the Unix timestamp of the last refresh.
+    fn last_updated(&self) -> u64;
+}
+
+/// Shared refreshable catalog for use across Engine and strategies.
+pub type SharedRefreshable = Arc<dyn Refreshable>;
+
+// =============================================================================
+// Catalog Trait (Full Interface with Time-Travel)
 // =============================================================================
 
 /// Trait for catalogs that support historical time-travel.
 /// 
+/// Extends `Refreshable` with item-specific operations and diff tracking.
 /// Implementations store the current state plus a series of diffs,
 /// enabling reconstruction of the catalog state at any past timestamp.
 /// 
+/// Uses `&self` with interior mutability to allow sharing via `Arc`.
+/// 
 /// # Type Parameters
-/// * `Item` - The type of items stored in the catalog (e.g., `MarketInfo`)
+/// * `Item` - The type of items stored in the catalog (e.g., `DeribitInstrument`)
 #[async_trait]
-pub trait Catalog: Send + Sync {
+pub trait Catalog: Refreshable {
     /// The type of items stored in this catalog.
     type Item: Serialize + DeserializeOwned + Clone + Send + Sync;
 
@@ -113,14 +142,14 @@ pub trait Catalog: Send + Sync {
     /// * `timestamp` - Unix timestamp (seconds) to reconstruct state for
     fn as_of(&self, timestamp: u64) -> HashMap<String, Self::Item>;
 
-    /// Refreshes the catalog from the exchange and records any changes as a diff.
+    /// Refreshes the catalog and returns the diff of changes.
+    /// 
+    /// This is the rich version of refresh that returns detailed change information.
+    /// The `Refreshable::refresh` method delegates to this and returns just the count.
     /// 
     /// # Returns
     /// The diff containing all changes, or an error if refresh failed.
-    async fn refresh(&mut self) -> Result<CatalogDiff<Self::Item>, String>;
-
-    /// Returns the Unix timestamp of the last refresh.
-    fn last_updated(&self) -> u64;
+    async fn refresh_with_diff(&self) -> Result<CatalogDiff<Self::Item>, String>;
 
     /// Returns all historical diffs, newest first.
     /// Returns an owned Vec since the data is typically behind a lock.
@@ -302,8 +331,16 @@ pub struct SearchResult {
 
 /// Legacy trait for discovering markets on an exchange.
 /// 
-/// This trait is kept for backwards compatibility. New catalogs should
-/// implement the `Catalog` trait instead for time-travel support.
+/// DEPRECATED: This trait is superseded by `Refreshable` + `Catalog`.
+/// - Use `Refreshable` for Engine refresh coordination
+/// - Use `Catalog` for time-travel and item access
+/// - Use concrete types (e.g., `PolymarketCatalog`) for exchange-specific methods like search
+/// 
+/// This trait is kept for backwards compatibility during migration.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use Refreshable + Catalog traits instead. MarketCatalog will be removed in v1.0."
+)]
 #[async_trait]
 pub trait MarketCatalog: Send + Sync {
     /// Refresh the catalog from the exchange.

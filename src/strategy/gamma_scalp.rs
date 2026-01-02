@@ -185,12 +185,6 @@ impl Strategy for GammaScalp {
         self.instruments.clone()
     }
 
-    #[allow(deprecated)]
-    fn required_subscriptions(&self) -> Vec<String> {
-        // Legacy method for MarketRouter compatibility
-        self.instruments.iter().map(|i| i.symbol().to_string()).collect()
-    }
-
     async fn on_event(&self, event: MarketEvent) {
         let mut state = self.state.lock().await;
 

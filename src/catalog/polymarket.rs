@@ -6,8 +6,8 @@
 
 use super::{
     apply_diff, compute_diff, format_timestamp, invert_diff, AutoRefreshGuard, Catalog,
-    CatalogDiff, CatalogFileEntry, MarketCatalog, MarketInfo, SearchResult, TokenInfo,
-    DEFAULT_MARKET_STALE_THRESHOLD_SECS,
+    CatalogDiff, CatalogFileEntry, MarketCatalog, MarketInfo, Refreshable, SearchResult, 
+    TokenInfo, DEFAULT_MARKET_STALE_THRESHOLD_SECS,
 };
 use async_trait::async_trait;
 use log::{error, info, warn};
@@ -129,7 +129,7 @@ impl PolymarketCatalog {
         }
 
         // Check staleness and auto-refresh in background
-        // Note: We use MarketCatalog::refresh which works with &self via internal mutability
+        // Use Refreshable::refresh which works with &self via internal mutability
         // Use atomic flag to prevent multiple concurrent auto-refreshes
         if catalog.is_stale_internal(last_updated) {
             // Try to acquire the refresh lock - only one refresh can run at a time
@@ -142,9 +142,9 @@ impl PolymarketCatalog {
                 tokio::spawn(async move {
                     // Guard ensures flag is reset even if this task panics
                     let _guard = AutoRefreshGuard::new(&AUTO_REFRESH_IN_PROGRESS);
-                    match MarketCatalog::refresh(catalog_clone.as_ref()).await {
+                    match Refreshable::refresh(catalog_clone.as_ref()).await {
                         Ok(count) => info!(
-                            "PolymarketCatalog: Background refresh complete, {} markets",
+                            "PolymarketCatalog: Background refresh complete, {} changes",
                             count
                         ),
                         Err(e) => error!("PolymarketCatalog: Background refresh failed: {}", e),
@@ -372,7 +372,24 @@ impl PolymarketCatalog {
 }
 
 // =============================================================================
-// New Catalog Trait Implementation (with time-travel)
+// =============================================================================
+// Refreshable Trait Implementation (used by Engine)
+// =============================================================================
+
+#[async_trait]
+impl Refreshable for PolymarketCatalog {
+    async fn refresh(&self) -> Result<usize, String> {
+        let diff = self.refresh_with_diff().await?;
+        Ok(diff.change_count())
+    }
+
+    fn last_updated(&self) -> u64 {
+        self.inner.read().unwrap().last_updated
+    }
+}
+
+// =============================================================================
+// Catalog Trait Implementation (with time-travel)
 // =============================================================================
 
 #[async_trait]
@@ -409,7 +426,7 @@ impl Catalog for PolymarketCatalog {
         result
     }
 
-    async fn refresh(&mut self) -> Result<CatalogDiff<MarketInfo>, String> {
+    async fn refresh_with_diff(&self) -> Result<CatalogDiff<MarketInfo>, String> {
         let new_markets = self.fetch_all_markets().await?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -447,10 +464,6 @@ impl Catalog for PolymarketCatalog {
         }
 
         Ok(diff)
-    }
-
-    fn last_updated(&self) -> u64 {
-        self.inner.read().unwrap().last_updated
     }
 
     fn diffs(&self) -> Vec<CatalogDiff<MarketInfo>> {
