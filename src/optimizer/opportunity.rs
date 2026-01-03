@@ -113,11 +113,7 @@ impl Opportunity {
     /// - Rounds price to minimum_tick_size (if set)
     /// - Requires token_id to be set for Polymarket opportunities
     pub fn to_order(&self, quantity: f64) -> Result<Order, String> {
-        // Get token_id for Polymarket orders
-        let token_id = self.token_id.as_ref()
-            .ok_or_else(|| "No token_id set on opportunity".to_string())?;
-
-        // Validate minimum order size
+        // Validate minimum order size (Polymarket limit orders only)
         if let Some(min_size) = self.minimum_order_size {
             if quantity < min_size {
                 return Err(format!(
@@ -127,7 +123,7 @@ impl Opportunity {
             }
         }
 
-        // Round price to tick size
+        // Round price to tick size (Polymarket only)
         let price = if let Some(tick) = self.minimum_tick_size {
             if tick > 0.0 {
                 (self.market_price / tick).round() * tick
@@ -145,7 +141,11 @@ impl Opportunity {
         };
 
         let instrument = match self.exchange.as_str() {
-            "polymarket" => Instrument::Polymarket(token_id.clone()),
+            "polymarket" => {
+                let token_id = self.token_id.as_ref()
+                    .ok_or_else(|| "Polymarket opportunity requires token_id".to_string())?;
+                Instrument::Polymarket(token_id.clone())
+            }
             "derive" => Instrument::Derive(self.instrument_id.clone()),
             "deribit" => Instrument::Deribit(self.instrument_id.clone()),
             _ => return Err(format!("Unknown exchange: {}", self.exchange)),
