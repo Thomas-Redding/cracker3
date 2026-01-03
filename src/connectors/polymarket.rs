@@ -658,9 +658,13 @@ impl ExecutionClient for PolymarketExec {
         }
 
         // Validate order against market constraints (if catalog is available)
-        // For limit orders, use the order price; for market orders, we can't validate
-        // the $1 minimum without knowing the current market price
+        // For limit orders, use the order price for tick size validation.
+        // For market orders, we cannot validate the $1 minimum here because we don't
+        // have access to current market prices. The exchange will reject invalid orders.
         let estimated_price = order.price;
+        if order.order_type == crate::models::OrderType::Market && estimated_price.is_none() {
+            warn!("PolymarketExec: Cannot validate market order minimum ($1) without price estimate");
+        }
         self.validate_order(&order, estimated_price).await?;
 
         let signer = self.inner.signer.as_ref()

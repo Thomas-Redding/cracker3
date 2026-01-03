@@ -703,13 +703,16 @@ pub fn validate_polymarket_order(
     market: &MarketInfo,
     estimated_price: Option<f64>,
 ) -> Result<(), PolymarketOrderError> {
-    // Check minimum order size (applies to limit orders)
-    if let Some(min_size) = market.minimum_order_size() {
-        if order.quantity < min_size {
-            return Err(PolymarketOrderError::QuantityTooSmall {
-                quantity: order.quantity,
-                minimum: min_size,
-            });
+    // Check minimum order size (applies to limit orders only)
+    // Market orders have a $1 minimum value instead, checked below
+    if order.order_type == OrderType::Limit {
+        if let Some(min_size) = market.minimum_order_size() {
+            if order.quantity < min_size {
+                return Err(PolymarketOrderError::QuantityTooSmall {
+                    quantity: order.quantity,
+                    minimum: min_size,
+                });
+            }
         }
     }
 
@@ -733,6 +736,9 @@ pub fn validate_polymarket_order(
     }
 
     // Check market order minimum value ($1)
+    // Note: This requires an estimated_price to be provided by the caller.
+    // If estimated_price is None for market orders, this check is skipped
+    // and the exchange will reject invalid orders directly.
     if order.order_type == OrderType::Market {
         if let Some(price) = estimated_price {
             let estimated_value = order.quantity * price;
