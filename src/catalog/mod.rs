@@ -18,6 +18,9 @@ pub use deribit::{DeribitCatalog, DeribitInstrument};
 pub use derive::{DeriveCatalog, DeriveInstrument};
 pub use polymarket::PolymarketCatalog;
 
+// Polymarket order validation
+pub use polymarket::{validate_polymarket_order, PolymarketOrderError};
+
 // =============================================================================
 // Historical Diff Types
 // =============================================================================
@@ -319,6 +322,54 @@ impl MarketInfo {
     /// Get the "No" token if it exists.
     pub fn no_token(&self) -> Option<&TokenInfo> {
         self.token_by_outcome("No")
+    }
+
+    // =========================================================================
+    // Polymarket-specific accessors
+    // =========================================================================
+
+    /// Get the minimum order size for this market (Polymarket only).
+    /// 
+    /// This is the minimum number of shares a limit order can offer.
+    /// Typically 5 or 15 shares depending on the market.
+    /// 
+    /// Returns `None` if not a Polymarket market or field is not set.
+    pub fn minimum_order_size(&self) -> Option<f64> {
+        self.extra.get("minimum_order_size")?.as_f64()
+    }
+
+    /// Get the minimum tick size for this market (Polymarket only).
+    /// 
+    /// This is the minimum price increment for orders.
+    /// Typically 0.01 (1¢) or 0.001 (0.1¢) depending on the market.
+    /// 
+    /// Returns `None` if not a Polymarket market or field is not set.
+    pub fn minimum_tick_size(&self) -> Option<f64> {
+        self.extra.get("minimum_tick_size")?.as_f64()
+    }
+
+    /// Round a price to the valid tick size for this market.
+    /// 
+    /// For Polymarket, rounds to the market's minimum_tick_size.
+    /// Returns the original price if tick size is not available.
+    pub fn round_to_tick(&self, price: f64) -> f64 {
+        if let Some(tick) = self.minimum_tick_size() {
+            if tick > 0.0 {
+                return (price / tick).round() * tick;
+            }
+        }
+        price
+    }
+
+    /// Check if an order quantity meets the minimum order size requirement.
+    /// 
+    /// Returns `true` if valid, `false` if quantity is too small.
+    /// Always returns `true` if minimum_order_size is not set.
+    pub fn is_valid_order_size(&self, quantity: f64) -> bool {
+        if let Some(min_size) = self.minimum_order_size() {
+            return quantity >= min_size;
+        }
+        true
     }
 }
 

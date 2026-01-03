@@ -3,6 +3,7 @@
 // Opportunity identification for binary options, vanilla options, and spreads.
 // Scans markets for mispricings relative to the calibrated volatility surface.
 
+use crate::models::{Instrument, Order, OrderSide};
 use crate::pricing::{BlackScholes, OptionType, PriceDistribution, VolatilitySurface, VolTimeStrategy};
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +74,10 @@ pub struct Opportunity {
     pub model_iv: Option<f64>,
     /// Token ID for order execution
     pub token_id: Option<String>,
+    /// Minimum order size in shares (Polymarket constraint)
+    pub minimum_order_size: Option<f64>,
+    /// Minimum tick size for prices (Polymarket constraint)
+    pub minimum_tick_size: Option<f64>,
 }
 
 impl Opportunity {
@@ -92,6 +97,109 @@ impl Opportunity {
             TradeDirection::Buy => self.market_price,
             TradeDirection::Sell => self.max_loss,
         }
+    }
+
+    /// Validates and creates a limit order for this opportunity.
+    /// 
+    /// # Arguments
+    /// * `quantity` - Number of shares to trade
+    /// 
+    /// # Returns
+    /// * `Ok(Order)` if valid
+    /// * `Err(String)` describing the validation failure
+    /// 
+    /// # Validation
+    /// - Checks quantity >= minimum_order_size (if set)
+    /// - Rounds price to minimum_tick_size (if set)
+    /// - Requires token_id to be set for Polymarket opportunities
+    pub fn to_order(&self, quantity: f64) -> Result<Order, String> {
+        // Get token_id for Polymarket orders
+        let token_id = self.token_id.as_ref()
+            .ok_or_else(|| "No token_id set on opportunity".to_string())?;
+
+        // Validate minimum order size
+        if let Some(min_size) = self.minimum_order_size {
+            if quantity < min_size {
+                return Err(format!(
+                    "Quantity {} is below minimum order size {} shares",
+                    quantity, min_size
+                ));
+            }
+        }
+
+        // Round price to tick size
+        let price = if let Some(tick) = self.minimum_tick_size {
+            if tick > 0.0 {
+                (self.market_price / tick).round() * tick
+            } else {
+                self.market_price
+            }
+        } else {
+            self.market_price
+        };
+
+        // Create order
+        let side = match self.direction {
+            TradeDirection::Buy => OrderSide::Buy,
+            TradeDirection::Sell => OrderSide::Sell,
+        };
+
+        let instrument = match self.exchange.as_str() {
+            "polymarket" => Instrument::Polymarket(token_id.clone()),
+            "derive" => Instrument::Derive(self.instrument_id.clone()),
+            "deribit" => Instrument::Deribit(self.instrument_id.clone()),
+            _ => return Err(format!("Unknown exchange: {}", self.exchange)),
+        };
+
+        Ok(Order::limit(instrument, side, quantity, price))
+    }
+
+    /// Validates order parameters without creating an order.
+    /// 
+    /// Returns `Ok(())` if the order would be valid, or an error describing
+    /// what's wrong.
+    pub fn validate_order(&self, quantity: f64, price: Option<f64>) -> Result<(), String> {
+        // Check minimum order size
+        if let Some(min_size) = self.minimum_order_size {
+            if quantity < min_size {
+                return Err(format!(
+                    "Quantity {} is below minimum order size {} shares",
+                    quantity, min_size
+                ));
+            }
+        }
+
+        // Check tick alignment if price provided
+        if let (Some(price), Some(tick)) = (price, self.minimum_tick_size) {
+            if tick > 0.0 {
+                let ticks = price / tick;
+                let rounded = ticks.round();
+                if (ticks - rounded).abs() > 1e-9 {
+                    let nearest = rounded * tick;
+                    return Err(format!(
+                        "Price {} is not aligned to tick size {} (nearest valid: {})",
+                        price, tick, nearest
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns the minimum order size, or a default if not set.
+    pub fn min_order_size(&self) -> f64 {
+        self.minimum_order_size.unwrap_or(1.0)
+    }
+
+    /// Rounds a price to the valid tick size for this opportunity.
+    pub fn round_to_tick(&self, price: f64) -> f64 {
+        if let Some(tick) = self.minimum_tick_size {
+            if tick > 0.0 {
+                return (price / tick).round() * tick;
+            }
+        }
+        price
     }
 }
 
@@ -154,6 +262,8 @@ impl OpportunityScanner {
     /// * `yes_token_id` - Token ID for YES
     /// * `no_token_id` - Token ID for NO
     /// * `vol_time_strategy` - Optional vol-time strategy for interpolation. If None, uses calendar time.
+    /// * `minimum_order_size` - Optional minimum shares for limit orders (Polymarket constraint)
+    /// * `minimum_tick_size` - Optional minimum price increment (Polymarket constraint)
     pub fn scan_binary_option(
         &self,
         market_id: &str,
@@ -169,6 +279,8 @@ impl OpportunityScanner {
         yes_token_id: Option<&str>,
         no_token_id: Option<&str>,
         vol_time_strategy: Option<&dyn VolTimeStrategy>,
+        minimum_order_size: Option<f64>,
+        minimum_tick_size: Option<f64>,
     ) -> Vec<Opportunity> {
         let mut opportunities = Vec::new();
 
@@ -215,6 +327,8 @@ impl OpportunityScanner {
                     model_probability: Some(model_prob),
                     model_iv: None,
                     token_id: yes_token_id.map(|s| s.to_string()),
+                    minimum_order_size,
+                    minimum_tick_size,
                 });
             }
         }
@@ -246,6 +360,8 @@ impl OpportunityScanner {
                     model_probability: Some(model_prob_no),
                     model_iv: None,
                     token_id: no_token_id.map(|s| s.to_string()),
+                    minimum_order_size,
+                    minimum_tick_size,
                 });
             }
         }
@@ -329,6 +445,8 @@ impl OpportunityScanner {
                     model_probability: None,
                     model_iv: Some(model_iv),
                     token_id: None,
+                    minimum_order_size: None, // Derive has different constraints
+                    minimum_tick_size: None,
                 });
             }
         }
@@ -359,6 +477,8 @@ impl OpportunityScanner {
                     model_probability: None,
                     model_iv: Some(model_iv),
                     token_id: None,
+                    minimum_order_size: None,
+                    minimum_tick_size: None,
                 });
             }
         }
@@ -459,6 +579,8 @@ impl OpportunityScanner {
             model_probability: None,
             model_iv: Some((short_iv + long_iv) / 2.0),
             token_id: None,
+            minimum_order_size: None,
+            minimum_tick_size: None,
         })
     }
 }
@@ -506,6 +628,8 @@ mod tests {
             Some("yes_token"),
             Some("no_token"),
             None, // Use calendar time in tests
+            Some(15.0), // minimum_order_size
+            Some(0.01), // minimum_tick_size
         );
 
         assert!(!opps.is_empty());
@@ -576,6 +700,8 @@ mod tests {
             Some("yes_token"),
             Some("no_token"),
             None, // Use calendar time in tests
+            Some(15.0),
+            Some(0.01),
         );
 
         // Should find no opportunities since edge < min_edge (10%)
@@ -606,6 +732,8 @@ mod tests {
             Some("yes_token"),
             Some("no_token"),
             None, // Use calendar time in tests
+            Some(15.0),
+            Some(0.01),
         );
 
         assert!(opps.is_empty());
@@ -632,6 +760,8 @@ mod tests {
             Some("yes_token"),
             Some("no_token"),
             None, // Use calendar time in tests
+            Some(15.0),
+            Some(0.01),
         );
 
         assert!(opps.is_empty());
@@ -659,6 +789,8 @@ mod tests {
             Some("yes_token"),
             Some("no_token"),
             None, // Use calendar time in tests
+            Some(15.0),
+            Some(0.01),
         );
 
         assert!(opps.is_empty());
@@ -765,6 +897,8 @@ mod tests {
             model_probability: Some(0.50),
             model_iv: None,
             token_id: Some("token".to_string()),
+            minimum_order_size: Some(15.0),
+            minimum_tick_size: Some(0.01),
         };
 
         // Edge formula: (fair - market) / market
@@ -815,6 +949,8 @@ mod tests {
             Some("yes_token"),
             Some("no_token"),
             None, // Use calendar time in tests
+            Some(15.0),
+            Some(0.01),
         );
 
         // Should find opportunity on NO side

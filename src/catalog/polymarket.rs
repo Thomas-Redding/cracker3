@@ -40,6 +40,10 @@ struct PolymarketApiMarket {
     end_date_iso: Option<String>,
     active: Option<bool>,
     closed: Option<bool>,
+    /// Minimum shares for limit orders (typically 5 or 15)
+    minimum_order_size: Option<f64>,
+    /// Minimum price increment (typically 0.01 or 0.001)
+    minimum_tick_size: Option<f64>,
     // Capture everything else
     #[serde(flatten)]
     extra: serde_json::Value,
@@ -286,6 +290,8 @@ impl PolymarketCatalog {
                 "end_date_iso": api_market.end_date_iso,
                 "active": api_market.active,
                 "closed": api_market.closed,
+                "minimum_order_size": api_market.minimum_order_size,
+                "minimum_tick_size": api_market.minimum_tick_size,
             }),
         }
     }
@@ -615,6 +621,133 @@ impl MarketCatalog for PolymarketCatalog {
     }
 }
 
+// =============================================================================
+// Order Validation
+// =============================================================================
+
+use crate::models::{Order, OrderType};
+
+/// Errors that can occur when validating a Polymarket order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PolymarketOrderError {
+    /// Order quantity is below the market's minimum_order_size
+    QuantityTooSmall {
+        quantity: f64,
+        minimum: f64,
+    },
+    /// Order price is not aligned to the market's minimum_tick_size
+    InvalidTickSize {
+        price: f64,
+        tick_size: f64,
+        nearest_valid: f64,
+    },
+    /// Market order value is below the $1 minimum
+    MarketOrderTooSmall {
+        estimated_value: f64,
+        minimum: f64,
+    },
+}
+
+impl std::fmt::Display for PolymarketOrderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QuantityTooSmall { quantity, minimum } => {
+                write!(f, "Order quantity {} is below minimum {} shares", quantity, minimum)
+            }
+            Self::InvalidTickSize { price, tick_size, nearest_valid } => {
+                write!(f, "Price {} is not aligned to tick size {} (nearest: {})", 
+                       price, tick_size, nearest_valid)
+            }
+            Self::MarketOrderTooSmall { estimated_value, minimum } => {
+                write!(f, "Market order value ${:.2} is below minimum ${:.2}", 
+                       estimated_value, minimum)
+            }
+        }
+    }
+}
+
+impl std::error::Error for PolymarketOrderError {}
+
+/// Minimum value for market orders on Polymarket (in USDC).
+pub const POLYMARKET_MIN_MARKET_ORDER_VALUE: f64 = 1.0;
+
+/// Validate a Polymarket order against market constraints.
+/// 
+/// # Arguments
+/// * `order` - The order to validate
+/// * `market` - The market info containing constraints (minimum_order_size, minimum_tick_size)
+/// * `estimated_price` - For market orders, the estimated execution price (e.g., best bid/ask)
+/// 
+/// # Returns
+/// * `Ok(())` if the order is valid
+/// * `Err(PolymarketOrderError)` describing the validation failure
+/// 
+/// # Example
+/// ```ignore
+/// use trading_bot::catalog::{validate_polymarket_order, MarketInfo};
+/// use trading_bot::models::{Order, Instrument, OrderSide};
+/// 
+/// let market = catalog.get("condition_id").unwrap();
+/// let order = Order::limit(
+///     Instrument::polymarket("token_id"),
+///     OrderSide::Buy,
+///     15.0,  // quantity
+///     0.55,  // price
+/// );
+/// 
+/// // For limit orders, estimated_price can be None or the limit price
+/// validate_polymarket_order(&order, &market, Some(0.55))?;
+/// ```
+pub fn validate_polymarket_order(
+    order: &Order,
+    market: &MarketInfo,
+    estimated_price: Option<f64>,
+) -> Result<(), PolymarketOrderError> {
+    // Check minimum order size (applies to limit orders)
+    if let Some(min_size) = market.minimum_order_size() {
+        if order.quantity < min_size {
+            return Err(PolymarketOrderError::QuantityTooSmall {
+                quantity: order.quantity,
+                minimum: min_size,
+            });
+        }
+    }
+
+    // Check tick size alignment for limit orders
+    if order.order_type == OrderType::Limit {
+        if let (Some(price), Some(tick_size)) = (order.price, market.minimum_tick_size()) {
+            if tick_size > 0.0 {
+                let ticks = price / tick_size;
+                let rounded = ticks.round();
+                // Allow for floating point tolerance
+                if (ticks - rounded).abs() > 1e-9 {
+                    let nearest_valid = rounded * tick_size;
+                    return Err(PolymarketOrderError::InvalidTickSize {
+                        price,
+                        tick_size,
+                        nearest_valid,
+                    });
+                }
+            }
+        }
+    }
+
+    // Check market order minimum value ($1)
+    if order.order_type == OrderType::Market {
+        if let Some(price) = estimated_price {
+            let estimated_value = order.quantity * price;
+            if estimated_value < POLYMARKET_MIN_MARKET_ORDER_VALUE {
+                return Err(PolymarketOrderError::MarketOrderTooSmall {
+                    estimated_value,
+                    minimum: POLYMARKET_MIN_MARKET_ORDER_VALUE,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,5 +791,149 @@ mod tests {
         let result = catalog.as_of(500);
         assert_eq!(result.len(), 1);
         assert!(result.contains_key("a"));
+    }
+
+    // =========================================================================
+    // Order Validation Tests
+    // =========================================================================
+
+    use crate::models::{Instrument, OrderSide};
+
+    fn make_test_market(min_order_size: Option<f64>, min_tick_size: Option<f64>) -> MarketInfo {
+        MarketInfo {
+            id: "test-condition".to_string(),
+            slug: Some("test-market".to_string()),
+            question: Some("Test?".to_string()),
+            description: None,
+            tags: None,
+            tokens: vec![
+                TokenInfo { token_id: "token-yes".to_string(), outcome: Some("Yes".to_string()) },
+                TokenInfo { token_id: "token-no".to_string(), outcome: Some("No".to_string()) },
+            ],
+            extra: serde_json::json!({
+                "minimum_order_size": min_order_size,
+                "minimum_tick_size": min_tick_size,
+            }),
+        }
+    }
+
+    #[test]
+    fn test_validate_order_quantity_valid() {
+        let market = make_test_market(Some(15.0), Some(0.01));
+        let order = Order::limit(
+            Instrument::polymarket("token-yes"),
+            OrderSide::Buy,
+            20.0,  // Above minimum
+            0.55,
+        );
+        
+        assert!(validate_polymarket_order(&order, &market, None).is_ok());
+    }
+
+    #[test]
+    fn test_validate_order_quantity_too_small() {
+        let market = make_test_market(Some(15.0), Some(0.01));
+        let order = Order::limit(
+            Instrument::polymarket("token-yes"),
+            OrderSide::Buy,
+            10.0,  // Below minimum of 15
+            0.55,
+        );
+        
+        let result = validate_polymarket_order(&order, &market, None);
+        assert!(matches!(
+            result,
+            Err(PolymarketOrderError::QuantityTooSmall { quantity: 10.0, minimum: 15.0 })
+        ));
+    }
+
+    #[test]
+    fn test_validate_order_tick_size_valid() {
+        let market = make_test_market(Some(5.0), Some(0.01));
+        let order = Order::limit(
+            Instrument::polymarket("token-yes"),
+            OrderSide::Buy,
+            10.0,
+            0.55,  // Valid: 55 ticks of 0.01
+        );
+        
+        assert!(validate_polymarket_order(&order, &market, None).is_ok());
+    }
+
+    #[test]
+    fn test_validate_order_tick_size_invalid() {
+        let market = make_test_market(Some(5.0), Some(0.01));
+        let order = Order::limit(
+            Instrument::polymarket("token-yes"),
+            OrderSide::Buy,
+            10.0,
+            0.555,  // Invalid: not aligned to 0.01
+        );
+        
+        let result = validate_polymarket_order(&order, &market, None);
+        assert!(matches!(
+            result,
+            Err(PolymarketOrderError::InvalidTickSize { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_market_order_value_valid() {
+        let market = make_test_market(None, None);
+        let order = Order::market(
+            Instrument::polymarket("token-yes"),
+            OrderSide::Buy,
+            10.0,  // 10 shares
+        );
+        
+        // At 0.50 price: 10 * 0.50 = $5.00 (above $1 minimum)
+        assert!(validate_polymarket_order(&order, &market, Some(0.50)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_market_order_value_too_small() {
+        let market = make_test_market(None, None);
+        let order = Order::market(
+            Instrument::polymarket("token-yes"),
+            OrderSide::Buy,
+            1.0,  // 1 share
+        );
+        
+        // At 0.50 price: 1 * 0.50 = $0.50 (below $1 minimum)
+        let result = validate_polymarket_order(&order, &market, Some(0.50));
+        assert!(matches!(
+            result,
+            Err(PolymarketOrderError::MarketOrderTooSmall { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_order_no_constraints() {
+        // When market has no constraints set, validation should pass
+        let market = make_test_market(None, None);
+        let order = Order::limit(
+            Instrument::polymarket("token-yes"),
+            OrderSide::Buy,
+            1.0,
+            0.555,
+        );
+        
+        assert!(validate_polymarket_order(&order, &market, None).is_ok());
+    }
+
+    #[test]
+    fn test_market_info_accessors() {
+        let market = make_test_market(Some(15.0), Some(0.01));
+        
+        assert_eq!(market.minimum_order_size(), Some(15.0));
+        assert_eq!(market.minimum_tick_size(), Some(0.01));
+        assert!(market.is_valid_order_size(15.0));
+        assert!(market.is_valid_order_size(20.0));
+        assert!(!market.is_valid_order_size(10.0));
+        
+        // Test round_to_tick
+        assert!((market.round_to_tick(0.555) - 0.56).abs() < 1e-9);
+        assert!((market.round_to_tick(0.554) - 0.55).abs() < 1e-9);
+        assert!((market.round_to_tick(0.50) - 0.50).abs() < 1e-9);
     }
 }

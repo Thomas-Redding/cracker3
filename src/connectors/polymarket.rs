@@ -1,5 +1,6 @@
 // src/connectors/polymarket.rs
 
+use crate::catalog::{validate_polymarket_order, MarketCatalog, PolymarketCatalog};
 use crate::models::{Instrument, MarketEvent, Order, OrderId};
 use crate::traits::{ExecutionClient, MarketStream, SharedExecutionClient};
 use async_trait::async_trait;
@@ -10,7 +11,7 @@ use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
@@ -499,6 +500,9 @@ struct PolymarketExecInner {
     signer: Option<PrivateKeySigner>,
     /// Whether trading is enabled
     trading_enabled: bool,
+    /// Optional catalog for order validation (validates constraints if set)
+    /// Uses RwLock to allow setting after construction
+    catalog: RwLock<Option<Arc<PolymarketCatalog>>>,
 }
 
 impl PolymarketExec {
@@ -521,6 +525,7 @@ impl PolymarketExec {
                     client: None,
                     signer: None,
                     trading_enabled: false,
+                    catalog: RwLock::new(None),
                 }),
             };
         }
@@ -535,6 +540,7 @@ impl PolymarketExec {
                         client: None,
                         signer: None,
                         trading_enabled: false,
+                        catalog: RwLock::new(None),
                     }),
                 };
             }
@@ -551,6 +557,7 @@ impl PolymarketExec {
                         client: None,
                         signer: None,
                         trading_enabled: false,
+                        catalog: RwLock::new(None),
                     }),
                 };
             }
@@ -570,6 +577,7 @@ impl PolymarketExec {
                         client: None,
                         signer: None,
                         trading_enabled: false,
+                        catalog: RwLock::new(None),
                     }),
                 };
             }
@@ -582,6 +590,7 @@ impl PolymarketExec {
                 client: Some(authenticated_client),
                 signer: Some(signer),
                 trading_enabled: true,
+                catalog: RwLock::new(None),
             }),
         }
     }
@@ -595,6 +604,49 @@ impl PolymarketExec {
     pub fn is_trading_enabled(&self) -> bool {
         self.inner.trading_enabled
     }
+
+    /// Sets the catalog for order validation.
+    /// 
+    /// When a catalog is set, `place_order` will validate orders against
+    /// market constraints (minimum_order_size, minimum_tick_size) before
+    /// submitting them to the exchange.
+    /// 
+    /// This should be called after the catalog is initialized, typically
+    /// during application startup.
+    pub async fn set_catalog(&self, catalog: Arc<PolymarketCatalog>) {
+        let mut guard = self.inner.catalog.write().await;
+        *guard = Some(catalog);
+        info!("PolymarketExec: Catalog set for order validation");
+    }
+
+    /// Validates an order against market constraints.
+    /// 
+    /// Returns Ok(()) if valid, or an error message if invalid.
+    /// If no catalog is set, logs a warning and returns Ok.
+    async fn validate_order(&self, order: &Order, estimated_price: Option<f64>) -> Result<(), String> {
+        let catalog_guard = self.inner.catalog.read().await;
+        let catalog = match catalog_guard.as_ref() {
+            Some(c) => c,
+            None => {
+                warn!("PolymarketExec: No catalog set, skipping order validation");
+                return Ok(());
+            }
+        };
+
+        // Extract token_id from instrument
+        let token_id = match &order.instrument {
+            Instrument::Polymarket(id) => id,
+            _ => return Err(format!("Invalid instrument for Polymarket: {:?}", order.instrument)),
+        };
+
+        // Look up market by token_id
+        let market = catalog.find_by_token_id(token_id)
+            .ok_or_else(|| format!("Market not found for token_id: {}", token_id))?;
+
+        // Validate using the catalog validation function
+        validate_polymarket_order(order, &market, estimated_price)
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[async_trait]
@@ -604,6 +656,12 @@ impl ExecutionClient for PolymarketExec {
         if !self.inner.trading_enabled {
             return Err("Trading disabled: no private key configured".to_string());
         }
+
+        // Validate order against market constraints (if catalog is available)
+        // For limit orders, use the order price; for market orders, we can't validate
+        // the $1 minimum without knowing the current market price
+        let estimated_price = order.price;
+        self.validate_order(&order, estimated_price).await?;
 
         let signer = self.inner.signer.as_ref()
             .ok_or_else(|| "Signer not available".to_string())?;
