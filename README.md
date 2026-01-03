@@ -179,6 +179,7 @@ Unit tests cover:
 * **Multi-Exchange:** Run strategies across Deribit, Derive, and Polymarket simultaneously.
 * **Typed Instruments:** `Instrument::Deribit("BTC-29MAR24-60000-C")` prevents exchange mix-ups.
 * **Execution Router:** Place orders on any exchange via `ExecutionRouter::place_order()`.
+* **Polymarket SDK:** Native order placement via [rs-clob-client](https://github.com/Polymarket/rs-clob-client).
 * **Historical Catalogs:** Time-travel support with `as_of(timestamp)` for backtests.
 * **TOML Config:** Define strategies in config files, not code.
 * **Dynamic Subscriptions:** Engine-coordinated catalog refresh + `discover_subscriptions()` for live market discovery.
@@ -464,14 +465,9 @@ Options:
 
 ## TODOs
 
-* P1: ~~Implement cross-market BTC trading strategy.~~ ✅ DONE
-* P1: ~~Engine-coordinated catalog refresh for dynamic market discovery.~~ ✅ DONE
 * P1: Add execution logic to actually place trades on identified opportunities.
-* P2: ~~Unified Refreshable + Catalog trait hierarchy.~~ ✅ DONE
-* P2: ~~Remove deprecated `MarketRouter`, `EngineBuilder`, and `required_subscriptions()`.~~ ✅ DONE
 * P2: Allow dashboard to enable/disable strategies.
 * P3: Remove deprecated `MarketCatalog` trait and move methods to `PolymarketCatalog`.
-* P3: ~~Polymarket execution via official SDK.~~ ✅ DONE (uses [rs-clob-client](https://github.com/Polymarket/rs-clob-client))
 * P3: Implement real trading execution for Deribit and Derive.
 
 ## LLM Context Cheatsheet
