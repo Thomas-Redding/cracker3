@@ -568,6 +568,8 @@ mod tests {
             model_probability: Some(0.55),
             model_iv: None,
             token_id: None,
+            minimum_order_size: Some(15.0),
+            minimum_tick_size: Some(0.01),
         }
     }
 
@@ -716,6 +718,8 @@ mod tests {
             model_probability: Some(0.60),
             model_iv: None,
             token_id: Some("token".to_string()),
+            minimum_order_size: Some(15.0),
+            minimum_tick_size: Some(0.01),
         };
         
         let optimizer = KellyOptimizer::default();
@@ -760,6 +764,8 @@ mod tests {
             model_probability: None,
             model_iv: Some(0.50),
             token_id: None,
+            minimum_order_size: None,
+            minimum_tick_size: None,
         };
         
         let optimizer = KellyOptimizer::default();
@@ -805,6 +811,8 @@ mod tests {
             model_probability: None,
             model_iv: Some(0.50),
             token_id: None,
+            minimum_order_size: None,
+            minimum_tick_size: None,
         };
         
         let optimizer = KellyOptimizer::default();
@@ -856,6 +864,8 @@ mod tests {
             model_probability: None,
             model_iv: Some(0.50),
             token_id: None,
+            minimum_order_size: None,
+            minimum_tick_size: None,
         };
         // Vanilla option capital = premium (market price)
         assert!((opp.capital_required() - 4000.0).abs() < 1e-6);
@@ -937,6 +947,8 @@ mod tests {
             model_probability: Some(0.50),
             model_iv: None,
             token_id: None,
+            minimum_order_size: Some(15.0),
+            minimum_tick_size: Some(0.01),
         };
         
         let config = KellyConfig {

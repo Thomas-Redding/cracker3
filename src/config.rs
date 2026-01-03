@@ -173,6 +173,12 @@ pub struct PolymarketMarketConfig {
     pub expiry_timestamp: i64,
     pub yes_token: String,
     pub no_token: String,
+    /// Minimum shares for limit orders (typically 5 or 15)
+    #[serde(default)]
+    pub minimum_order_size: Option<f64>,
+    /// Minimum price increment (typically 0.01 or 0.001)
+    #[serde(default)]
+    pub minimum_tick_size: Option<f64>,
 }
 
 fn default_currency() -> String {
@@ -475,6 +481,8 @@ fn build_cross_market(
                         market.expiry_timestamp,
                         &market.yes_token,
                         &market.no_token,
+                        market.minimum_order_size,
+                        market.minimum_tick_size,
                     ).await;
                 }
             });

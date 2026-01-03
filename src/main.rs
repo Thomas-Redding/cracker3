@@ -111,6 +111,9 @@ async fn run_live_mode(args: &Args) {
     // API keys are optional for read-only mode (market data streaming)
     // They're only needed for actual trading
     let mut exec_clients: HashMap<Exchange, SharedExecutionClient> = HashMap::new();
+    
+    // Keep a reference to Polymarket exec for catalog injection later
+    let mut polymarket_exec: Option<polymarket::PolymarketExec> = None;
 
     for exchange in &required_exchanges {
         match exchange {
@@ -140,7 +143,10 @@ async fn run_live_mode(args: &Args) {
                         println!("Note: POLYMARKET_PRIVATE_KEY not set - trading disabled, read-only mode");
                         "read_only".to_string()
                     });
-                let client = polymarket::PolymarketExec::new(private_key).await.shared();
+                // Keep a reference to inject catalog later (shares inner Arc)
+                let exec = polymarket::PolymarketExec::new(private_key).await;
+                polymarket_exec = Some(exec.clone());
+                let client = exec.shared();
                 exec_clients.insert(Exchange::Polymarket, client);
             }
         }
@@ -156,6 +162,10 @@ async fn run_live_mode(args: &Args) {
     
     if required_exchanges.contains(&Exchange::Polymarket) {
         let catalog = PolymarketCatalog::new(None, None).await;
+        // Inject catalog into exec client for order validation
+        if let Some(ref exec) = polymarket_exec {
+            exec.set_catalog(catalog.clone()).await;
+        }
         catalogs.polymarket = Some(catalog);
         println!("Polymarket catalog initialized");
     }
@@ -396,6 +406,8 @@ async fn run_demo_mode(args: &Args) {
         expiry_ms,
         "demo_yes_token",
         "demo_no_token",
+        Some(15.0),  // typical minimum_order_size
+        Some(0.01),  // typical minimum_tick_size
     ).await;
 
     // Update with mock prices (underpriced YES = opportunity)

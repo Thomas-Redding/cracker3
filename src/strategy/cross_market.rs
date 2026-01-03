@@ -37,6 +37,8 @@ struct PolymarketDiscovery {
     expiry_ms: i64,
     yes_token: String,
     no_token: String,
+    minimum_order_size: Option<f64>,
+    minimum_tick_size: Option<f64>,
 }
 
 /// Stats for debugging opportunity scanning.
@@ -202,6 +204,10 @@ struct PolymarketMarket {
     yes_liquidity: f64,
     no_liquidity: f64,
     last_updated: i64,
+    /// Minimum shares for limit orders (Polymarket constraint)
+    minimum_order_size: Option<f64>,
+    /// Minimum price increment (Polymarket constraint)
+    minimum_tick_size: Option<f64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -341,6 +347,8 @@ impl CrossMarketStrategy {
                         market.expiry_ms,
                         &market.yes_token,
                         &market.no_token,
+                        market.minimum_order_size,
+                        market.minimum_tick_size,
                     ).await;
                 }
                 self.add_log("info", format!("Initialized {} Polymarket markets", count)).await;
@@ -504,13 +512,19 @@ impl CrossMarketStrategy {
                 // Get YES/NO tokens
                 let (yes_token, no_token) = Self::parse_tokens_from_market(&m)?;
                 
+                // Extract constraints before consuming the market
+                let minimum_order_size = m.minimum_order_size();
+                let minimum_tick_size = m.minimum_tick_size();
+                
                 Some(PolymarketDiscovery {
-                    condition_id: m.id,
+                    condition_id: m.id.clone(),
                     question: m.question.unwrap_or_default(),
                     strike,
                     expiry_ms,
                     yes_token,
                     no_token,
+                    minimum_order_size,
+                    minimum_tick_size,
                 })
             })
             .collect();
@@ -880,6 +894,8 @@ impl CrossMarketStrategy {
                 Some(&market.yes_token_id),
                 Some(&market.no_token_id),
                 vol_time_strategy, // Pass vol-time strategy for interpolation
+                market.minimum_order_size,
+                market.minimum_tick_size,
             );
             
             if !opps.is_empty() {
@@ -1099,6 +1115,8 @@ impl CrossMarketStrategy {
         expiry_timestamp: i64,
         yes_token_id: &str,
         no_token_id: &str,
+        minimum_order_size: Option<f64>,
+        minimum_tick_size: Option<f64>,
     ) {
         let mut state = self.state.write().await;
         state.polymarket_markets.insert(
@@ -1115,6 +1133,8 @@ impl CrossMarketStrategy {
                 yes_liquidity: 0.0,
                 no_liquidity: 0.0,
                 last_updated: 0,
+                minimum_order_size,
+                minimum_tick_size,
             },
         );
     }
@@ -1431,6 +1451,8 @@ impl Strategy for CrossMarketStrategy {
                             expiry_ms,
                             &yes_token,
                             &no_token,
+                            market.minimum_order_size(),
+                            market.minimum_tick_size(),
                         ).await;
 
                         instruments.push(Instrument::Polymarket(yes_token));
@@ -1637,6 +1659,8 @@ mod tests {
             1735689600000, // Dec 31, 2024
             "yes_token_123",
             "no_token_123",
+            Some(15.0),  // typical minimum_order_size
+            Some(0.01),  // typical minimum_tick_size
         ).await;
 
         strategy.update_polymarket_prices(
@@ -1906,6 +1930,8 @@ mod tests {
             chrono::Utc::now().timestamp_millis() + 86400000, // Tomorrow
             "yes_token",
             "no_token",
+            Some(15.0),
+            Some(0.01),
         ).await;
 
         strategy.update_polymarket_prices("test_condition", 0.50, 0.50, 100.0, 100.0).await;
@@ -1988,6 +2014,8 @@ mod tests {
             chrono::Utc::now().timestamp_millis() + 86400000,
             "yes_tok",
             "no_tok",
+            Some(15.0),
+            Some(0.01),
         ).await;
 
         let subs = strategy.discover_subscriptions().await;
@@ -2037,6 +2065,8 @@ mod tests {
                 chrono::Utc::now().timestamp_millis() + 86400000 * (i as i64 + 1),
                 &format!("yes_{}", i),
                 &format!("no_{}", i),
+                Some(15.0),
+                Some(0.01),
             ).await;
         }
 
