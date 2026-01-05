@@ -43,6 +43,17 @@ cargo run -- --mode backtest --file recordings/deribit_20251229.jsonl
 cargo run -- --mode backtest --file data.jsonl --realtime --speed 2.0
 ```
 
+### Raspberry Pi / Low-Memory Linux Builds
+
+On memory-constrained devices (e.g. Raspberry Pi), the build can fail during **linking** with an error like `ld terminated with signal 9 [Killed]` (OOM killer). Using `lld` significantly reduces peak link memory.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y lld clang
+
+RUSTFLAGS="-C link-arg=-fuse-ld=lld" CARGO_BUILD_JOBS=1 cargo build -j1
+```
+
 ### Environment Variables
 
 | Variable | Exchange | Required |
