@@ -39,3 +39,7 @@ tower-http = { version = "0.5", features = ["cors"] }
 polymarket-client-sdk = { git = "https://github.com/Polymarket/rs-clob-client" }
 alloy = { version = "1.2", default-features = false, features = ["signers", "signer-local"] }
 rust_decimal = "1.39"
+
+# Optimization
+argmin = "0.10"
+argmin-math = { version = "0.4", features = ["vec"] }

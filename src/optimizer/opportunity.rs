@@ -102,26 +102,19 @@ impl Opportunity {
     /// Validates and creates a limit order for this opportunity.
     /// 
     /// # Arguments
-    /// * `quantity` - Number of shares to trade
+    /// * `quantity` - Number of shares to trade (will be rounded up to minimum_order_size if needed)
     /// 
     /// # Returns
     /// * `Ok(Order)` if valid
     /// * `Err(String)` describing the validation failure
     /// 
     /// # Validation
-    /// - Checks quantity >= minimum_order_size (if set)
+    /// - Rounds quantity up to minimum_order_size (if set)
     /// - Rounds price to minimum_tick_size (if set)
     /// - Requires token_id to be set for Polymarket opportunities
     pub fn to_order(&self, quantity: f64) -> Result<Order, String> {
-        // Validate minimum order size (Polymarket limit orders only)
-        if let Some(min_size) = self.minimum_order_size {
-            if quantity < min_size {
-                return Err(format!(
-                    "Quantity {} is below minimum order size {} shares",
-                    quantity, min_size
-                ));
-            }
-        }
+        // Round quantity up to meet minimum order size (Polymarket limit orders only)
+        let rounded_quantity = self.round_quantity_to_minimum(quantity);
 
         // Round price to tick size (Polymarket only)
         let price = if let Some(tick) = self.minimum_tick_size {
@@ -151,7 +144,7 @@ impl Opportunity {
             _ => return Err(format!("Unknown exchange: {}", self.exchange)),
         };
 
-        Ok(Order::limit(instrument, side, quantity, price))
+        Ok(Order::limit(instrument, side, rounded_quantity, price))
     }
 
     /// Validates order parameters without creating an order.
@@ -200,6 +193,27 @@ impl Opportunity {
             }
         }
         price
+    }
+
+    /// Rounds a quantity up to meet the minimum order size requirement.
+    /// 
+    /// If the quantity is below the minimum order size, rounds up to the minimum.
+    /// If no minimum is set, returns the quantity unchanged.
+    /// 
+    /// # Examples
+    /// ```
+    /// // With minimum_order_size = 15.0:
+    /// // round_quantity_to_minimum(8.5) -> 15.0
+    /// // round_quantity_to_minimum(20.0) -> 20.0
+    /// // round_quantity_to_minimum(15.0) -> 15.0
+    /// ```
+    pub fn round_quantity_to_minimum(&self, quantity: f64) -> f64 {
+        if let Some(min_size) = self.minimum_order_size {
+            if quantity < min_size {
+                return min_size;
+            }
+        }
+        quantity
     }
 }
 
@@ -904,6 +918,116 @@ mod tests {
         // Edge formula: (fair - market) / market
         let expected_edge = (0.50 - 0.40) / 0.40;
         assert!((opp.edge - expected_edge).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_round_quantity_to_minimum() {
+        let opp = Opportunity {
+            id: "test".to_string(),
+            opportunity_type: OpportunityType::BinaryYes,
+            exchange: "polymarket".to_string(),
+            instrument_id: "test".to_string(),
+            description: "Test".to_string(),
+            strike: 100_000.0,
+            strike2: None,
+            expiry_timestamp: 0,
+            time_to_expiry: 0.25,
+            direction: TradeDirection::Buy,
+            market_price: 0.40,
+            fair_value: 0.50,
+            edge: 0.25,
+            max_profit: 0.60,
+            max_loss: 0.40,
+            liquidity: 100.0,
+            implied_probability: Some(0.40),
+            model_probability: Some(0.50),
+            model_iv: None,
+            token_id: Some("token".to_string()),
+            minimum_order_size: Some(15.0),
+            minimum_tick_size: Some(0.01),
+        };
+
+        // Quantity below minimum should be rounded up
+        assert_eq!(opp.round_quantity_to_minimum(8.5), 15.0);
+        assert_eq!(opp.round_quantity_to_minimum(14.9), 15.0);
+        
+        // Quantity at or above minimum should be unchanged
+        assert_eq!(opp.round_quantity_to_minimum(15.0), 15.0);
+        assert_eq!(opp.round_quantity_to_minimum(20.0), 20.0);
+        assert_eq!(opp.round_quantity_to_minimum(100.0), 100.0);
+    }
+
+    #[test]
+    fn test_round_quantity_no_minimum() {
+        let opp = Opportunity {
+            id: "test".to_string(),
+            opportunity_type: OpportunityType::VanillaCall,
+            exchange: "derive".to_string(),
+            instrument_id: "test".to_string(),
+            description: "Test".to_string(),
+            strike: 100_000.0,
+            strike2: None,
+            expiry_timestamp: 0,
+            time_to_expiry: 0.25,
+            direction: TradeDirection::Buy,
+            market_price: 4000.0,
+            fair_value: 5000.0,
+            edge: 0.25,
+            max_profit: f64::INFINITY,
+            max_loss: 4000.0,
+            liquidity: 10.0,
+            implied_probability: None,
+            model_probability: None,
+            model_iv: Some(0.50),
+            token_id: None,
+            minimum_order_size: None, // No minimum
+            minimum_tick_size: None,
+        };
+
+        // Without minimum, quantities should be unchanged
+        assert_eq!(opp.round_quantity_to_minimum(8.5), 8.5);
+        assert_eq!(opp.round_quantity_to_minimum(0.1), 0.1);
+        assert_eq!(opp.round_quantity_to_minimum(100.0), 100.0);
+    }
+
+    #[test]
+    fn test_to_order_rounds_quantity() {
+        let opp = Opportunity {
+            id: "test".to_string(),
+            opportunity_type: OpportunityType::BinaryYes,
+            exchange: "polymarket".to_string(),
+            instrument_id: "test".to_string(),
+            description: "Test".to_string(),
+            strike: 100_000.0,
+            strike2: None,
+            expiry_timestamp: 0,
+            time_to_expiry: 0.25,
+            direction: TradeDirection::Buy,
+            market_price: 0.40,
+            fair_value: 0.50,
+            edge: 0.25,
+            max_profit: 0.60,
+            max_loss: 0.40,
+            liquidity: 100.0,
+            implied_probability: Some(0.40),
+            model_probability: Some(0.50),
+            model_iv: None,
+            token_id: Some("token123".to_string()),
+            minimum_order_size: Some(15.0),
+            minimum_tick_size: Some(0.01),
+        };
+
+        // Quantity below minimum should be rounded up in the order
+        let order = opp.to_order(8.5).unwrap();
+        assert_eq!(order.quantity, 15.0);
+
+        // Quantity at minimum should be unchanged
+        let order = opp.to_order(15.0).unwrap();
+        assert_eq!(order.quantity, 15.0);
+
+        // Quantity above minimum should be unchanged
+        let order = opp.to_order(20.0).unwrap();
+        assert_eq!(order.quantity, 20.0);
     }
 
     #[test]
