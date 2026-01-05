@@ -195,21 +195,23 @@ impl Opportunity {
         price
     }
 
-    /// Rounds a quantity up to meet the minimum order size requirement.
+    /// Rounds a positive quantity up to meet the minimum order size requirement.
     /// 
-    /// If the quantity is below the minimum order size, rounds up to the minimum.
+    /// If the quantity is positive but below the minimum order size, rounds up to the minimum.
+    /// Zero quantities are preserved (they represent "no order").
     /// If no minimum is set, returns the quantity unchanged.
     /// 
     /// # Examples
     /// ```
     /// // With minimum_order_size = 15.0:
+    /// // round_quantity_to_minimum(0.0) -> 0.0 (no order)
     /// // round_quantity_to_minimum(8.5) -> 15.0
     /// // round_quantity_to_minimum(20.0) -> 20.0
     /// // round_quantity_to_minimum(15.0) -> 15.0
     /// ```
     pub fn round_quantity_to_minimum(&self, quantity: f64) -> f64 {
         if let Some(min_size) = self.minimum_order_size {
-            if quantity < min_size {
+            if quantity > 0.0 && quantity < min_size {
                 return min_size;
             }
         }
@@ -947,7 +949,10 @@ mod tests {
             minimum_tick_size: Some(0.01),
         };
 
-        // Quantity below minimum should be rounded up
+        // Zero quantity should stay zero (represents "no order")
+        assert_eq!(opp.round_quantity_to_minimum(0.0), 0.0);
+        
+        // Positive quantity below minimum should be rounded up
         assert_eq!(opp.round_quantity_to_minimum(8.5), 15.0);
         assert_eq!(opp.round_quantity_to_minimum(14.9), 15.0);
         
@@ -1017,7 +1022,11 @@ mod tests {
             minimum_tick_size: Some(0.01),
         };
 
-        // Quantity below minimum should be rounded up in the order
+        // Zero quantity should stay zero (not round up to minimum!)
+        let order = opp.to_order(0.0).unwrap();
+        assert_eq!(order.quantity, 0.0, "Zero quantity must not round up to minimum");
+
+        // Positive quantity below minimum should be rounded up
         let order = opp.to_order(8.5).unwrap();
         assert_eq!(order.quantity, 15.0);
 
