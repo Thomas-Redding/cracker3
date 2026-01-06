@@ -54,6 +54,19 @@ sudo apt-get install -y lld clang
 RUSTFLAGS="-C link-arg=-fuse-ld=lld" CARGO_BUILD_JOBS=1 cargo build -j1
 ```
 
+To run with the same settings (equivalent of `cargo run -- --config config.toml --dashboard 8080`):
+
+```bash
+RUSTFLAGS="-C link-arg=-fuse-ld=lld" CARGO_BUILD_JOBS=1 cargo run -- --config config.toml --dashboard 8080
+```
+
+If you don’t want to type the flags each time:
+
+```bash
+export RUSTFLAGS="-C link-arg=-fuse-ld=lld"
+export CARGO_BUILD_JOBS=1
+```
+
 ### Environment Variables
 
 | Variable | Exchange | Required |
