@@ -67,6 +67,14 @@ export RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 export CARGO_BUILD_JOBS=1
 ```
 
+### VPN Installation on Rasperry Pi
+
+`expressvpn_canada_toronto_2.ovpn` was downloaded from [here](https://portal.expressvpn.com/setup#manual), per [these directions](https://www.expressvpn.com/support/vpn-setup/manual-config-for-linux-with-openvpn/).
+
+```
+sudo apt install openvpn resolvconf
+```
+
 ### Environment Variables
 
 | Variable | Exchange | Required |
