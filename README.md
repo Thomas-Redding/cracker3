@@ -76,7 +76,7 @@ sudo apt install openvpn resolvconf
 
 ```
 # Run
-sudo openvpn --config expressvpn_canada_toronto_2.ovpn --script-security 2 --up /etc/openvpn/update-resolv-conf --down /etc/openvpn/update-resolv-conf
+sudo openvpn --config expressvpn_canada_toronto_2.ovpn --auth-user-pass pass.txt --script-security 2 --up /etc/openvpn/update-resolv-conf --down /etc/openvpn/update-resolv-conf
 ```
 
 NB: `expressvpn_canada_toronto_2.ovpn` was downloaded from [here](https://portal.expressvpn.com/setup#manual), per [these directions](https://www.expressvpn.com/support/vpn-setup/manual-config-for-linux-with-openvpn/). The username and password are from [here](https://portal.expressvpn.com/setup#manual).
