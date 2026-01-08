@@ -67,6 +67,36 @@ export RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 export CARGO_BUILD_JOBS=1
 ```
 
+### Transferring Cache Files to Remote Machines
+
+The Polymarket catalog cache (`cache/polymarket_markets.jsonl`) can be quite large (700MB+) and contains thousands of markets. On a Raspberry Pi or other remote machine with slow network, you may want to transfer the cache from your development machine rather than waiting for it to download:
+
+```bash
+# From your development machine, compress and transfer the cache
+cd ~/proj/cracker3
+tar -czf polymarket_cache.tar.gz cache/
+
+# Transfer to Raspberry Pi
+scp polymarket_cache.tar.gz pi@raspberrypi:~/cracker3/
+
+# On the Raspberry Pi, extract the cache
+cd ~/cracker3
+tar -xzf polymarket_cache.tar.gz
+rm polymarket_cache.tar.gz
+```
+
+The catalog will automatically refresh in the background if the cache is older than the stale threshold (default: 24 hours).
+
+**Why no Polymarket instruments?** If you see "No instruments for Polymarket, skipping stream", the most common causes are:
+
+1. **Cache file doesn't exist** - Transfer the cache as shown above, or wait for the initial fetch (may take 5-10 minutes)
+2. **Pattern doesn't match any markets** - Check that `polymarket_pattern` in `config.toml` matches real market slugs. You can list markets with:
+   ```bash
+   # View markets matching your pattern
+   head -1 cache/polymarket_markets.jsonl | jq '.items[] | select(.slug | test("bitcoin-above")) | {slug, question, end_date_iso}'
+   ```
+3. **All matching markets have expired** - Update the pattern or wait for new markets to be created
+
 ### VPN on Rasperry Pi
 
 ```
@@ -510,6 +540,7 @@ Options:
 * P2: Allow dashboard to enable/disable strategies.
 * P3: Remove deprecated `MarketCatalog` trait and move methods to `PolymarketCatalog`.
 * P3: Implement real trading execution for Deribit and Derive.
+* P3: Modify `main.rs` to always create streams for required exchanges, even with empty initial instruments. Currently, if a catalog is empty at startup, no stream is created and the Engine can never subscribe later. The current workaround is blocking refresh for empty caches in `PolymarketCatalog::new()`.
 
 ## LLM Context Cheatsheet
 

@@ -103,7 +103,8 @@ pub struct PolymarketCatalog {
 impl PolymarketCatalog {
     /// Create a new catalog, loading from cache if available.
     /// 
-    /// If the cache is stale, spawns a background refresh task.
+    /// If the cache is empty, performs a blocking refresh to fetch markets.
+    /// If the cache exists but is stale, spawns a background refresh task.
     pub async fn new(
         cache_path: Option<&str>,
         stale_threshold_secs: Option<u64>,
@@ -115,6 +116,7 @@ impl PolymarketCatalog {
         let loaded_count = state.markets.len();
         let last_updated = state.last_updated;
         let diff_count = state.diffs.len();
+        let cache_was_empty = loaded_count == 0;
         
         let catalog = Arc::new(Self {
             inner: RwLock::new(state),
@@ -132,28 +134,41 @@ impl PolymarketCatalog {
             );
         }
 
-        // Check staleness and auto-refresh in background
-        // Use Refreshable::refresh which works with &self via internal mutability
-        // Use atomic flag to prevent multiple concurrent auto-refreshes
+        // If cache was empty, do a blocking refresh so discover_subscriptions has data
+        // If cache exists but is stale, refresh in background to avoid blocking startup
         if catalog.is_stale_internal(last_updated) {
             // Try to acquire the refresh lock - only one refresh can run at a time
             if AUTO_REFRESH_IN_PROGRESS
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                info!("PolymarketCatalog: Cache is stale, spawning background refresh...");
-                let catalog_clone = catalog.clone();
-                tokio::spawn(async move {
-                    // Guard ensures flag is reset even if this task panics
+                if cache_was_empty {
+                    // No cache - must refresh synchronously or strategies won't find any markets
+                    info!("PolymarketCatalog: No cache found, fetching markets...");
                     let _guard = AutoRefreshGuard::new(&AUTO_REFRESH_IN_PROGRESS);
-                    match Refreshable::refresh(catalog_clone.as_ref()).await {
+                    match Refreshable::refresh(catalog.as_ref()).await {
                         Ok(count) => info!(
-                            "PolymarketCatalog: Background refresh complete, {} changes",
+                            "PolymarketCatalog: Initial fetch complete, {} markets",
                             count
                         ),
-                        Err(e) => error!("PolymarketCatalog: Background refresh failed: {}", e),
+                        Err(e) => error!("PolymarketCatalog: Initial fetch failed: {}", e),
                     }
-                });
+                } else {
+                    // Cache exists but stale - refresh in background
+                    info!("PolymarketCatalog: Cache is stale, spawning background refresh...");
+                    let catalog_clone = catalog.clone();
+                    tokio::spawn(async move {
+                        // Guard ensures flag is reset even if this task panics
+                        let _guard = AutoRefreshGuard::new(&AUTO_REFRESH_IN_PROGRESS);
+                        match Refreshable::refresh(catalog_clone.as_ref()).await {
+                            Ok(count) => info!(
+                                "PolymarketCatalog: Background refresh complete, {} changes",
+                                count
+                            ),
+                            Err(e) => error!("PolymarketCatalog: Background refresh failed: {}", e),
+                        }
+                    });
+                }
             } else {
                 info!("PolymarketCatalog: Cache is stale, but refresh already in progress");
             }
@@ -761,6 +776,81 @@ mod tests {
     #[test]
     fn test_search_scoring() {
         // Basic scoring test - would need mock data
+    }
+
+    #[test]
+    fn test_is_stale_with_empty_cache() {
+        // When last_updated is 0 (empty cache), should always be stale
+        let catalog = PolymarketCatalog {
+            inner: RwLock::new(CatalogState::default()),
+            cache_path: "test.jsonl".to_string(),
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            stale_threshold_secs: 3600, // 1 hour
+        };
+
+        // Default state has last_updated = 0, which is always stale
+        assert!(catalog.is_stale());
+    }
+
+    #[test]
+    fn test_is_stale_with_recent_update() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let state = CatalogState {
+            markets: HashMap::new(),
+            diffs: vec![],
+            last_updated: now - 100, // 100 seconds ago
+        };
+
+        let catalog = PolymarketCatalog {
+            inner: RwLock::new(state),
+            cache_path: "test.jsonl".to_string(),
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            stale_threshold_secs: 3600, // 1 hour threshold
+        };
+
+        // Updated 100s ago with 1 hour threshold = not stale
+        assert!(!catalog.is_stale());
+    }
+
+    #[test]
+    fn test_is_stale_with_old_update() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let state = CatalogState {
+            markets: HashMap::new(),
+            diffs: vec![],
+            last_updated: now - 7200, // 2 hours ago
+        };
+
+        let catalog = PolymarketCatalog {
+            inner: RwLock::new(state),
+            cache_path: "test.jsonl".to_string(),
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            stale_threshold_secs: 3600, // 1 hour threshold
+        };
+
+        // Updated 2 hours ago with 1 hour threshold = stale
+        assert!(catalog.is_stale());
     }
 
     #[test]
