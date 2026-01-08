@@ -31,10 +31,10 @@ cargo build
 cargo run -- --generate-config > config.toml
 
 # Live trading with config file
-cargo run -- --config config.toml --dashboard 8080
+cargo run -- --config config.toml --dashboard 8079
 
 # Demo mode with mock data
-cargo run -- --mode demo --dashboard 8080
+cargo run -- --mode demo --dashboard 8079
 
 # Backtest from JSONL file
 cargo run -- --mode backtest --file recordings/deribit_20251229.jsonl
@@ -54,10 +54,10 @@ sudo apt-get install -y lld clang
 RUSTFLAGS="-C link-arg=-fuse-ld=lld" CARGO_BUILD_JOBS=1 cargo build -j1
 ```
 
-To run with the same settings (equivalent of `cargo run -- --config config.toml --dashboard 8080`):
+To run with the same settings (equivalent of `cargo run -- --config config.toml --dashboard 8079`):
 
 ```bash
-RUSTFLAGS="-C link-arg=-fuse-ld=lld" CARGO_BUILD_JOBS=1 cargo run -- --config config.toml --dashboard 8080
+RUSTFLAGS="-C link-arg=-fuse-ld=lld" CARGO_BUILD_JOBS=1 cargo run -- --config config.toml --dashboard 8079
 ```
 
 If you don’t want to type the flags each time:
@@ -135,7 +135,7 @@ Strategies are defined in TOML format:
 # config.toml
 
 [global]
-dashboard_port = 8080
+dashboard_port = 8079
 subscription_refresh_secs = 60
 
 # Cross-Market Arbitrage Strategy (NEW!)
@@ -497,8 +497,8 @@ src/
 ## 📊 Web Dashboard
 
 ```bash
-cargo run -- --config config.toml --dashboard 8080
-# Open http://localhost:8080
+cargo run -- --config config.toml --dashboard 8079
+# Open http://localhost:8079
 ```
 
 The dashboard shows:
