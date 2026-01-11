@@ -36,12 +36,26 @@ cargo run -- --config config.toml --dashboard 8079
 # Demo mode with mock data
 cargo run -- --mode demo --dashboard 8079
 
-# Backtest from JSONL file
-cargo run -- --mode backtest --file recordings/deribit_20251229.jsonl
+# Backtest with multiple data files (merged by timestamp)
+cargo run -- --mode backtest \
+  --file recordings/deribit.jsonl \
+  --file recordings/polymarket.jsonl \
+  --file recordings/derive.jsonl
 
 # Backtest with realtime simulation (2x speed)
 cargo run -- --mode backtest --file data.jsonl --realtime --speed 2.0
 ```
+
+## 📊 Backtest Reporting
+
+When running in backtest mode, the engine provides:
+
+1.  **Progress Indicator**: Real-time progress bar showing completion % and MB processed.
+2.  **PnL & Trade Summary**: At completion, a detailed report showing:
+    *   **Portfolio Stats**: Expected Return, Sharpe Ratio, Probability of Loss (from Kelly Optimizer).
+    *   **Open Positions**: List of optimized positions with size and expected profit.
+    *   **Execution Volume**: Total value traded per exchange.
+
 
 ### Raspberry Pi / Low-Memory Linux Builds
 
@@ -526,7 +540,7 @@ Options:
   --mode <MODE>          Mode: live, backtest, demo [default: live]
   --config <FILE>        Path to TOML configuration file
   --strategies <LIST>    Comma-separated strategy names (quick testing)
-  --file <FILE>          JSONL file for backtest mode
+  --file <FILE>...       JSONL file(s) for backtest mode (can be specified multiple times)
   --as-of <TIMESTAMP>    Historical catalog timestamp for backtest
   --realtime             Enable realtime playback simulation
   --speed <FLOAT>        Playback speed multiplier [default: 1.0]
