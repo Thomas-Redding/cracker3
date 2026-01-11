@@ -70,9 +70,13 @@ impl PlaybackConfig {
 
 /// Internal state for HistoricalStream.
 struct HistoricalStreamState {
-    reader: BufReader<File>,
-    line_buffer: String,
+    readers: Vec<BufReader<File>>,
+    line_buffers: Vec<String>,
+    next_events: Vec<Option<MarketEvent>>,
     last_timestamp: Option<i64>,
+    total_size_bytes: u64,
+    processed_bytes: u64,
+    last_progress_log: std::time::Instant,
 }
 
 /// A MarketStream that reads historical data from a JSONL file.
@@ -83,28 +87,42 @@ pub struct HistoricalStream {
 }
 
 impl HistoricalStream {
-    /// Creates a new HistoricalStream from a file path.
-    /// Returns an error if the file cannot be opened.
-    pub fn new<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
-        let file = File::open(path)?;
-        Ok(Self {
-            state: Mutex::new(HistoricalStreamState {
-                reader: BufReader::new(file),
-                line_buffer: String::new(),
-                last_timestamp: None,
-            }),
-            playback_config: PlaybackConfig::default(),
-        })
+    /// Creates a new HistoricalStream from a list of file paths.
+    pub fn new<P: AsRef<Path>>(paths: Vec<P>) -> std::io::Result<Self> {
+        Self::with_config(paths, PlaybackConfig::default())
     }
 
     /// Creates a new HistoricalStream with custom playback configuration.
-    pub fn with_config<P: AsRef<Path>>(path: P, config: PlaybackConfig) -> std::io::Result<Self> {
-        let file = File::open(path)?;
+    pub fn with_config<P: AsRef<Path>>(
+        paths: Vec<P>,
+        config: PlaybackConfig,
+    ) -> std::io::Result<Self> {
+        let mut readers = Vec::with_capacity(paths.len());
+        let mut line_buffers = Vec::with_capacity(paths.len());
+        let mut next_events = Vec::with_capacity(paths.len());
+        let mut total_size_bytes: u64 = 0;
+
+        for path in paths {
+            let metadata = std::fs::metadata(&path)?;
+            total_size_bytes += metadata.len();
+            
+            let file = File::open(path)?;
+            readers.push(BufReader::new(file));
+            line_buffers.push(String::new());
+            next_events.push(None); // Initially empty, will be filled on first next()
+        }
+
+        eprintln!("Backtest: Total data size: {:.2} MB", total_size_bytes as f64 / 1_024.0 / 1_024.0);
+
         Ok(Self {
             state: Mutex::new(HistoricalStreamState {
-                reader: BufReader::new(file),
-                line_buffer: String::new(),
+                readers,
+                line_buffers,
+                next_events,
                 last_timestamp: None,
+                total_size_bytes,
+                processed_bytes: 0,
+                last_progress_log: std::time::Instant::now(),
             }),
             playback_config: config,
         })
@@ -114,51 +132,123 @@ impl HistoricalStream {
 #[async_trait]
 impl MarketStream for HistoricalStream {
     async fn next(&self) -> Option<MarketEvent> {
-        let mut state = self.state.lock().await;
+        let mut state_guard = self.state.lock().await;
+
         loop {
-            state.line_buffer.clear();
-            // Split borrows: get mutable references to reader and line_buffer separately
-            let HistoricalStreamState { ref mut reader, ref mut line_buffer, ref mut last_timestamp } = *state;
-            match reader.read_line(line_buffer) {
-                Ok(0) => return None, // EOF
-                Ok(_) => {
-                    let line = line_buffer.trim();
-                    if line.is_empty() {
-                        continue; // Skip empty lines
-                    }
-                    match serde_json::from_str::<MarketEvent>(line) {
-                        Ok(event) => {
-                            // Handle time-aware playback
-                            if self.playback_config.realtime {
-                                if let Some(last_ts) = *last_timestamp {
-                                    let delta_ms = event.timestamp - last_ts;
-                                    if delta_ms > 0 {
-                                        let sleep_ms =
-                                            (delta_ms as f64 / self.playback_config.speed) as u64;
-                                        // Drop the lock before sleeping to avoid holding it
-                                        drop(state);
-                                        tokio::time::sleep(
-                                            tokio::time::Duration::from_millis(sleep_ms),
-                                        )
-                                        .await;
-                                        // Reacquire to update timestamp
-                                        state = self.state.lock().await;
+            let state = &mut *state_guard;
+            
+            // Check for progress logging (every 5 seconds)
+            if state.last_progress_log.elapsed() >= std::time::Duration::from_secs(5) {
+                let pct = if state.total_size_bytes > 0 {
+                    (state.processed_bytes as f64 / state.total_size_bytes as f64) * 100.0
+                } else {
+                    0.0
+                };
+                
+                let processed_mb = state.processed_bytes as f64 / 1024.0 / 1024.0;
+                let total_mb = state.total_size_bytes as f64 / 1024.0 / 1024.0;
+                
+                // Use \r to overwrite line for cleaner progress
+                eprint!("\r[progress] {:.1}% complete ({:.1} MB / {:.1} MB)", 
+                    pct, processed_mb, total_mb);
+                // Flush to ensure it prints
+                use std::io::Write;
+                let _ = std::io::stderr().flush();
+                state.last_progress_log = std::time::Instant::now();
+            }
+
+            // Split borrows manually to avoid "cannot borrow `*state` as mutable more than once"
+            let HistoricalStreamState { 
+                ref mut readers, 
+                ref mut line_buffers, 
+                ref mut next_events, 
+                ref mut last_timestamp,
+                ref mut processed_bytes,
+                ..
+            } = state;
+
+            // 1. Refill any empty slots
+            let mut all_eof = true;
+
+            // We iterate by index because we need to access parallel vectors
+            for i in 0..readers.len() {
+                if next_events[i].is_none() {
+                    // Try to read next event for this reader
+                    loop {
+                        let reader = &mut readers[i];
+                        let buffer = &mut line_buffers[i];
+                        
+                        buffer.clear();
+                        match reader.read_line(buffer) {
+                            Ok(0) => break, // EOF for this file
+                            Ok(n) => {
+                                *processed_bytes += n as u64;
+                                let line = buffer.trim();
+                                if line.is_empty() {
+                                    continue;
+                                }
+                                match serde_json::from_str::<MarketEvent>(line) {
+                                    Ok(event) => {
+                                        next_events[i] = Some(event);
+                                        break; // Found valid event
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Failed to parse MarketEvent: {}", e);
+                                        continue;
                                     }
                                 }
                             }
-                            state.last_timestamp = Some(event.timestamp);
-                            return Some(event);
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to parse MarketEvent from line: {}", e);
-                            continue; // Skip malformed lines
+                            Err(e) => {
+                                log::error!("Error reading historical file: {}", e);
+                                break;
+                            }
                         }
                     }
                 }
-                Err(e) => {
-                    log::error!("Error reading from historical data file: {}", e);
-                    return None;
+                
+                if next_events[i].is_some() {
+                    all_eof = false;
                 }
+            }
+
+            if all_eof {
+                return None;
+            }
+
+            // 2. Find the event with minimum timestamp
+            let mut min_ts = i64::MAX;
+            let mut best_idx = None;
+
+            for (i, event_opt) in next_events.iter().enumerate() {
+                if let Some(event) = event_opt {
+                    if event.timestamp < min_ts {
+                        min_ts = event.timestamp;
+                        best_idx = Some(i);
+                    }
+                }
+            }
+
+            // 3. Return and advance
+            if let Some(idx) = best_idx {
+                let event = next_events[idx].take().unwrap();
+
+                // Handle delay
+                // Note: We hold the lock while sleeping. This prevents other consumers from
+                // racing to get the next event, which preserves strict ordering.
+                if self.playback_config.realtime {
+                    if let Some(last_ts) = *last_timestamp {
+                        let delta_ms = event.timestamp - last_ts;
+                        if delta_ms > 0 {
+                            let sleep_ms = (delta_ms as f64 / self.playback_config.speed) as u64;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
+                        }
+                    }
+                }
+
+                *last_timestamp = Some(event.timestamp);
+                return Some(event);
+            } else {
+                return None;
             }
         }
     }
