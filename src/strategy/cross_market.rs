@@ -1561,9 +1561,6 @@ impl Strategy for CrossMarketStrategy {
     }
 
     async fn on_event(&self, event: MarketEvent) {
-
-        println!("=== ON EVENT (ts={}) ===", event.timestamp);
-
         let now_ms = event.timestamp;
 
         match &event.instrument {
@@ -1700,8 +1697,6 @@ impl Strategy for CrossMarketStrategy {
         if should_recalc {
             self.recalculate(now_ms).await;
         }
-
-        println!("=== RECALCULATE CYCLE (ts={}) === ended", now_ms);
     }
 }
 
