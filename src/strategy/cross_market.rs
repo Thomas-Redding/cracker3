@@ -2235,5 +2235,30 @@ mod tests {
         let state = strategy.state.read().await;
         assert!(state.log.len() <= MAX_LOG_ENTRIES);
     }
+
+    #[tokio::test]
+    async fn test_recalc_update_without_opportunities() {
+        use crate::traits::ExecutionRouter; 
+        let exec = Arc::new(ExecutionRouter::empty());
+        let strategy = CrossMarketStrategy::with_defaults("test", exec);
+
+        // Ensure initially opportunities are empty
+        {
+            let state = strategy.state.read().await;
+            assert!(state.opportunities.is_empty());
+            assert_eq!(state.last_recalc, 0);
+        }
+
+        // Run recalculate
+        let now = 1234567890;
+        strategy.recalculate(now).await;
+
+        // Verify last_recalc is updated even with 0 opportunities
+        {
+            let state = strategy.state.read().await;
+            assert!(state.opportunities.is_empty());
+            assert_eq!(state.last_recalc, now, "last_recalc should be updated even if no opportunities found");
+        }
+    }
 }
 
