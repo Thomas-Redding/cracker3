@@ -144,6 +144,8 @@ struct CrossMarketState {
     derive_subscriptions: HashSet<String>,
     /// PnL history
     history: Vec<HistoryPoint>,
+    /// Event counter for throttling logs
+    event_counter: usize,
 }
 
 /// Point in time for PnL history.
@@ -174,6 +176,7 @@ impl Default for CrossMarketState {
             deribit_subscriptions: HashSet::new(),
             derive_subscriptions: HashSet::new(),
             history: Vec::new(),
+            event_counter: 0,
         }
     }
 }
@@ -1575,11 +1578,13 @@ impl Strategy for CrossMarketStrategy {
                 // NOTE: For BUYING opportunities, we care about the ASK (what we'd pay)
                 // For SELLING opportunities, we care about the BID (what we'd receive)
                 let mut state = self.state.write().await;
-                // Capture log length early to avoid borrow conflicts later
-                let log_len = state.log.len();
+                
+                // Increment event counter for throttling
+                state.event_counter += 1;
+                let event_count = state.event_counter;
 
                 // HEARTBEAT: Log that we received an event (throttle to avoid spam)
-                if log_len % 50 == 0 {
+                if event_count % 50 == 0 {
                     println!("RX PM Event: {} | bid={:?} ask={:?}", token_id, event.best_bid, event.best_ask);
                 }
                 
@@ -1618,7 +1623,7 @@ impl Strategy for CrossMarketStrategy {
                                 market.yes_price = ask;
                                 market.last_updated = now_ms;
                             } else {
-                                if log_len % 50 == 0 {
+                                if event_count % 50 == 0 {
                                     println!("PM UPDATE YES: No ask price for {} (bid={:?})", token_id, event.best_bid);
                                 }
                             }
@@ -1630,7 +1635,7 @@ impl Strategy for CrossMarketStrategy {
                                 market.no_price = ask;
                                 market.last_updated = now_ms;
                             } else {
-                                if log_len % 50 == 0 {
+                                if event_count % 50 == 0 {
                                      println!("PM UPDATE NO: No ask price for {} (bid={:?})", token_id, event.best_bid);
                                 }
                             }
@@ -1678,7 +1683,7 @@ impl Strategy for CrossMarketStrategy {
                         }
                     } else {
                         // Truly unmatched
-                        if state.log.len() % 100 == 0 { 
+                        if state.event_counter % 100 == 0 { 
                              println!("PM UNMATCHED token: {} (Map size: {}, Markets: {})", 
                                  token_id, state.token_to_market_key.len(), state.polymarket_markets.len());
                         }
@@ -2254,6 +2259,35 @@ mod tests {
             assert!(state.opportunities.is_empty());
             assert_eq!(state.last_recalc, now, "last_recalc should be updated even if no opportunities found");
         }
+    }
+
+    #[tokio::test]
+    async fn test_event_throttling_counter() {
+        let exec = Arc::new(ExecutionRouter::empty());
+        let strategy = CrossMarketStrategy::with_defaults("test", exec);
+        
+        // Create a dummy event
+        let event = MarketEvent {
+            timestamp: 1000,
+            instrument: Instrument::Polymarket("token_123".to_string()),
+            best_bid: Some(0.5),
+            best_ask: Some(0.6),
+            delta: None,
+            mark_iv: None,
+            bid_iv: None,
+            ask_iv: None,
+            underlying_price: None,
+        };
+
+        // Send 250 events
+        for _ in 0..250 {
+            strategy.on_event(event.clone()).await;
+        }
+
+        let state = strategy.state.read().await;
+        assert_eq!(state.event_counter, 250);
+        // Log should be capped at 200
+        assert!(state.log.len() <= MAX_LOG_ENTRIES);
     }
 }
 
