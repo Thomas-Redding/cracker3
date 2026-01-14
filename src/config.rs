@@ -393,21 +393,21 @@ fn build_cross_market(
                 match serde_json::from_str::<Vec<f64>>(&contents) {
                     Ok(vols) => {
                         if vols.len() == 168 {
-                            println!("Loaded {} hourly volatility values from {}", vols.len(), path);
+                            log::info!("Loaded {} hourly volatility values from {}", vols.len(), path);
                             vols
                         } else {
-                            eprintln!("Warning: {} contains {} values, expected 168. Using calendar time.", path, vols.len());
+                            log::warn!("Warning: {} contains {} values, expected 168. Using calendar time.", path, vols.len());
                             Vec::new()
                         }
                     }
                     Err(e) => {
-                        eprintln!("Warning: Failed to parse {}: {}. Using calendar time.", path, e);
+                        log::warn!("Warning: Failed to parse {}: {}. Using calendar time.", path, e);
                         Vec::new()
                     }
                 }
             }
             Err(e) => {
-                eprintln!("Warning: Failed to read {}: {}. Using calendar time.", path, e);
+                log::warn!("Warning: Failed to read {}: {}. Using calendar time.", path, e);
                 Vec::new()
             }
         }
