@@ -55,6 +55,7 @@ When running in backtest mode, the engine provides:
     *   **Portfolio Stats**: Expected Return, Sharpe Ratio, Probability of Loss (from Kelly Optimizer).
     *   **Open Positions**: List of optimized positions with size and expected profit.
     *   **Execution Volume**: Total value traded per exchange.
+3.  **PnL History File**: Exports a detailed CSV of PnL history to `backtest_results/<strategy_name>_history.csv` containing timestamp, expected utility, return, probability of loss, position count, and total value.
 
 
 ### Raspberry Pi / Low-Memory Linux Builds
