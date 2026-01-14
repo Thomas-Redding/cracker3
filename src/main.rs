@@ -5,6 +5,7 @@
 
 use chrono::Utc;
 use clap::Parser;
+use log::{info, warn, error};
 use std::collections::HashMap;
 use std::sync::Arc;
 use trading_bot::catalog::{DeribitCatalog, DeriveCatalog, PolymarketCatalog, SharedRefreshable};
@@ -73,7 +74,7 @@ async fn main() {
         "backtest" => run_backtest_mode(&args).await,
         "demo" => run_demo_mode(&args).await,
         _ => {
-            eprintln!("Unknown mode: {}. Use: live, backtest, or demo", args.mode);
+            error!("Unknown mode: {}. Use: live, backtest, or demo", args.mode);
             std::process::exit(1);
         }
     }
@@ -84,28 +85,28 @@ async fn main() {
 // =============================================================================
 
 async fn run_live_mode(args: &Args) {
-    println!("Starting Live Trading Mode...");
+    info!("Starting Live Trading Mode...");
 
     // Load configuration
     let config = match &args.config {
         Some(path) => match Config::from_file(path) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("Failed to load config: {}", e);
-                eprintln!("Use --generate-config to create a template.");
+                error!("Failed to load config: {}", e);
+                error!("Use --generate-config to create a template.");
                 std::process::exit(1);
             }
         },
         None => {
-            eprintln!("No config file specified. Use --config <path>");
-            eprintln!("Use --generate-config to create a template.");
+            error!("No config file specified. Use --config <path>");
+            error!("Use --generate-config to create a template.");
             std::process::exit(1);
         }
     };
 
     // Determine required exchanges
     let required_exchanges = config.required_exchanges();
-    println!("Required exchanges: {:?}", required_exchanges);
+    info!("Required exchanges: {:?}", required_exchanges);
 
     // Build execution clients for each exchange
     // API keys are optional for read-only mode (market data streaming)
@@ -120,7 +121,7 @@ async fn run_live_mode(args: &Args) {
             Exchange::Deribit => {
                 let api_key = std::env::var("DERIBIT_KEY")
                     .unwrap_or_else(|_| {
-                        println!("Note: DERIBIT_KEY not set - trading disabled, read-only mode");
+                        info!("Note: DERIBIT_KEY not set - trading disabled, read-only mode");
                         "read_only".to_string()
                     });
                 let client = deribit::DeribitExec::new(api_key).await.shared();
@@ -129,7 +130,7 @@ async fn run_live_mode(args: &Args) {
             Exchange::Derive => {
                 let api_key = std::env::var("DERIVE_KEY")
                     .unwrap_or_else(|_| {
-                        println!("Note: DERIVE_KEY not set - trading disabled, read-only mode");
+                        info!("Note: DERIVE_KEY not set - trading disabled, read-only mode");
                         "read_only".to_string()
                     });
                 let client = derive::DeriveExec::new(api_key).await.shared();
@@ -140,7 +141,7 @@ async fn run_live_mode(args: &Args) {
                 // Use POLYMARKET_PRIVATE_KEY env var (hex string, with or without 0x prefix)
                 let private_key = std::env::var("POLYMARKET_PRIVATE_KEY")
                     .unwrap_or_else(|_| {
-                        println!("Note: POLYMARKET_PRIVATE_KEY not set - trading disabled, read-only mode");
+                        info!("Note: POLYMARKET_PRIVATE_KEY not set - trading disabled, read-only mode");
                         "read_only".to_string()
                     });
                 // Keep a reference to inject catalog later (shares inner Arc)
@@ -157,7 +158,7 @@ async fn run_live_mode(args: &Args) {
 
     // Create catalogs for market discovery
     // These are shared between Engine (for refresh coordination) and strategies (for discovery)
-    println!("Initializing catalogs...");
+    info!("Initializing catalogs...");
     let mut catalogs = Catalogs::default();
     
     if required_exchanges.contains(&Exchange::Polymarket) {
@@ -167,23 +168,23 @@ async fn run_live_mode(args: &Args) {
             exec.set_catalog(catalog.clone()).await;
         }
         catalogs.polymarket = Some(catalog);
-        println!("Polymarket catalog initialized");
+        info!("Polymarket catalog initialized");
     }
     if required_exchanges.contains(&Exchange::Deribit) {
         // DeribitCatalog needs currencies - extract from config or default to BTC
         let catalog = DeribitCatalog::new(vec!["BTC".to_string()], None, None).await;
         catalogs.deribit = Some(catalog);
-        println!("Deribit catalog initialized");
+        info!("Deribit catalog initialized");
     }
     if required_exchanges.contains(&Exchange::Derive) {
         let catalog = DeriveCatalog::new(vec!["BTC".to_string()], None, None).await;
         catalogs.derive = Some(catalog);
-        println!("Derive catalog initialized");
+        info!("Derive catalog initialized");
     }
 
     // Build strategies from config with catalog references
     let strategies = config.build_strategies_with_catalogs(exec_router.clone(), Some(&catalogs));
-    println!("Loaded {} strategies", strategies.len());
+    info!("Loaded {} strategies", strategies.len());
 
     // Start dashboard if configured
     let dashboard_port = args.dashboard.or(config.global.dashboard_port);
@@ -226,11 +227,11 @@ async fn run_live_mode(args: &Args) {
             .unwrap_or_default();
 
         if instruments.is_empty() {
-            println!("No instruments for {:?}, skipping stream", exchange);
+            info!("No instruments for {:?}, skipping stream", exchange);
             continue;
         }
 
-        println!("{:?}: Subscribing to {} instruments", exchange, instruments.len());
+        info!("{:?}: Subscribing to {} instruments", exchange, instruments.len());
 
         match exchange {
             Exchange::Deribit => {
@@ -241,12 +242,12 @@ async fn run_live_mode(args: &Args) {
                 std::fs::create_dir_all("recordings").ok();
                 match backtest::RecordingStream::new(stream, &path) {
                     Ok(recording) => {
-                        println!("Deribit: Recording to {}", path);
+                        info!("Deribit: Recording to {}", path);
                         engine = engine.with_stream(Exchange::Deribit, Box::new(recording));
                     }
                     Err(_) => {
                         // Can't record, skip this exchange
-                        println!("Deribit: Failed to create recording, skipping");
+                        error!("Deribit: Failed to create recording, skipping");
                     }
                 }
             }
@@ -257,11 +258,11 @@ async fn run_live_mode(args: &Args) {
                 std::fs::create_dir_all("recordings").ok();
                 match backtest::RecordingStream::new(stream, &path) {
                     Ok(recording) => {
-                        println!("Derive: Recording to {}", path);
+                        info!("Derive: Recording to {}", path);
                         engine = engine.with_stream(Exchange::Derive, Box::new(recording));
                     }
                     Err(_) => {
-                        println!("Derive: Failed to create recording, skipping");
+                        error!("Derive: Failed to create recording, skipping");
                     }
                 }
             }
@@ -272,11 +273,11 @@ async fn run_live_mode(args: &Args) {
                 std::fs::create_dir_all("recordings").ok();
                 match backtest::RecordingStream::new(stream, &path) {
                     Ok(recording) => {
-                        println!("Polymarket: Recording to {}", path);
+                        info!("Polymarket: Recording to {}", path);
                         engine = engine.with_stream(Exchange::Polymarket, Box::new(recording));
                     }
                     Err(_) => {
-                        println!("Polymarket: Failed to create recording, skipping");
+                        error!("Polymarket: Failed to create recording, skipping");
                     }
                 }
             }
@@ -293,17 +294,17 @@ async fn run_live_mode(args: &Args) {
 
 async fn run_backtest_mode(args: &Args) {
     if args.file.is_empty() {
-        eprintln!("--file is required for backtest mode");
+        error!("--file is required for backtest mode");
         std::process::exit(1);
     }
     
     let file_paths = &args.file;
 
-    println!("Starting Backtest from files: {:?}", file_paths);
+    info!("Starting Backtest from files: {:?}", file_paths);
 
     // Create playback configuration
     let playback_config = if args.realtime {
-        println!("Realtime playback enabled at {}x speed", args.speed);
+        info!("Realtime playback enabled at {}x speed", args.speed);
         backtest::PlaybackConfig::realtime(args.speed)
     } else {
         backtest::PlaybackConfig::instant()
@@ -313,7 +314,7 @@ async fn run_backtest_mode(args: &Args) {
     let stream = match backtest::HistoricalStream::with_config(file_paths.clone(), playback_config) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Failed to open historical data file: {}", e);
+            error!("Failed to open historical data file: {}", e);
             std::process::exit(1);
         }
     };
@@ -347,7 +348,7 @@ async fn run_backtest_mode(args: &Args) {
         match Config::from_file(config_path) {
             Ok(config) => config.build_strategies_with_catalogs(exec_router.clone(), Some(&catalogs)),
             Err(e) => {
-                eprintln!("Failed to load config: {}", e);
+                error!("Failed to load config: {}", e);
                 default_backtest_strategies(exec_router.clone())
             }
         }
@@ -356,7 +357,7 @@ async fn run_backtest_mode(args: &Args) {
     };
 
     let strategies_clone = strategies.clone(); // Keep for reporting
-    println!("Running with {} strategies", strategies.len());
+    info!("Running with {} strategies", strategies.len());
 
     // Start dashboard if requested
     if let Some(port) = args.dashboard {
@@ -371,25 +372,24 @@ async fn run_backtest_mode(args: &Args) {
         .with_catalog(Exchange::Derive, derive_catalog as SharedRefreshable)
         .with_exec_router(exec_router);
     engine.run().await;
-
-    println!("\n=== Backtest Results ===");
+    info!("\n=== Backtest Results ===");
 
     // Report Strategy States (Positions & PnL)
     for strategy in &strategies_clone {
-        println!("\nStrategy: {}", strategy.name());
+        info!("\nStrategy: {}", strategy.name());
         let state = strategy.dashboard_state().await;
         
         if let Some(stats) = state.get("portfolio_stats") {
             if !stats.is_null() {
-                println!("  Portfolio Stats:");
+                info!("  Portfolio Stats:");
                 if let Some(ret) = stats.get("expected_return") {
-                    println!("    Expected Return: {}", ret);
+                    info!("    Expected Return: {}", ret);
                 }
                 if let Some(sharpe) = stats.get("expected_sharpe") {
-                    println!("    Expected Sharpe: {}", sharpe);
+                    info!("    Expected Sharpe: {}", sharpe);
                 }
                 if let Some(prob_loss) = stats.get("prob_loss") {
-                    println!("    Prob. Loss:      {}", prob_loss);
+                    info!("    Prob. Loss:      {}", prob_loss);
                 }
             }
         }
@@ -397,18 +397,18 @@ async fn run_backtest_mode(args: &Args) {
         if let Some(positions) = state.get("positions") {
             if let Some(pos_array) = positions.as_array() {
                 if !pos_array.is_empty() {
-                    println!("  Open Positions: {}", pos_array.len());
+                    info!("  Open Positions: {}", pos_array.len());
                     for pos in pos_array {
                         let opp_id = pos.get("opportunity_id").and_then(|v| v.as_str()).unwrap_or("?");
                         let size = pos.get("size").and_then(|v| v.as_str()).unwrap_or("?");
                         let value = pos.get("dollar_value").and_then(|v| v.as_str()).unwrap_or("?");
                         let profit = pos.get("expected_profit").and_then(|v| v.as_str()).unwrap_or("?");
                         
-                        println!("    - {} : Size {} | Val {} | E[Profit] {}", 
+                        info!("    - {} : Size {} | Val {} | E[Profit] {}", 
                             opp_id, size, value, profit);
                     }
                 } else {
-                    println!("  No open positions.");
+                    info!("  No open positions.");
                 }
             }
         }
@@ -416,8 +416,8 @@ async fn run_backtest_mode(args: &Args) {
 
     // Report Execution Log
     let fills = mock_exec_raw.get_fills().await;
-    println!("\nExecution Summary:");
-    println!("  Total Trades: {}", fills.len());
+    info!("\nExecution Summary:");
+    info!("  Total Trades: {}", fills.len());
     
     // Aggregate volume by exchange
     let mut volume_by_exchange: HashMap<String, f64> = HashMap::new();
@@ -426,13 +426,14 @@ async fn run_backtest_mode(args: &Args) {
         let val = fill.quantity * fill.price.unwrap_or(0.0);
         *volume_by_exchange.entry(exchange).or_default() += val;
     }
+    }
     
     for (exc, vol) in volume_by_exchange {
-        println!("  {}: ${:.2} volume", exc, vol);
+        info!("  {}: ${:.2} volume", exc, vol);
     }
 
     // Export PnL History
-    println!("\nExporting PnL History...");
+    info!("\nExporting PnL History...");
     std::fs::create_dir_all("backtest_results").unwrap_or_default();
     
     for strategy in strategies_clone {
@@ -456,14 +457,14 @@ async fn run_backtest_mode(args: &Args) {
             }
             
             if let Ok(_) = std::fs::write(&filename, content) {
-                println!("  Saved history to: {}", filename);
+                info!("  Saved history to: {}", filename);
             } else {
-                eprintln!("  Failed to write history to: {}", filename);
+                error!("  Failed to write history to: {}", filename);
             }
         }
     }
 
-    println!("\nBacktest complete!");
+    info!("\nBacktest complete!");
 
     // Keep dashboard alive after backtest
     if args.dashboard.is_some() {
@@ -493,7 +494,7 @@ fn default_backtest_strategies(exec_router: Arc<ExecutionRouter>) -> Vec<Arc<dyn
 // =============================================================================
 
 async fn run_demo_mode(args: &Args) {
-    println!("Starting Demo Mode with mock data...");
+    info!("Starting Demo Mode with mock data...");
 
     // Create mock execution for all exchanges
     let mock_exec = backtest::MockExec::new().shared();
@@ -608,7 +609,7 @@ async fn run_demo_mode(args: &Args) {
         .with_exec_router(exec_router);
     engine.run().await;
 
-    println!("\nDemo complete!");
+    info!("\nDemo complete!");
 
     if args.dashboard.is_some() {
         wait_for_shutdown().await;
@@ -623,16 +624,16 @@ fn start_dashboard(strategies: Vec<Arc<dyn Strategy>>, port: u16) {
     let dashboard = DashboardServer::new(strategies, port);
     tokio::spawn(async move {
         if let Err(e) = dashboard.run().await {
-            eprintln!("Dashboard server error: {}", e);
+            error!("Dashboard server error: {}", e);
         }
     });
-    println!("Dashboard available at http://localhost:{}", port);
+    info!("Dashboard available at http://localhost:{}", port);
 }
 
 async fn wait_for_shutdown() {
-    println!("Dashboard still running. Press Ctrl+C to exit.");
+    info!("Dashboard still running. Press Ctrl+C to exit.");
     tokio::signal::ctrl_c()
         .await
         .expect("Failed to listen for Ctrl+C");
-    println!("\nShutting down...");
+    info!("\nShutting down...");
 }

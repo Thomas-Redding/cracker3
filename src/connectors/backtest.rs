@@ -112,7 +112,7 @@ impl HistoricalStream {
             next_events.push(None); // Initially empty, will be filled on first next()
         }
 
-        eprintln!("Backtest: Total data size: {:.2} MB", total_size_bytes as f64 / 1_024.0 / 1_024.0);
+        log::info!("Backtest: Total data size: {:.2} MB", total_size_bytes as f64 / 1_024.0 / 1_024.0);
 
         Ok(Self {
             state: Mutex::new(HistoricalStreamState {
@@ -353,7 +353,7 @@ impl Default for MockExec {
 #[async_trait]
 impl ExecutionClient for MockExec {
     async fn place_order(&self, order: Order) -> Result<OrderId, String> {
-        println!("BACKTEST: Filled order for {:?}", order);
+        log::info!("BACKTEST: Filled order for {:?}", order);
         self.inner.fills.lock().await.push(order);
         Ok("mock_ord_1".to_string())
     }

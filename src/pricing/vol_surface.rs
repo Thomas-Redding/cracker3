@@ -637,7 +637,7 @@ mod tests {
         
         // The weighted and calendar IVs may differ slightly due to different interpolation weights
         // Both should be valid and in range
-        println!("Calendar IV: {:.4}, Weighted IV: {:.4}", iv_cal, iv_wt);
+        debug!("Calendar IV: {:.4}, Weighted IV: {:.4}", iv_cal, iv_wt);
     }
 
     #[test]

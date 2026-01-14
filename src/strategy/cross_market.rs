@@ -18,7 +18,7 @@ use crate::traits::{Dashboard, DashboardSchema, SharedExecutionRouter, Strategy,
 use async_trait::async_trait;
 use chrono::TimeZone;
 use chrono_tz::America::New_York;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -419,7 +419,7 @@ impl CrossMarketStrategy {
             .map(|i| i.instrument_name)
             .collect();
 
-        println!("Deribit: Found {} {} options within {} days", instruments.len(), currency, max_expiry_days);
+        info!("Deribit: Found {} {} options within {} days", instruments.len(), currency, max_expiry_days);
         Ok(instruments)
     }
 
@@ -473,7 +473,7 @@ impl CrossMarketStrategy {
             })
             .collect();
 
-        println!("Derive: Found {} {} options within {} days", instruments.len(), currency, max_expiry_days);
+        info!("Derive: Found {} {} options within {} days", instruments.len(), currency, max_expiry_days);
         Ok(instruments)
     }
 
@@ -486,7 +486,7 @@ impl CrossMarketStrategy {
         let markets = catalog.find_by_slug_regex(pattern)
             .map_err(|e| format!("Regex search failed: {}", e))?;
         
-        println!("Polymarket: Regex '{}' matched {} markets", pattern, markets.len());
+        info!("Polymarket: Regex '{}' matched {} markets", pattern, markets.len());
         
         let now_ms = chrono::Utc::now().timestamp_millis();
         
@@ -549,20 +549,20 @@ impl CrossMarketStrategy {
             })
             .collect();
         
-        println!("Polymarket: Found {} active BTC price markets:", discoveries.len());
+        info!("Polymarket: Found {} active BTC price markets:", discoveries.len());
         for d in &discoveries {
             let expiry_str = chrono::DateTime::from_timestamp_millis(d.expiry_ms)
                 .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
                 .unwrap_or_else(|| "?".to_string());
             
-            println!("  - {} @ ${:.0} (expires {})", 
+            debug!("  - {} @ ${:.0} (expires {})", 
                 d.question.chars().take(60).collect::<String>(),
                 d.strike,
                 expiry_str
             );
             
             if let Some(end_date) = end_date_map.get(&d.condition_id) {
-                println!("    end_date_iso: {}", end_date);
+                debug!("    end_date_iso: {}", end_date);
             }
         }
         Ok(discoveries)
@@ -678,7 +678,7 @@ impl CrossMarketStrategy {
     async fn add_log(&self, level: &str, message: String) {
         let mut state = self.state.write().await;
         let entry = LogEntry {
-            time: chrono::Utc::now().format("%H:%M:%S").to_string(),
+            time: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             level: level.to_string(),
             message,
         };
@@ -759,7 +759,7 @@ impl CrossMarketStrategy {
             // We can't use self.add_log here because we have a mutable borrow of state
             // But we can add it to the state.log directly
             let time_str = chrono::DateTime::from_timestamp_millis(now_ms)
-                .map(|dt| dt.format("%H:%M:%S").to_string())
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
                 .unwrap_or_else(|| "??:??:??".to_string());
                 
             let entry = LogEntry {
@@ -970,7 +970,7 @@ impl CrossMarketStrategy {
         }
 
         // Log scan summary
-        println!("SCAN SUMMARY: PM={} Derive={} | invalid_price={} no_model={} | opportunities={}",
+        info!("SCAN SUMMARY: PM={} Derive={} | invalid_price={} no_model={} | opportunities={}",
             scan_stats.polymarket_scanned,
             scan_stats.derive_scanned,
             scan_stats.invalid_prices,
@@ -980,7 +980,7 @@ impl CrossMarketStrategy {
         
         // Log the actual opportunities found
         for opp in &opportunities {
-            println!("  OPPORTUNITY: {} | edge={:.1}% | fair={:.3} vs market={:.3} | {}",
+            info!("  OPPORTUNITY: {} | edge={:.1}% | fair={:.3} vs market={:.3} | {}",
                 opp.exchange,
                 opp.edge * 100.0,
                 opp.fair_value,
@@ -1018,9 +1018,9 @@ impl CrossMarketStrategy {
         // Log current Polymarket prices before recalc
         {
             let state = self.state.read().await;
-            println!("Polymarket markets with prices:");
+            debug!("Polymarket markets with prices:");
             for market in state.polymarket_markets.values() {
-                println!("  - {} @ ${:.0}: YES={:.3} NO={:.3} (sum={:.3})",
+                debug!("  - {} @ ${:.0}: YES={:.3} NO={:.3} (sum={:.3})",
                     market.question.chars().take(50).collect::<String>(),
                     market.strike,
                     market.yes_price,
@@ -1575,14 +1575,14 @@ impl Strategy for CrossMarketStrategy {
 
                 // HEARTBEAT: Log that we received an event (throttle to avoid spam)
                 if event_count % 50 == 0 {
-                    println!("RX PM Event: {} | bid={:?} ask={:?}", token_id, event.best_bid, event.best_ask);
+                    debug!("RX PM Event: {} | bid={:?} ask={:?}", token_id, event.best_bid, event.best_ask);
                 }
                 
                 // Ensure reverse lookup is populated (handle deserialization from old state)
                 // We check if the map length is consistent with markets (2 tokens per market)
                 if state.token_to_market_key.len() != state.polymarket_markets.len() * 2 {
                     if !state.polymarket_markets.is_empty() {
-                         println!("Rebuilding token_to_market_key map ({} markets, {} keys -> expecting {})", 
+                         warn!("Rebuilding token_to_market_key map ({} markets, {} keys -> expecting {})", 
                              state.polymarket_markets.len(), 
                              state.token_to_market_key.len(),
                              state.polymarket_markets.len() * 2
@@ -1598,7 +1598,7 @@ impl Strategy for CrossMarketStrategy {
                         for (token, id) in mappings {
                             state.token_to_market_key.insert(token, id);
                         }
-                        println!("Map rebuild complete. New Token->Market entries: {}", state.token_to_market_key.len());
+                        info!("Map rebuild complete. New Token->Market entries: {}", state.token_to_market_key.len());
                     }
                 }
                 
@@ -1614,7 +1614,7 @@ impl Strategy for CrossMarketStrategy {
                                 market.last_updated = now_ms;
                             } else {
                                 if event_count % 50 == 0 {
-                                    println!("PM UPDATE YES: No ask price for {} (bid={:?})", token_id, event.best_bid);
+                                    debug!("PM UPDATE YES: No ask price for {} (bid={:?})", token_id, event.best_bid);
                                 }
                             }
                             if let Some(bid) = event.best_bid {
@@ -1626,7 +1626,7 @@ impl Strategy for CrossMarketStrategy {
                                 market.last_updated = now_ms;
                             } else {
                                 if event_count % 50 == 0 {
-                                     println!("PM UPDATE NO: No ask price for {} (bid={:?})", token_id, event.best_bid);
+                                     debug!("PM UPDATE NO: No ask price for {} (bid={:?})", token_id, event.best_bid);
                                 }
                             }
                             if let Some(bid) = event.best_bid {
@@ -1634,7 +1634,7 @@ impl Strategy for CrossMarketStrategy {
                             }
                         }
                     } else {
-                         println!("CRITICAL: Token mapped to key {} but market not found!", key);
+                         error!("CRITICAL: Token mapped to key {} but market not found!", key);
                     }
                 } else {
                     // O(1) failed. Try O(N) fallback to check if we are desync'd
@@ -1648,7 +1648,7 @@ impl Strategy for CrossMarketStrategy {
 
                     if let Some(id) = found_slow {
                         // Found via O(N)! Map is broken. Repair it.
-                        println!("CRITICAL: Map desync detected! Token {} not in map but found in market {}. Repairing...", token_id, id);
+                        warn!("CRITICAL: Map desync detected! Token {} not in map but found in market {}. Repairing...", token_id, id);
                         state.token_to_market_key.insert(token_id.clone(), id.clone());
                         
                         // Retry with the found ID
@@ -1674,7 +1674,7 @@ impl Strategy for CrossMarketStrategy {
                     } else {
                         // Truly unmatched
                         if state.event_counter % 100 == 0 { 
-                             println!("PM UNMATCHED token: {} (Map size: {}, Markets: {})", 
+                             debug!("PM UNMATCHED token: {} (Map size: {}, Markets: {})", 
                                  token_id, state.token_to_market_key.len(), state.polymarket_markets.len());
                         }
                     }
