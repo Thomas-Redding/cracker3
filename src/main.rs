@@ -375,7 +375,7 @@ async fn run_backtest_mode(args: &Args) {
     println!("\n=== Backtest Results ===");
 
     // Report Strategy States (Positions & PnL)
-    for strategy in strategies_clone {
+    for strategy in &strategies_clone {
         println!("\nStrategy: {}", strategy.name());
         let state = strategy.dashboard_state().await;
         
@@ -429,6 +429,38 @@ async fn run_backtest_mode(args: &Args) {
     
     for (exc, vol) in volume_by_exchange {
         println!("  {}: ${:.2} volume", exc, vol);
+    }
+
+    // Export PnL History
+    println!("\nExporting PnL History...");
+    std::fs::create_dir_all("backtest_results").unwrap_or_default();
+    
+    for strategy in strategies_clone {
+        let state = strategy.dashboard_state().await;
+        if let Some(history) = state.get("history").and_then(|h| h.as_array()) {
+            if history.is_empty() { continue; }
+            
+            let filename = format!("backtest_results/{}_history.csv", strategy.name().replace(" ", "_"));
+            // Simple CSV write without pulling in csv crate
+            let mut content = "timestamp,expected_utility,expected_return,prob_loss,total_positions,total_value\n".to_string();
+            
+            for point in history {
+                let ts = point.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+                let util = point.get("expected_utility").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let ret = point.get("expected_return").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let prob = point.get("prob_loss").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let pos = point.get("total_positions").and_then(|v| v.as_u64()).unwrap_or(0);
+                let val = point.get("total_value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                
+                content.push_str(&format!("{},{:.6},{:.6},{:.6},{},{:.2}\n", ts, util, ret, prob, pos, val));
+            }
+            
+            if let Ok(_) = std::fs::write(&filename, content) {
+                println!("  Saved history to: {}", filename);
+            } else {
+                eprintln!("  Failed to write history to: {}", filename);
+            }
+        }
     }
 
     println!("\nBacktest complete!");
