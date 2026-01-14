@@ -220,7 +220,7 @@ impl Strategy for MomentumStrategy {
                 state.price_history.len(),
                 state.lookback_period
             );
-            // info!("[{}] {}", self.name, msg); // disabled for test noise
+            info!("[{}] {}", self.name, msg);
             Self::add_log(&mut state, msg, "info");
             return;
         }
@@ -254,7 +254,7 @@ impl Strategy for MomentumStrategy {
                 "{} Mid: {:.2}, Momentum: {:.4}%",
                 event.instrument, mid, momentum * 100.0
             );
-            // info!("[{}] {}", self.name, msg); // disabled for test noise
+            info!("[{}] {}", self.name, msg);
             Self::add_log(&mut state, msg, "info");
         }
     }
