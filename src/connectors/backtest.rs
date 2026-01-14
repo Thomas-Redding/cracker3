@@ -358,3 +358,75 @@ impl ExecutionClient for MockExec {
         Ok("mock_ord_1".to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn create_test_event(ts: i64) -> MarketEvent {
+        MarketEvent {
+            timestamp: ts,
+            instrument: Instrument::Deribit("BTC-PERPETUAL".to_string()),
+            best_bid: Some(100.0),
+            best_ask: Some(101.0),
+            delta: None,
+            mark_iv: None,
+            bid_iv: None,
+            ask_iv: None,
+            underlying_price: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_backtest_stream_memory() {
+        let events = vec![
+            create_test_event(100),
+            create_test_event(200),
+        ];
+        let stream = BacktestStream::new(events);
+
+        let evt1 = stream.next().await;
+        assert!(evt1.is_some());
+        assert_eq!(evt1.unwrap().timestamp, 100);
+
+        let evt2 = stream.next().await;
+        assert!(evt2.is_some());
+        assert_eq!(evt2.unwrap().timestamp, 200);
+
+        let evt3 = stream.next().await;
+        assert!(evt3.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_historical_stream_sorting() {
+        // file 1: events at 100, 300
+        let mut file1 = NamedTempFile::new().unwrap();
+        writeln!(file1, "{}", serde_json::to_string(&create_test_event(100)).unwrap()).unwrap();
+        writeln!(file1, "{}", serde_json::to_string(&create_test_event(300)).unwrap()).unwrap();
+
+        // file 2: events at 200, 400
+        let mut file2 = NamedTempFile::new().unwrap();
+        writeln!(file2, "{}", serde_json::to_string(&create_test_event(200)).unwrap()).unwrap();
+        writeln!(file2, "{}", serde_json::to_string(&create_test_event(400)).unwrap()).unwrap();
+
+        let stream = HistoricalStream::new(vec![file1.path(), file2.path()]).unwrap();
+
+        // Expected order: 100, 200, 300, 400
+        
+        let e1 = stream.next().await.unwrap();
+        assert_eq!(e1.timestamp, 100);
+
+        let e2 = stream.next().await.unwrap();
+        assert_eq!(e2.timestamp, 200);
+
+        let e3 = stream.next().await.unwrap();
+        assert_eq!(e3.timestamp, 300);
+
+        let e4 = stream.next().await.unwrap();
+        assert_eq!(e4.timestamp, 400);
+
+        assert!(stream.next().await.is_none());
+    }
+}

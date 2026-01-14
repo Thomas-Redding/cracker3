@@ -220,7 +220,7 @@ impl Strategy for MomentumStrategy {
                 state.price_history.len(),
                 state.lookback_period
             );
-            info!("[{}] {}", self.name, msg);
+            // info!("[{}] {}", self.name, msg); // disabled for test noise
             Self::add_log(&mut state, msg, "info");
             return;
         }
@@ -254,8 +254,88 @@ impl Strategy for MomentumStrategy {
                 "{} Mid: {:.2}, Momentum: {:.4}%",
                 event.instrument, mid, momentum * 100.0
             );
-            info!("[{}] {}", self.name, msg);
+            // info!("[{}] {}", self.name, msg); // disabled for test noise
             Self::add_log(&mut state, msg, "info");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::ExecutionRouter;
+
+    fn test_event(price: f64) -> MarketEvent {
+        MarketEvent {
+            timestamp: 0,
+            instrument: Instrument::Deribit("BTC-PERPETUAL".to_string()),
+            best_bid: Some(price),
+            best_ask: Some(price), // mid = price
+            delta: None,
+            mark_iv: None,
+            bid_iv: None,
+            ask_iv: None,
+            underlying_price: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_momentum_signal_bullish() {
+        let exec = Arc::new(ExecutionRouter::empty());
+        let strat = MomentumStrategy::new(
+            "TestStrat",
+            vec![Instrument::Deribit("BTC-PERPETUAL".to_string())],
+            exec,
+            3,      // Lookback period = 3
+            0.10,   // Threshold = 10%
+        );
+
+        // 1. Initial price: 100
+        strat.on_event(test_event(100.0)).await;
+        // 2. Price stable: 100 
+        strat.on_event(test_event(100.0)).await;
+        
+        {
+            let state = strat.state.lock().await;
+            assert!(state.current_momentum.is_none(), "Should not have momentum yet (warmup)");
+            assert_eq!(state.signal_count, 0);
+        }
+
+        // 3. Price jumps: 111 (11% increase from 100)
+        // History: [100, 100, 111], First=100, Last=111, Mom=0.11 > 0.10
+        strat.on_event(test_event(111.0)).await;
+
+        {
+            let state = strat.state.lock().await;
+            assert_eq!(state.signal_count, 1);
+            assert_eq!(state.last_signal.as_deref(), Some("BULLISH"));
+            assert!(state.current_momentum.unwrap() > 0.10);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_momentum_signal_bearish() {
+        let exec = Arc::new(ExecutionRouter::empty());
+        let strat = MomentumStrategy::new(
+            "TestStrat",
+            vec![Instrument::Deribit("BTC-PERPETUAL".to_string())],
+            exec,
+            3,      // Lookback
+            0.10,   // Threshold
+        );
+
+        // 1. Initial price: 100
+        strat.on_event(test_event(100.0)).await;
+        // 2. Price stable: 100 
+        strat.on_event(test_event(100.0)).await;
+        // 3. Price drops: 89 (-11% from 100)
+        strat.on_event(test_event(89.0)).await;
+
+        {
+            let state = strat.state.lock().await;
+            assert_eq!(state.signal_count, 1);
+            assert_eq!(state.last_signal.as_deref(), Some("BEARISH"));
+            assert!(state.current_momentum.unwrap() < -0.10);
         }
     }
 }

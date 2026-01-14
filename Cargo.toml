@@ -53,3 +53,6 @@ debug = 0
 # Smaller/faster links on constrained devices.
 debug = 0
 strip = "debuginfo"
+
+[dev-dependencies]
+tempfile = "3.24.0"
