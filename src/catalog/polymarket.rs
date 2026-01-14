@@ -10,7 +10,7 @@ use super::{
     TokenInfo, DEFAULT_MARKET_STALE_THRESHOLD_SECS,
 };
 use async_trait::async_trait;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -406,6 +406,26 @@ impl PolymarketCatalog {
 #[async_trait]
 impl Refreshable for PolymarketCatalog {
     async fn refresh(&self) -> Result<usize, String> {
+        // Skip refresh if cache is still fresh (default: 24 hours)
+        // Polymarket has 300k+ markets and takes 5+ minutes to fetch
+        if !self.is_stale() {
+            debug!("PolymarketCatalog: Skipping refresh, cache is fresh");
+            return Ok(0);
+        }
+
+        // Check if a refresh is already in progress
+        if AUTO_REFRESH_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            debug!("PolymarketCatalog: Skipping refresh, already in progress");
+            return Ok(0);
+        }
+
+        // Guard ensures flag is reset even if refresh fails/panics
+        let _guard = AutoRefreshGuard::new(&AUTO_REFRESH_IN_PROGRESS);
+        
+        info!("PolymarketCatalog: Cache is stale, refreshing...");
         let diff = self.refresh_with_diff().await?;
         Ok(diff.change_count())
     }
