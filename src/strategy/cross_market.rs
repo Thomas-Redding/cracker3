@@ -995,7 +995,6 @@ impl CrossMarketStrategy {
     /// Optimizes the portfolio using Kelly criterion.
     /// Optimizes the portfolio using Kelly criterion.
     async fn optimize_portfolio(&self, now_ms: i64) {
-        println!("\n=== OPTIMIZE PORTFOLIO (ts={}) === started", now_ms);
         let state = self.state.read().await;
 
         let distribution = match &state.distribution {
@@ -1004,7 +1003,6 @@ impl CrossMarketStrategy {
         };
 
         if state.opportunities.is_empty() {
-            println!("=== OPTIMIZE PORTFOLIO (ts={}) === ended (no opportunities)", now_ms);
             return;
         }
 
@@ -1013,14 +1011,10 @@ impl CrossMarketStrategy {
 
         let mut state = self.state.write().await;
         state.portfolio = Some(portfolio);
-        // last_recalc update moved to recalculate() to ensure it always happens
-        println!("=== OPTIMIZE PORTFOLIO (ts={}) === ended", now_ms);
     }
 
     /// Performs a full recalculation cycle.
     async fn recalculate(&self, now_ms: i64) {
-        println!("\n=== RECALCULATE CYCLE (ts={}) === started", now_ms);
-        
         // Log current Polymarket prices before recalc
         {
             let state = self.state.read().await;
@@ -1056,8 +1050,6 @@ impl CrossMarketStrategy {
             };
         drop(state);
 
-        println!("=== Record history (ts={}) === started", now_ms);
-
         // Record history AND update last_recalc
         {
             let mut state = self.state.write().await;
@@ -1071,8 +1063,6 @@ impl CrossMarketStrategy {
                 total_value,
             });
         }
-
-        println!("=== Record history (ts={}) === ended", now_ms);
 
         self.add_log(
             "info",
