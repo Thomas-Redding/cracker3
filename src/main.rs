@@ -426,7 +426,6 @@ async fn run_backtest_mode(args: &Args) {
         let val = fill.quantity * fill.price.unwrap_or(0.0);
         *volume_by_exchange.entry(exchange).or_default() += val;
     }
-    }
     
     for (exc, vol) in volume_by_exchange {
         info!("  {}: ${:.2} volume", exc, vol);
