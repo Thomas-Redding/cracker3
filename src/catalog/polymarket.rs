@@ -1054,4 +1054,84 @@ mod tests {
         assert!((market.round_to_tick(0.554) - 0.55).abs() < 1e-9);
         assert!((market.round_to_tick(0.50) - 0.50).abs() < 1e-9);
     }
+
+    #[tokio::test]
+    async fn test_refresh_skips_when_cache_is_fresh() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use crate::catalog::Refreshable;
+        
+        // Reset the global flag to ensure clean test state
+        AUTO_REFRESH_IN_PROGRESS.store(false, Ordering::SeqCst);
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Create catalog with fresh cache (updated just now)
+        let state = CatalogState {
+            markets: HashMap::new(),
+            diffs: vec![],
+            last_updated: now, // Fresh - just updated
+        };
+
+        let catalog = PolymarketCatalog {
+            inner: RwLock::new(state),
+            cache_path: "/tmp/test_fresh.jsonl".to_string(),
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            stale_threshold_secs: 3600, // 1 hour threshold
+        };
+
+        // Refresh should skip and return 0 because cache is fresh
+        // Use Refreshable::refresh to disambiguate from deprecated MarketCatalog::refresh
+        let result = Refreshable::refresh(&catalog).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0, "Should skip refresh when cache is fresh");
+        
+        // Verify the lock was NOT acquired (still false)
+        assert!(!AUTO_REFRESH_IN_PROGRESS.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_refresh_skips_when_already_in_progress() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use crate::catalog::Refreshable;
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Create catalog with stale cache
+        let state = CatalogState {
+            markets: HashMap::new(),
+            diffs: vec![],
+            last_updated: now - 7200, // 2 hours ago - stale
+        };
+
+        let catalog = PolymarketCatalog {
+            inner: RwLock::new(state),
+            cache_path: "/tmp/test_in_progress.jsonl".to_string(),
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            stale_threshold_secs: 3600, // 1 hour threshold
+        };
+
+        // Simulate another refresh already in progress
+        AUTO_REFRESH_IN_PROGRESS.store(true, Ordering::SeqCst);
+
+        // Refresh should skip and return 0 because another refresh is in progress
+        // Use Refreshable::refresh to disambiguate from deprecated MarketCatalog::refresh
+        let result = Refreshable::refresh(&catalog).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0, "Should skip refresh when already in progress");
+        
+        // Clean up - reset the flag
+        AUTO_REFRESH_IN_PROGRESS.store(false, Ordering::SeqCst);
+    }
 }
