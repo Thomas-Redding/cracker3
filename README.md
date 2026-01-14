@@ -206,7 +206,7 @@ momentum_threshold = 0.02
 4. **Kelly Optimization**
    - Maximizes expected utility of terminal wealth
    - Supports log utility (Kelly) and CRRA (adjustable risk aversion)
-   - Uses Sobol sequences for quasi-random Monte Carlo
+   - Uses Halton sequences for quasi-random Monte Carlo
    - L-BFGS optimizer (via `argmin` library) for robust convergence
    - Smart rounding for exchange minimum order sizes (e.g., Polymarket's 5-share minimum)
 
@@ -491,7 +491,8 @@ src/
 │   ├── mod.rs           # Module exports
 │   ├── black_scholes.rs # BS pricing, norm_cdf, norm_ppf
 │   ├── vol_surface.rs   # VolSmile, VolatilitySurface, total variance interpolation
-│   └── distribution.rs  # ExpiryDistribution, PriceDistribution, PPF/CDF
+│   ├── distribution.rs  # ExpiryDistribution, PriceDistribution, PPF/CDF
+│   └── vol_time.rs      # Volatility-Weighted Time strategies
 ├── optimizer/
 │   ├── mod.rs           # Module exports
 │   ├── opportunity.rs   # Opportunity, OpportunityScanner
