@@ -146,10 +146,11 @@ impl PolymarketCatalog {
                     // No cache - must refresh synchronously or strategies won't find any markets
                     info!("PolymarketCatalog: No cache found, fetching markets...");
                     let _guard = AutoRefreshGuard::new(&AUTO_REFRESH_IN_PROGRESS);
-                    match Refreshable::refresh(catalog.as_ref()).await {
-                        Ok(count) => info!(
+                    // Call refresh_with_diff directly to bypass lock check in refresh()
+                    match catalog.refresh_with_diff().await {
+                        Ok(diff) => info!(
                             "PolymarketCatalog: Initial fetch complete, {} markets",
-                            count
+                            diff.change_count()
                         ),
                         Err(e) => error!("PolymarketCatalog: Initial fetch failed: {}", e),
                     }
@@ -160,10 +161,11 @@ impl PolymarketCatalog {
                     tokio::spawn(async move {
                         // Guard ensures flag is reset even if this task panics
                         let _guard = AutoRefreshGuard::new(&AUTO_REFRESH_IN_PROGRESS);
-                        match Refreshable::refresh(catalog_clone.as_ref()).await {
-                            Ok(count) => info!(
+                        // Call refresh_with_diff directly to bypass lock check in refresh()
+                        match catalog_clone.refresh_with_diff().await {
+                            Ok(diff) => info!(
                                 "PolymarketCatalog: Background refresh complete, {} changes",
-                                count
+                                diff.change_count()
                             ),
                             Err(e) => error!("PolymarketCatalog: Background refresh failed: {}", e),
                         }
