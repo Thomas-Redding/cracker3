@@ -5,6 +5,7 @@ use crate::traits::{ExecutionClient, MarketStream, SharedExecutionClient};
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -14,11 +15,41 @@ use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
 
+const DERIBIT_REST_URL: &str = "https://www.deribit.com/api/v2";
+
 /// Commands sent from the stream to the actor for dynamic subscription management.
 #[derive(Debug, Clone)]
 pub enum DeribitCommand {
     Subscribe(Vec<String>),
     Unsubscribe(Vec<String>),
+}
+
+// =============================================================================
+// REST API types for initial snapshot
+// =============================================================================
+
+/// Response from Deribit's get_book_summary_by_currency endpoint.
+#[derive(Debug, Deserialize)]
+struct BookSummaryResponse {
+    result: Vec<BookSummaryItem>,
+}
+
+/// Individual item from book summary (option ticker data).
+#[derive(Debug, Deserialize)]
+struct BookSummaryItem {
+    instrument_name: String,
+    #[serde(default)]
+    mark_iv: Option<f64>,
+    #[serde(default)]
+    bid_iv: Option<f64>,
+    #[serde(default)]
+    ask_iv: Option<f64>,
+    #[serde(default)]
+    underlying_price: Option<f64>,
+    #[serde(default)]
+    best_bid_price: Option<f64>,
+    #[serde(default)]
+    best_ask_price: Option<f64>,
 }
 
 pub struct DeribitStream {
@@ -139,24 +170,27 @@ impl DeribitActor {
                     // 1. Subscribe to all current instruments on connect/reconnect
                     if !current_subs.is_empty() {
                         let channels: Vec<String> = current_subs
-                        .iter()
-                        .map(|i| format!("ticker.{}.100ms", i))
-                        .collect();
+                            .iter()
+                            .map(|i| format!("ticker.{}.100ms", i))
+                            .collect();
 
-                    let subscribe_msg = json!({
-                        "jsonrpc": "2.0",
-                        "method": "public/subscribe",
-                        "id": 1,
-                        "params": {
-                            "channels": channels
-                        }
-                    });
+                        let subscribe_msg = json!({
+                            "jsonrpc": "2.0",
+                            "method": "public/subscribe",
+                            "id": 1,
+                            "params": {
+                                "channels": channels
+                            }
+                        });
 
-                    if let Err(e) = write.send(Message::Text(subscribe_msg.to_string())).await {
+                        if let Err(e) = write.send(Message::Text(subscribe_msg.to_string())).await {
                             error!("Deribit: Failed to send subscription: {}", e);
-                        continue; // Reconnect loop
+                            continue; // Reconnect loop
                         }
                         info!("Deribit: Subscribed to {} instruments on connect", current_subs.len());
+
+                        // 2. Fetch initial snapshot via REST to populate data immediately
+                        Self::fetch_initial_snapshot(&self.tx, &current_subs).await;
                     }
 
                     // 2. Process Loop with command handling
@@ -223,8 +257,14 @@ impl DeribitActor {
                                             break; // Reconnect
                                         }
                                         
+                                        // Add to current subs before fetching snapshot
+                                        let new_subs_set: HashSet<String> = new_instruments.iter().cloned().collect();
+                                        current_subs.extend(new_instruments.clone());
+                                        
                                         info!("Deribit: Subscribed to {} new instruments", new_instruments.len());
-                                        current_subs.extend(new_instruments);
+                                        
+                                        // Fetch initial snapshot for newly subscribed instruments
+                                        Self::fetch_initial_snapshot(&self.tx, &new_subs_set).await;
                                     }
                                     Some(DeribitCommand::Unsubscribe(instruments)) => {
                                         // Filter to only currently subscribed instruments
@@ -291,6 +331,75 @@ impl DeribitActor {
         if let Some(iv) = data.ask_iv {
             data.ask_iv = Some(iv / 100.0);
         }
+    }
+
+    /// Fetches initial ticker snapshot via REST API for all BTC options.
+    /// This provides immediate data on connect instead of waiting for WebSocket updates.
+    async fn fetch_initial_snapshot(
+        tx: &mpsc::Sender<DeribitTickerData>,
+        subscribed_instruments: &HashSet<String>,
+    ) {
+        let url = format!(
+            "{}/public/get_book_summary_by_currency?currency=BTC&kind=option",
+            DERIBIT_REST_URL
+        );
+
+        let client = reqwest::Client::new();
+        let response = match client.get(&url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                warn!("Deribit: Failed to fetch initial snapshot: {}", e);
+                return;
+            }
+        };
+
+        if !response.status().is_success() {
+            warn!("Deribit: Snapshot API returned status {}", response.status());
+            return;
+        }
+
+        let data: BookSummaryResponse = match response.json().await {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("Deribit: Failed to parse snapshot response: {}", e);
+                return;
+            }
+        };
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut sent_count = 0;
+
+        for item in data.result {
+            // Only send data for instruments we're subscribed to
+            if !subscribed_instruments.contains(&item.instrument_name) {
+                continue;
+            }
+
+            // Convert to DeribitTickerData format
+            let mut ticker = DeribitTickerData {
+                instrument_name: item.instrument_name,
+                timestamp: now_ms,
+                best_bid_price: item.best_bid_price,
+                best_ask_price: item.best_ask_price,
+                greeks: None, // Book summary doesn't include greeks
+                mark_iv: item.mark_iv,
+                bid_iv: item.bid_iv,
+                ask_iv: item.ask_iv,
+                underlying_price: item.underlying_price,
+                index_price: None,
+            };
+
+            // Normalize IVs (Deribit returns percentages)
+            Self::normalize_ivs(&mut ticker);
+
+            if tx.send(ticker).await.is_err() {
+                warn!("Deribit: Receiver dropped during snapshot");
+                return;
+            }
+            sent_count += 1;
+        }
+
+        info!("Deribit: Loaded {} tickers from REST snapshot", sent_count);
     }
 }
 

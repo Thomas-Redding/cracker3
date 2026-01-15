@@ -46,6 +46,21 @@ cargo run -- --mode backtest \
 cargo run -- --mode backtest --file data.jsonl --realtime --speed 2.0
 ```
 
+### Logging
+
+Set `RUST_LOG` to see log output:
+
+```bash
+# Show all logs at info level
+RUST_LOG=info cargo run -- --config config.toml --dashboard 8079
+
+# Show only trading_bot logs (less noisy)
+RUST_LOG=trading_bot=info cargo run -- --config config.toml --dashboard 8079
+
+# Debug level for a specific module
+RUST_LOG=trading_bot::connectors::deribit=debug cargo run -- --config config.toml
+```
+
 ## 📊 Backtest Reporting
 
 When running in backtest mode, the engine provides:

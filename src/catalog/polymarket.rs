@@ -10,7 +10,7 @@ use super::{
     TokenInfo, DEFAULT_MARKET_STALE_THRESHOLD_SECS,
 };
 use async_trait::async_trait;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -146,10 +146,11 @@ impl PolymarketCatalog {
                     // No cache - must refresh synchronously or strategies won't find any markets
                     info!("PolymarketCatalog: No cache found, fetching markets...");
                     let _guard = AutoRefreshGuard::new(&AUTO_REFRESH_IN_PROGRESS);
-                    match Refreshable::refresh(catalog.as_ref()).await {
-                        Ok(count) => info!(
+                    // Call refresh_with_diff directly to bypass lock check in refresh()
+                    match catalog.refresh_with_diff().await {
+                        Ok(diff) => info!(
                             "PolymarketCatalog: Initial fetch complete, {} markets",
-                            count
+                            diff.change_count()
                         ),
                         Err(e) => error!("PolymarketCatalog: Initial fetch failed: {}", e),
                     }
@@ -160,10 +161,11 @@ impl PolymarketCatalog {
                     tokio::spawn(async move {
                         // Guard ensures flag is reset even if this task panics
                         let _guard = AutoRefreshGuard::new(&AUTO_REFRESH_IN_PROGRESS);
-                        match Refreshable::refresh(catalog_clone.as_ref()).await {
-                            Ok(count) => info!(
+                        // Call refresh_with_diff directly to bypass lock check in refresh()
+                        match catalog_clone.refresh_with_diff().await {
+                            Ok(diff) => info!(
                                 "PolymarketCatalog: Background refresh complete, {} changes",
-                                count
+                                diff.change_count()
                             ),
                             Err(e) => error!("PolymarketCatalog: Background refresh failed: {}", e),
                         }
@@ -406,6 +408,26 @@ impl PolymarketCatalog {
 #[async_trait]
 impl Refreshable for PolymarketCatalog {
     async fn refresh(&self) -> Result<usize, String> {
+        // Skip refresh if cache is still fresh (default: 24 hours)
+        // Polymarket has 300k+ markets and takes 5+ minutes to fetch
+        if !self.is_stale() {
+            debug!("PolymarketCatalog: Skipping refresh, cache is fresh");
+            return Ok(0);
+        }
+
+        // Check if a refresh is already in progress
+        if AUTO_REFRESH_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            debug!("PolymarketCatalog: Skipping refresh, already in progress");
+            return Ok(0);
+        }
+
+        // Guard ensures flag is reset even if refresh fails/panics
+        let _guard = AutoRefreshGuard::new(&AUTO_REFRESH_IN_PROGRESS);
+        
+        info!("PolymarketCatalog: Cache is stale, refreshing...");
         let diff = self.refresh_with_diff().await?;
         Ok(diff.change_count())
     }
@@ -1031,5 +1053,85 @@ mod tests {
         assert!((market.round_to_tick(0.555) - 0.56).abs() < 1e-9);
         assert!((market.round_to_tick(0.554) - 0.55).abs() < 1e-9);
         assert!((market.round_to_tick(0.50) - 0.50).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_skips_when_cache_is_fresh() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use crate::catalog::Refreshable;
+        
+        // Reset the global flag to ensure clean test state
+        AUTO_REFRESH_IN_PROGRESS.store(false, Ordering::SeqCst);
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Create catalog with fresh cache (updated just now)
+        let state = CatalogState {
+            markets: HashMap::new(),
+            diffs: vec![],
+            last_updated: now, // Fresh - just updated
+        };
+
+        let catalog = PolymarketCatalog {
+            inner: RwLock::new(state),
+            cache_path: "/tmp/test_fresh.jsonl".to_string(),
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            stale_threshold_secs: 3600, // 1 hour threshold
+        };
+
+        // Refresh should skip and return 0 because cache is fresh
+        // Use Refreshable::refresh to disambiguate from deprecated MarketCatalog::refresh
+        let result = Refreshable::refresh(&catalog).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0, "Should skip refresh when cache is fresh");
+        
+        // Verify the lock was NOT acquired (still false)
+        assert!(!AUTO_REFRESH_IN_PROGRESS.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_refresh_skips_when_already_in_progress() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use crate::catalog::Refreshable;
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Create catalog with stale cache
+        let state = CatalogState {
+            markets: HashMap::new(),
+            diffs: vec![],
+            last_updated: now - 7200, // 2 hours ago - stale
+        };
+
+        let catalog = PolymarketCatalog {
+            inner: RwLock::new(state),
+            cache_path: "/tmp/test_in_progress.jsonl".to_string(),
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            stale_threshold_secs: 3600, // 1 hour threshold
+        };
+
+        // Simulate another refresh already in progress
+        AUTO_REFRESH_IN_PROGRESS.store(true, Ordering::SeqCst);
+
+        // Refresh should skip and return 0 because another refresh is in progress
+        // Use Refreshable::refresh to disambiguate from deprecated MarketCatalog::refresh
+        let result = Refreshable::refresh(&catalog).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0, "Should skip refresh when already in progress");
+        
+        // Clean up - reset the flag
+        AUTO_REFRESH_IN_PROGRESS.store(false, Ordering::SeqCst);
     }
 }
