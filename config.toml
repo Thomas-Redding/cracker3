@@ -23,7 +23,11 @@ max_time_to_expiry = 0.5       # 6 months max
 max_expiry_days = 90           # Discovery window for instruments
 initial_wealth = 10000.0       # Bankroll for Kelly sizing ($10k)
 risk_aversion = 1.0            # 1.0 = Kelly, 2.0 = half-Kelly, etc.
-n_scenarios = 10000            # Monte Carlo scenarios
+n_scenarios = 500              # Monte Carlo scenarios (reduced for faster backtests; use 10000 for live)
+
+# How often to recalculate opportunities (in simulated seconds)
+# For backtests: use 300-600 for speed. For live: use 60 for responsiveness.
+recalc_interval_secs = 300
 
 # Regex pattern for auto-discovering Polymarket BTC price markets
 # This matches slugs like "bitcoin-above-100000-on-december-31"

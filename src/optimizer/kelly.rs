@@ -446,6 +446,7 @@ impl KellyOptimizer {
 
         // Generate correlated scenarios
         let scenarios = self.generate_scenarios(opportunities, distribution, now_ms);
+        info!("Kelly: Generated {} scenarios", scenarios.len());
         
         if scenarios.is_empty() {
             info!("KellyOptimizer: No valid scenarios generated");
@@ -462,6 +463,7 @@ impl KellyOptimizer {
 
         // Pre-compute P&L matrix for efficiency
         let pnl_matrix = PnlMatrix::new(&scenarios, opportunities);
+        info!("Kelly: PnL matrix built");
         
         // Clone for use after optimization (since KellyProblem takes ownership)
         let pnl_matrix_for_rounding = pnl_matrix.clone();
@@ -484,8 +486,12 @@ impl KellyOptimizer {
             .collect();
 
         // Run L-BFGS optimization
+        info!("Kelly: Starting L-BFGS...");
         let sizes = match self.run_lbfgs(problem, init_sizes) {
-            Ok(result) => result,
+            Ok(result) => {
+                info!("Kelly: L-BFGS success");
+                result
+            },
             Err(e) => {
                 warn!("KellyOptimizer: L-BFGS failed: {}. Using initial sizes.", e);
                 opportunities.iter()
@@ -499,10 +505,12 @@ impl KellyOptimizer {
 
         // Post-process: project onto constraints
         let mut final_sizes = self.project_onto_constraints(&sizes, opportunities);
+        info!("Kelly: Constraints projected");
 
         // Apply smart rounding to handle minimum order size constraints
         // This optimizes the rounding decisions to maximize expected utility
         self.apply_smart_rounding(&mut final_sizes, opportunities, &pnl_matrix_for_rounding);
+        info!("Kelly: Smart rounding complete");
 
         // Compute final statistics
         self.build_result(opportunities, &final_sizes, &scenarios)

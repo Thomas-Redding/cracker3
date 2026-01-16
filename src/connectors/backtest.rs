@@ -148,9 +148,15 @@ impl MarketStream for HistoricalStream {
                 let processed_mb = state.processed_bytes as f64 / 1024.0 / 1024.0;
                 let total_mb = state.total_size_bytes as f64 / 1024.0 / 1024.0;
                 
+                let time_str = state.last_timestamp
+                    .map(|ts| chrono::DateTime::from_timestamp(ts / 1000, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or("?".to_string()))
+                    .unwrap_or("Start".to_string());
+
                 // Use \r to overwrite line for cleaner progress
-                eprint!("\r[progress] {:.1}% complete ({:.1} MB / {:.1} MB)", 
-                    pct, processed_mb, total_mb);
+                eprint!("\r[progress] {:.1}% complete ({:.1} MB / {:.1} MB) @ {}", 
+                    pct, processed_mb, total_mb, time_str);
                 // Flush to ensure it prints
                 use std::io::Write;
                 let _ = std::io::stderr().flush();

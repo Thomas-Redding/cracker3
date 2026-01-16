@@ -60,6 +60,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "info");
+    }
     env_logger::init();
     let args = Args::parse();
 
@@ -442,7 +445,7 @@ async fn run_backtest_mode(args: &Args) {
             
             let filename = format!("backtest_results/{}_history.csv", strategy.name().replace(" ", "_"));
             // Simple CSV write without pulling in csv crate
-            let mut content = "timestamp,expected_utility,expected_return,prob_loss,total_positions,total_value\n".to_string();
+            let mut content = "timestamp,expected_utility,expected_return,prob_loss,total_positions,total_value,realized_pnl,total_equity\n".to_string();
             
             for point in history {
                 let ts = point.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -451,8 +454,10 @@ async fn run_backtest_mode(args: &Args) {
                 let prob = point.get("prob_loss").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let pos = point.get("total_positions").and_then(|v| v.as_u64()).unwrap_or(0);
                 let val = point.get("total_value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let pnl = point.get("realized_pnl").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let equity = point.get("total_equity").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 
-                content.push_str(&format!("{},{:.6},{:.6},{:.6},{},{:.2}\n", ts, util, ret, prob, pos, val));
+                content.push_str(&format!("{},{:.6},{:.6},{:.6},{},{:.2},{:.2},{:.2}\n", ts, util, ret, prob, pos, val, pnl, equity));
             }
             
             if let Ok(_) = std::fs::write(&filename, content) {
