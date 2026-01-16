@@ -1126,6 +1126,8 @@ impl CrossMarketStrategy {
         let portfolio = if let Some(dist) = distribution {
             optimizer.optimize(&opportunities, &dist, now_ms)
         } else {
+            let mut state = self.state.write().await;
+            state.last_recalc = now_ms;
             return;
         };
     
