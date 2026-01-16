@@ -43,6 +43,7 @@ rust_decimal = "1.39"
 # Optimization
 argmin = "0.10"
 argmin-math = { version = "0.4", features = ["vec"] }
+uuid = { version = "1.19.0", features = ["v4"] }
 
 [profile.dev]
 # Raspberry Pi can OOM during linking when full debuginfo is enabled.

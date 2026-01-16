@@ -1,6 +1,6 @@
 // src/connectors/backtest.rs
 
-use crate::models::{Instrument, MarketEvent, Order, OrderId};
+use crate::models::{Instrument, MarketEvent, Order, OrderId, Position};
 use crate::traits::{ExecutionClient, MarketStream, SharedExecutionClient};
 use async_trait::async_trait;
 use std::collections::VecDeque;
@@ -362,6 +362,23 @@ impl ExecutionClient for MockExec {
         log::info!("BACKTEST: Filled order for {:?}", order);
         self.inner.fills.lock().await.push(order);
         Ok("mock_ord_1".to_string())
+    }
+
+    async fn cancel_order(&self, _order_id: &OrderId, _instrument: &Instrument) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn get_position(&self, _instrument: &Instrument) -> Result<Position, String> {
+        // Return a zero position for testing if needed, or Err
+        Err("Not implemented in MockExec".to_string())
+    }
+
+    async fn get_positions(&self) -> Result<Vec<Position>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn get_balance(&self) -> Result<f64, String> {
+        Ok(1_000_000.0) // Return a default large balance for tests
     }
 }
 

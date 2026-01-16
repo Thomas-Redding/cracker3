@@ -142,28 +142,11 @@ struct CrossMarketState {
     deribit_subscriptions: HashSet<String>,
     /// Derive instruments we're subscribed to
     derive_subscriptions: HashSet<String>,
-    /// PnL history
-    history: Vec<HistoryPoint>,
     /// Event counter for throttling logs
     event_counter: usize,
-    /// Simulated cash balance
-    simulated_cash: f64,
-    /// Simulated positions (opportunity_id -> quantity)
-    simulated_positions: HashMap<String, f64>,
 }
 
-/// Point in time for PnL history.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HistoryPoint {
-    pub timestamp: i64,
-    pub expected_utility: f64,
-    pub expected_return: f64,
-    pub prob_loss: f64,
-    pub total_positions: usize,
-    pub total_value: f64,
-    pub realized_pnl: f64,
-    pub total_equity: f64,
-}
+
 
 impl Default for CrossMarketState {
     fn default() -> Self {
@@ -181,10 +164,7 @@ impl Default for CrossMarketState {
             log: VecDeque::with_capacity(MAX_LOG_ENTRIES),
             deribit_subscriptions: HashSet::new(),
             derive_subscriptions: HashSet::new(),
-            history: Vec::new(),
             event_counter: 0,
-            simulated_cash: 10_000.0, // Default start
-            simulated_positions: HashMap::new(),
         }
     }
 }
@@ -277,11 +257,7 @@ impl CrossMarketStrategy {
         Arc::new(Self {
             name: name.into(),
             config: config.clone(), // Clone config to use it
-            state: RwLock::new({
-                let mut s = CrossMarketState::default();
-                s.simulated_cash = config.kelly_config.initial_wealth;
-                s
-            }),
+            state: RwLock::new(CrossMarketState::default()),
             exec,
             scanner,
             polymarket_catalog: None,
@@ -308,11 +284,7 @@ impl CrossMarketStrategy {
         Arc::new(Self {
             name: name.into(),
             config: config.clone(),
-            state: RwLock::new({
-                let mut s = CrossMarketState::default();
-                s.simulated_cash = config.kelly_config.initial_wealth;
-                s
-            }),
+            state: RwLock::new(CrossMarketState::default()),
             exec,
             scanner,
             polymarket_catalog,
@@ -1087,13 +1059,19 @@ impl CrossMarketStrategy {
     /// 
     /// Assets (Long positions) add to value.
     /// Liabilities (Short positions) subtract from value.
-    fn calculate_holdings_value(&self, state: &CrossMarketState, opportunities: &[Opportunity], now_ms: i64) -> f64 {
+    fn calculate_holdings_value(
+        &self, 
+        current_positions: &HashMap<String, f64>, 
+        opportunities: &[Opportunity], 
+        now_ms: i64, 
+        state: &CrossMarketState // Still need state for fallback pricing fallback (tickers)
+    ) -> f64 {
         let opp_map: HashMap<&String, &Opportunity> = opportunities.iter()
             .map(|o| (&o.id, o))
             .collect();
 
         let mut holdings_value = 0.0;
-        for (opp_id, qty) in &state.simulated_positions {
+        for (opp_id, qty) in current_positions {
             if *qty == 0.0 { continue; }
             
             let val = if let Some(opp) = opp_map.get(opp_id) {
@@ -1108,8 +1086,6 @@ impl CrossMarketStrategy {
                 
                 // Direction inference
                 let is_short_generated_id = opp_id.ends_with("_sell") || opp_id.ends_with("_spread");
-                // Note: We might want a more robust way to track direction if IDs change,
-                // but for now this matches rebalance_portfolio logic.
                 
                 if is_short_generated_id {
                     -*qty * price
@@ -1123,10 +1099,49 @@ impl CrossMarketStrategy {
         holdings_value
     }
 
+    /// Helper to convert ExecutionClient positions to Opportunity ID -> Quantity map.
+    async fn get_opportunity_positions(&self) -> HashMap<String, f64> {
+        let positions = match self.exec.get_positions().await {
+            Ok(p) => p,
+            Err(e) => {
+                error!("Failed to get positions: {}", e);
+                return HashMap::new();
+            }
+        };
+
+        let state = self.state.read().await;
+        let mut opp_positions = HashMap::new();
+
+        for pos in positions {
+            if pos.quantity == 0.0 { continue; }
+
+            match pos.instrument {
+                Instrument::Deribit(name) | Instrument::Derive(name) => {
+                    if pos.quantity > 0.0 {
+                        opp_positions.insert(format!("{}_buy", name), pos.quantity);
+                    } else if pos.quantity < 0.0 {
+                        opp_positions.insert(format!("{}_sell", name), -pos.quantity);
+                    }
+                },
+                Instrument::Polymarket(token) => {
+                    if let Some(key) = state.token_to_market_key.get(&token) {
+                        if let Some(m) = state.polymarket_markets.get(key) {
+                            if m.yes_token_id == token {
+                                opp_positions.insert(format!("{}_yes", key), pos.quantity);
+                            } else if m.no_token_id == token {
+                                opp_positions.insert(format!("{}_no", key), pos.quantity);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        opp_positions
+    }
+
     /// Optimizes the portfolio using Kelly criterion.
 
 
-    /// Performs a full recalculation cycle.
     /// Performs a full recalculation cycle.
     async fn recalculate(&self, now_ms: i64) {
         let start = std::time::Instant::now();
@@ -1150,16 +1165,28 @@ impl CrossMarketStrategy {
         info!("Recalc: Scanning opportunities...");
         self.scan_opportunities(now_ms).await;
         
-
-        
         // PnL Tracking & Portfolio Optimization
+        
+        // 0. Fetch current state (Positions & Balance)
+        // We do this outside the lock to avoid holding it during async calls
+        let current_positions_map = self.get_opportunity_positions().await;
+        
+        let mut balance = 0.0;
+        for exchange in self.exec.exchanges() {
+            if let Ok(b) = self.exec.get_balance(exchange).await {
+                balance += b;
+            } else {
+                warn!("Failed to get balance for {:?}", exchange);
+            }
+        }
+        
         // 1. Calculate current equity and create compounding optimizer
         let (_current_equity, optimizer, opportunities, distribution) = {
             let state = self.state.read().await;
             
-            let holdings_value = self.calculate_holdings_value(&state, &state.opportunities, now_ms);
+            let holdings_value = self.calculate_holdings_value(&current_positions_map, &state.opportunities, now_ms, &state);
             
-            let equity = state.simulated_cash + holdings_value;
+            let equity = balance + holdings_value;
             
             // Create new optimizer with updated wealth for compounding
             let mut kelly_config = self.config.kelly_config.clone();
@@ -1184,42 +1211,28 @@ impl CrossMarketStrategy {
             return;
         };
     
-        // 3. Rebalance Simulated Portfolio
-        // 3. Rebalance & 4. Stats
+        // 3. Rebalance Portfolio
         let expected_utility = portfolio.expected_utility;
         let expected_return = portfolio.expected_return;
         let prob_loss = portfolio.prob_loss;
         let n_opps = opportunities.len();
         
+        // Rebalance
+        self.rebalance_portfolio(&current_positions_map, &portfolio.positions, &opportunities).await;
+        
+        // 4. Update Strategy State with Portfolio & Last Recalc
         {
             let mut state = self.state.write().await;
-            self.rebalance_portfolio(&mut state, &portfolio.positions, &opportunities, now_ms);
-            
             state.portfolio = Some(portfolio);
-
-            // 4. Calculate Final Stats (inside lock)
-            // Re-build price map for valuation
-            let n_positions = state.simulated_positions.len();
-            let final_holdings_value = self.calculate_holdings_value(&state, &opportunities, now_ms);
-            let final_equity = state.simulated_cash + final_holdings_value;
-            let initial_wealth = self.config.kelly_config.initial_wealth;
-        
             state.last_recalc = now_ms;
-            state.history.push(HistoryPoint {
-                timestamp: now_ms,
-                expected_utility,
-                expected_return,
-                prob_loss,
-                total_positions: n_positions,
-                total_value: final_holdings_value,
-                realized_pnl: final_equity - initial_wealth,
-                total_equity: final_equity,
-            });
-        
+            
+            // Note: We don't update history here anymore as the strategy doesn't own PnL history.
+            // The backtest runner or a separate metrics tracker should handle that.
+            
             let duration = start.elapsed();
             let msg = format!(
-                "Recalc ({:?}): {} opps, {} pos, Equity=${:.2} (PnL ${:+.2})", 
-                duration, n_opps, n_positions, final_equity, final_equity - initial_wealth
+                "Recalc ({:?}): {} opps, Equity=${:.2}", 
+                duration, n_opps, _current_equity
             );
             
             state.log.push_back(LogEntry {
@@ -1235,6 +1248,11 @@ impl CrossMarketStrategy {
 
     /// Processes a Deribit market event.
     async fn handle_deribit_event(&self, event: &MarketEvent, instrument_name: &str) {
+        // Ignore updates with no price data
+        if event.best_bid.is_none() && event.best_ask.is_none() {
+            return;
+        }
+
         // Parse instrument for strike and expiry
         let parts: Vec<&str> = instrument_name.split('-').collect();
         if parts.len() < 4 {
@@ -1272,6 +1290,11 @@ impl CrossMarketStrategy {
 
     /// Processes a Derive market event.
     async fn handle_derive_event(&self, event: &MarketEvent, instrument_name: &str) {
+        // Ignore updates with no price data (prevents overwriting valid state with None)
+        if event.best_bid.is_none() && event.best_ask.is_none() {
+            return;
+        }
+
         // Parse instrument
         let parts: Vec<&str> = instrument_name.split('-').collect();
         if parts.len() < 4 {
@@ -1353,90 +1376,161 @@ impl CrossMarketStrategy {
     }
 
     /// Rebalances the portfolio based on optimizer target positions.
-    fn rebalance_portfolio(
+    async fn rebalance_portfolio(
         &self,
-        state: &mut CrossMarketState,
-        positions: &[crate::optimizer::kelly::PositionAllocation],
+        current_positions: &HashMap<String, f64>,
+        target_positions: &[crate::optimizer::kelly::PositionAllocation],
         opportunities: &[Opportunity],
-        now_ms: i64,
     ) {
-        // Build map of ID -> Opportunity for direction lookup
+        // Build map of ID -> Opportunity
         let opp_map: HashMap<&String, &Opportunity> = opportunities.iter()
             .map(|o| (&o.id, o))
             .collect();
 
-        // Build price map for value calculations
-        let price_map: HashMap<&String, f64> = opportunities.iter()
-            .map(|o| (&o.id, o.market_price))
-            .collect();
-            
-        // Execute buys/sells for target positions
-        for pos in positions {
-            let old_qty = state.simulated_positions.get(&pos.opportunity_id).copied().unwrap_or(0.0);
+        // 1. Execute target positions
+        for pos in target_positions {
+            let old_qty = current_positions.get(&pos.opportunity_id).copied().unwrap_or(0.0);
             let needed = pos.size - old_qty;
             
             if needed.abs() > 1e-6 {
-                 let price = price_map.get(&pos.opportunity_id).copied().unwrap_or(0.0);
-                 
-                 // Determine flow direction (Buy = -1.0, Sell = +1.0)
-                 let flow_mult = if let Some(opp) = opp_map.get(&pos.opportunity_id) {
-                     match opp.direction {
-                         crate::optimizer::opportunity::TradeDirection::Buy => -1.0,
-                         crate::optimizer::opportunity::TradeDirection::Sell => 1.0,
-                     }
-                 } else {
-                     // Fallback based on ID naming convention
-                     if pos.opportunity_id.ends_with("_sell") || pos.opportunity_id.ends_with("_spread") {
-                         1.0
-                     } else {
-                         -1.0
-                     }
-                 };
-                 
-                 // cash_change = needed * price * flow_mult
-                 // If Sell (1.0): Opening (needed > 0) -> adds cash. Correct.
-                 // If Buy (-1.0): Opening (needed > 0) -> removes cash. Correct.
-                 state.simulated_cash += needed * price * flow_mult;
-                 state.simulated_positions.insert(pos.opportunity_id.clone(), pos.size);
-            }
-        }
-        
-        // Close positions not in new portfolio
-        let new_pos_ids: HashSet<&String> = positions.iter().map(|p| &p.opportunity_id).collect();
-        // Clone keys to avoid borrow check issues
-        let old_pos_ids: Vec<String> = state.simulated_positions.keys().cloned().collect();
-        
-        for id in old_pos_ids {
-            if !new_pos_ids.contains(&id) {
-                let old_qty = state.simulated_positions.get(&id).copied().unwrap_or(0.0);
-                if old_qty.abs() > 1e-6 {
-                    let price = price_map.get(&id).copied().unwrap_or_else(|| {
-                        self.get_fallback_price(&id, state, now_ms)
-                    });
-                    
-                    // Determine flow direction
-                    let flow_mult = if let Some(opp) = opp_map.get(&id) {
-                        match opp.direction {
-                            crate::optimizer::opportunity::TradeDirection::Buy => -1.0,
-                            crate::optimizer::opportunity::TradeDirection::Sell => 1.0,
-                        }
-                    } else {
-                if id.ends_with("_sell") || id.ends_with("_spread") {
-                            1.0
-                        } else {
-                            -1.0
-                        }
-                    };
+                if let Some(mut instrument) = self.get_instrument_for_opp(&pos.opportunity_id, &opp_map).await {
+                     // Determine order side
+                     // If opp is BUY/LONG and needed > 0 -> BUY
+                     // If opp is BUY/LONG and needed < 0 -> SELL
+                     // If opp is SELL/SHORT and needed > 0 -> SELL (Increase Short)
+                     // If opp is SELL/SHORT and needed < 0 -> BUY (Decrease Short)
+                     
+                     let opp = opp_map.get(&pos.opportunity_id);
+                     let is_sell_opp = match opp {
+                         Some(o) => o.direction == crate::optimizer::opportunity::TradeDirection::Sell,
+                         None => pos.opportunity_id.ends_with("_sell") || pos.opportunity_id.ends_with("_spread"),
+                     };
 
-                    // We are closing, so "needed" is -old_qty
-                    // cash_change = (-old_qty) * price * flow_mult
-                    // If Sell (1.0): Closing (old_qty > 0) -> removes cash. Correct (Buying back).
-                    // If Buy (-1.0): Closing (old_qty > 0) -> adds cash. Correct (Selling).
-                    state.simulated_cash += (-old_qty) * price * flow_mult;
-                    state.simulated_positions.remove(&id);
+                     let (side, qty_abs) = if is_sell_opp {
+                         // Being Short.
+                         if needed > 0.0 {
+                             (crate::models::OrderSide::Sell, needed.abs())
+                         } else {
+                             (crate::models::OrderSide::Buy, needed.abs())
+                         }
+                     } else {
+                         // Being Long.
+                         if needed > 0.0 {
+                             (crate::models::OrderSide::Buy, needed.abs())
+                         } else {
+                             (crate::models::OrderSide::Sell, needed.abs())
+                         }
+                     };
+                     
+                     let order = crate::models::Order::market(instrument, side, qty_abs);
+                     if let Err(e) = self.exec.place_order(order).await {
+                         error!("Failed to place order for {}: {}", pos.opportunity_id, e);
+                     }
+                } else {
+                    warn!("Could not determine instrument for opportunity: {}", pos.opportunity_id);
                 }
             }
         }
+        
+        // 2. Close positions not in new portfolio (if they exist in current)
+        let new_pos_ids: HashSet<&String> = target_positions.iter().map(|p| &p.opportunity_id).collect();
+        // To safely iterate and modify, we collect keys first
+        let old_pos_ids: Vec<&String> = current_positions.keys().collect();
+        
+        for id in old_pos_ids {
+            if !new_pos_ids.contains(id) {
+                let old_qty = current_positions.get(id).copied().unwrap_or(0.0);
+                if old_qty.abs() > 1e-6 {
+                    // We need to close this position. needed = -old_qty (target 0)
+                    // Logic similar to above
+                    // We need Opportunity info to know instrument.
+                    // But if opp is not in current scan, we might fail to map ID -> Instrument.
+                    // We need fallback mapping logic based on ID string.
+                    
+                    if let Some(instrument) = self.resolve_instrument_from_id(id).await {
+                        let is_sell_opp = id.ends_with("_sell") || id.ends_with("_spread"); // Fallback inference
+                        
+                        let needed = -old_qty;
+                        let (side, qty_abs) = if is_sell_opp {
+                             if needed > 0.0 { (crate::models::OrderSide::Sell, needed.abs()) }
+                             else { (crate::models::OrderSide::Buy, needed.abs()) }
+                        } else {
+                             if needed > 0.0 { (crate::models::OrderSide::Buy, needed.abs()) }
+                             else { (crate::models::OrderSide::Sell, needed.abs()) }
+                        };
+                        
+                        let order = crate::models::Order::market(instrument, side, qty_abs);
+                        if let Err(e) = self.exec.place_order(order).await {
+                            error!("Failed to close position {}: {}", id, e);
+                        }
+                    } else {
+                        warn!("Could not resolve instrument to close position: {}", id);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Helper to resolve instrument
+    async fn get_instrument_for_opp(&self, opp_id: &str, opp_map: &HashMap<&String, &Opportunity>) -> Option<Instrument> {
+        if let Some(opp) = opp_map.get(&opp_id.to_string()) {
+            // Reconstruct instrument from opp info
+            if let Some(token) = &opp.token_id {
+                return Some(Instrument::Polymarket(token.clone()));
+            } else if !opp.instrument_id.is_empty() {
+                if opp.exchange == "deribit" {
+                    return Some(Instrument::Deribit(opp.instrument_id.clone()));
+                } else {
+                    return Some(Instrument::Derive(opp.instrument_id.clone()));
+                }
+            }
+        }
+        // Fallback
+        self.resolve_instrument_from_id(opp_id).await
+    }
+    
+    async fn resolve_instrument_from_id(&self, opp_id: &str) -> Option<Instrument> {
+        if opp_id.contains("_yes") { 
+            if let Some(condition_id) = opp_id.strip_suffix("_yes") {
+                let state = self.state.read().await;
+                if let Some(market) = state.polymarket_markets.get(condition_id) {
+                    return Some(Instrument::Polymarket(market.yes_token_id.clone()));
+                }
+            }
+        } else if opp_id.contains("_no") {
+             if let Some(condition_id) = opp_id.strip_suffix("_no") {
+                 let state = self.state.read().await;
+                if let Some(market) = state.polymarket_markets.get(condition_id) {
+                    return Some(Instrument::Polymarket(market.no_token_id.clone()));
+                }
+            }
+        } else {
+            // Try stripping suffix
+            let base = if let Some(stripped) = opp_id.strip_suffix("_buy") { stripped }
+                       else if let Some(stripped) = opp_id.strip_suffix("_sell") { stripped }
+                       else { return None };
+                       
+            // Assume Derive/Deribit based on name format? 
+            // Deribit usually has -C/P? Derive too.
+            // But we can check subscriptions or simple heuristics.
+            // Or try both/either. Instrument::Deribit vs Derive.
+            // Scanner puts instrument_name directly in suffix.
+            // If it was scanned as Derive, it is Derive.
+            // But here we don't know exchange effectively without opp.
+            // Assume Derive for now as it's the primary target for vanilla options in this strat?
+            // Actually config defaults to both.
+            // We can check `state.deribit_tickers` or `derive_tickers` to see where it exists.
+            let state = self.state.read().await;
+            if state.deribit_tickers.contains_key(base) {
+                return Some(Instrument::Deribit(base.to_string()));
+            }
+            if state.derive_tickers.contains_key(base) {
+                return Some(Instrument::Derive(base.to_string()));
+            }
+            // Fallback: if not found, maybe default to Derive?
+             return Some(Instrument::Derive(base.to_string()));
+        }
+        None
     }
 
     /// Updates Polymarket prices (called from external data source).
@@ -1532,19 +1626,6 @@ impl Dashboard for CrossMarketStrategy {
             "max_drawdown": format!("{:.1}%", p.max_drawdown * 100.0),
         }));
 
-        let history: Vec<Value> = state.history.iter()
-            .map(|h| json!({
-                "timestamp": h.timestamp,
-                "expected_return": h.expected_return,
-                "expected_utility": h.expected_utility,
-                "prob_loss": h.prob_loss,
-                "total_positions": h.total_positions,
-                "total_value": h.total_value,
-            "realized_pnl": h.realized_pnl,
-            "total_equity": h.total_equity,
-        }))
-        .collect();
-
         // Build IV chart data from the volatility surface
         // Each point includes strike, IV, and expiry label for multi-series display
         let mut iv_chart_data: Vec<Value> = Vec::new();
@@ -1581,7 +1662,6 @@ impl Dashboard for CrossMarketStrategy {
             "last_recalc": state.last_recalc,
             "log": state.log.iter().collect::<Vec<_>>(),
             "iv_chart": iv_chart_data,
-            "history": history,
         })
     }
 
@@ -2028,6 +2108,7 @@ pub async fn setup_derive_subscriptions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ExecutionClient;
     use crate::catalog::{MarketInfo, TokenInfo};
     use crate::traits::ExecutionRouter;
 
@@ -2544,15 +2625,21 @@ mod tests {
         use std::collections::HashMap;
         use crate::optimizer::opportunity::{Opportunity, OpportunityType, TradeDirection};
         use crate::optimizer::kelly::PositionAllocation;
+        use crate::simulation::execution::SimulatedExecutionClient;
         
-        // Use default execution router mock/dummy if possible or existing one
-        use crate::traits::ExecutionRouter;
-        let exec = Arc::new(ExecutionRouter::empty());
+        // 1. Setup Simulation Client
+        let sim_client =  Arc::new(SimulatedExecutionClient::new(100_000.0));
+        let exec = Arc::new(ExecutionRouter::new(
+            std::collections::HashMap::from([
+                (Exchange::Derive, sim_client.clone() as Arc<dyn ExecutionClient>)
+            ])
+        ));
+        
         let strategy = CrossMarketStrategy::with_defaults("test", exec);
         
-        // 1. Manually insert a "Sell" opportunity
+        // 2. Manually insert a "Sell" opportunity
         let opp = Opportunity {
-            id: "test_sell_opp".to_string(),
+            id: "BTC-TEST-C_sell".to_string(),
             opportunity_type: OpportunityType::VanillaCall,
             exchange: "derive".to_string(),
             instrument_id: "BTC-TEST-C".to_string(),
@@ -2578,10 +2665,10 @@ mod tests {
         
         let opportunities = vec![opp.clone()];
         
-        // 2. Simulate rebalance to OPEN position (size 0 -> 1)
+        // 3. Simulate rebalance to OPEN position (size 0 -> 1)
         let positions = vec![
             PositionAllocation {
-                opportunity_id: "test_sell_opp".to_string(),
+                opportunity_id: "BTC-TEST-C_sell".to_string(),
                 size: 1.0,
                 dollar_value: 1000.0,
                 expected_profit: 200.0,
@@ -2590,27 +2677,39 @@ mod tests {
         ];
         
         {
-            let mut state = strategy.state.write().await;
-            state.simulated_cash = 100_000.0;
+            // Update price in valid exchanges so market order works
+            sim_client.update_price(Instrument::Derive("BTC-TEST-C".to_string()), 1000.0);
             
-            // Call the private method (accessible in tests module)
-            strategy.rebalance_portfolio(&mut state, &positions, &opportunities);
+            // Current positions map (Empty)
+            let current_positions = HashMap::new();
+            
+            // Call rebalance
+            strategy.rebalance_portfolio(&current_positions, &positions, &opportunities).await;
             
             // Assert CORRECT behavior (Increase)
-            assert_eq!(state.simulated_cash, 101_000.0, "Cash should increase when opening a short position (receiving premium)");
+            let cash: f64 = sim_client.get_balance().await.unwrap();
+            assert_eq!(cash, 101_000.0, "Cash should increase when opening a short position (receiving premium)");
         }
         
-        // 3. Simulate rebalance to CLOSE position (size 1 -> 0)
+        // 4. Simulate rebalance to CLOSE position (size 1 -> 0)
         let empty_positions: Vec<PositionAllocation> = Vec::new();
         
         {
-            let mut state = strategy.state.write().await;
-            // State is currently 101,000 cash, 1.0 position
+            // Current positions map: We are Short 1.0 "test_sell_opp"
+            // Wait, "test_sell_opp" corresponds to "Short Instrument".
+            // So if size is 1.0, we have -1.0 Instrument?
+            // Let's verify our get_opportunity_positions logic or manual map.
+            // Tests manually construct the map usually.
             
-            strategy.rebalance_portfolio(&mut state, &empty_positions, &opportunities);
+            // To mimic closing, we pass "Current State" = { "test_sell_opp": 1.0 }
+            let mut current_positions = HashMap::new();
+            current_positions.insert("BTC-TEST-C_sell".to_string(), 1.0);
+            
+            strategy.rebalance_portfolio(&current_positions, &empty_positions, &opportunities).await;
             
             // Assert CORRECT behavior (Decrease to close)
-            assert_eq!(state.simulated_cash, 100_000.0, "Cash should decrease when closing a short position (buying back)");
+            let cash: f64 = sim_client.get_balance().await.unwrap();
+            assert_eq!(cash, 100_000.0, "Cash should decrease when closing a short position (buying back)");
         }
     }
 }
@@ -2621,11 +2720,18 @@ mod regression_tests {
     use super::*;
     use std::sync::Arc;
     use crate::optimizer::kelly::PositionAllocation;
-    use crate::traits::ExecutionRouter;
+    use crate::traits::{ExecutionClient, ExecutionRouter};
 
     #[tokio::test]
     async fn test_pnl_close_missing_opportunity() {
-        let exec = Arc::new(ExecutionRouter::empty());
+        use crate::simulation::execution::SimulatedExecutionClient;
+        let sim_client =  Arc::new(SimulatedExecutionClient::new(10_000.0));
+        let exec = Arc::new(ExecutionRouter::new(
+            std::collections::HashMap::from([
+                (Exchange::Polymarket, sim_client.clone() as Arc<dyn ExecutionClient>)
+            ])
+        ));
+        
         let strategy = CrossMarketStrategy::with_defaults("test", exec);
         
         // 1. Setup Market State (via public API)
@@ -2650,32 +2756,32 @@ mod regression_tests {
             1000.0
         ).await;
         
+        // Also update simulator price so execution works
+        sim_client.update_price(Instrument::Polymarket("yes_token".to_string()), 0.50);
+        
         // 2. Simulate holding a position
         let opp_id = format!("{}_yes", condition_id);
-        {
-            let mut state = strategy.state.write().await;
-            state.simulated_cash = 10_000.0;
-            state.simulated_positions.insert(opp_id.clone(), 100.0); // 100 contracts
-        }
         
         // 3. Close position with NO opportunities present (empty scan)
-        // This simulates the case where the scanner filtered it out or data was missing
         let positions: Vec<PositionAllocation> = Vec::new(); // Empty target portfolio
         let opportunities = Vec::new(); // Empty scan results
         
         {
-            let mut state = strategy.state.write().await;
+            // Current positions map: We hold 100 contracts
+            let mut current_positions = std::collections::HashMap::new();
+            current_positions.insert(opp_id.clone(), 100.0);
+            
             // Call private rebalance method
-            strategy.rebalance_portfolio(&mut state, &positions, &opportunities);
+            strategy.rebalance_portfolio(&current_positions, &positions, &opportunities).await;
             
             // 4. Assert correctness
             // Value of position = 100 contracts * $0.50 = $50.0
             // Cash should increase from 10,000 to 10,050
-            // BUG: Without fallback, it sees 0.0 price and cash stays 10,000
-            let cash_diff = state.simulated_cash - 10_000.0;
-            assert!((state.simulated_cash - 10_050.0).abs() < 1e-6, 
+            let cash = sim_client.get_balance().await.unwrap();
+            let cash_diff = cash - 10_000.0;
+            assert!((cash - 10_050.0).abs() < 1e-6, 
                 "Cash did not increase correctly on close. Expected 10050 (+50), got {} (+{}). The position was closed at price 0.0 instead of 0.50!", 
-                state.simulated_cash, cash_diff);
+                cash, cash_diff);
         }
     }
 
@@ -2740,16 +2846,15 @@ mod regression_tests {
         let opportunities = vec![long_opp.clone(), short_opp.clone()];
         
         // 2. Setup Position State
-        {
-            let mut state = strategy.state.write().await;
-            state.simulated_positions.insert("long_opp".to_string(), 10.0);
-            state.simulated_positions.insert("short_opp_sell".to_string(), 5.0);
-        }
+        // (Just a map now)
+        let mut current_positions = std::collections::HashMap::new();
+        current_positions.insert("long_opp".to_string(), 10.0);
+        current_positions.insert("short_opp_sell".to_string(), 5.0);
         
         // 3. Test Calculation (Active Scan)
         {
             let state = strategy.state.read().await;
-            let value = strategy.calculate_holdings_value(&state, &opportunities);
+            let value = strategy.calculate_holdings_value(&current_positions, &opportunities, 0, &state);
             
             // Expected: (10.0 * 50.0) + (5.0 * -20.0) = 500.0 - 100.0 = 400.0
             assert!((value - 400.0).abs() < 1e-6, "Holdings value incorrect with opportunities present. Expected 400.0, got {}", value);
@@ -2760,13 +2865,7 @@ mod regression_tests {
             let state = strategy.state.read().await;
             let empty_opps: Vec<Opportunity> = Vec::new();
             
-            // Note: fallback lookup relies on internal market maps (polymarket/derive). 
-            // Since we didn't populate them, it might be 0.0 unless we mock or rely on ID inference with 0 price?
-            // Actually, if we want to test fallback logic specifically we need to populate the market maps OR the fallback mechanism.
-            // But here we are mostly testing the *direction helper* aspect.
-            // Since fallback price defaults to 0.0 if not found, we expect 0.0 value.
-            
-            let value = strategy.calculate_holdings_value(&state, &empty_opps);
+            let value = strategy.calculate_holdings_value(&current_positions, &empty_opps, 0, &state);
             assert_eq!(value, 0.0);
         }
     }
@@ -2803,15 +2902,18 @@ async fn test_repro_spread_valuation_mismatch() {
             best_ask_amount: None,
             });
             
-            // Insert Position
-            state.simulated_positions.insert(opp_id.to_string(), 1.0); 
+            // Insert Position (Implicit in map)
+            // state.simulated_positions.insert(opp_id.to_string(), 1.0); 
     }
     
     // 2. Calc Holdings Value (Fallback)
     let state = strategy.state.read().await;
     let empty_opps: Vec<crate::optimizer::opportunity::Opportunity> = Vec::new();
     
-    let value = strategy.calculate_holdings_value(&state, &empty_opps);
+    let mut current_positions = std::collections::HashMap::new();
+    current_positions.insert(opp_id.to_string(), 1.0);
+    
+    let value = strategy.calculate_holdings_value(&current_positions, &empty_opps, 0, &state);
     
     // 3. Assert
     println!("Calculated Value: {}", value);
@@ -2874,15 +2976,18 @@ async fn test_spread_fallback_valuation() {
         
         // 2. Setup Position
         // We hold 1.0 unit of the Credit Spread (Short Position)
-        state.simulated_positions.insert(spread_id.clone(), 1.0);
+        // state.simulated_positions.insert(spread_id.clone(), 1.0);
     }
     
     // 3. Calculate Value
     let state = strategy.state.read().await;
     let empty_opps: Vec<crate::optimizer::opportunity::Opportunity> = Vec::new();
     
+    let mut current_positions = std::collections::HashMap::new();
+    current_positions.insert(spread_id.clone(), 1.0);
+
     // Should use fallback pricing
-    let value = strategy.calculate_holdings_value(&state, &empty_opps);
+    let value = strategy.calculate_holdings_value(&current_positions, &empty_opps, 0, &state);
     
     // 4. Assert
     println!("Spread Value: {}", value);

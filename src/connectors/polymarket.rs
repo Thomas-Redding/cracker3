@@ -1,7 +1,7 @@
 // src/connectors/polymarket.rs
 
 use crate::catalog::{validate_polymarket_order, MarketCatalog, PolymarketCatalog};
-use crate::models::{Instrument, MarketEvent, Order, OrderId};
+use crate::models::{Instrument, MarketEvent, Order, OrderId, Position};
 use crate::traits::{ExecutionClient, MarketStream, SharedExecutionClient};
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
@@ -740,6 +740,22 @@ impl ExecutionClient for PolymarketExec {
         
         // Return the order ID from the response
         Ok(response.order_id.to_string())
+    }
+
+    async fn cancel_order(&self, _order_id: &OrderId, _instrument: &Instrument) -> Result<(), String> {
+        Err("Not implemented: cancel_order".to_string())
+    }
+
+    async fn get_position(&self, _instrument: &Instrument) -> Result<Position, String> {
+        Err("Not implemented: get_position".to_string())
+    }
+
+    async fn get_positions(&self) -> Result<Vec<Position>, String> {
+        Err("Not implemented: get_positions".to_string())
+    }
+
+    async fn get_balance(&self) -> Result<f64, String> {
+        Err("Not implemented: get_balance".to_string())
     }
 }
 
