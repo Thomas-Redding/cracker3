@@ -1036,6 +1036,35 @@ impl CrossMarketStrategy {
                     return ticker.best_ask.unwrap_or(0.0);
                 }
             }
+        } else if opp_id.ends_with("_spread") {
+            if let Some(legs_str) = opp_id.strip_suffix("_spread") {
+                // expecting "ShortInstrument_LongInstrument"
+                // Split by the middle underscore. Since tickers don't contain underscores, we can split by '_'.
+                let parts: Vec<&str> = legs_str.split('_').collect();
+                if parts.len() == 2 {
+                    let short_inst = parts[0];
+                    let long_inst = parts[1];
+                    
+                    let short_price = state.derive_tickers.get(short_inst)
+                        .and_then(|t| t.best_ask) // Buy back short -> Ask
+                        .unwrap_or(0.0);
+                        
+                    let long_price = state.derive_tickers.get(long_inst)
+                        .and_then(|t| t.best_bid) // Sell long -> Bid
+                        .unwrap_or(0.0);
+                        
+                    // Cost to close = Buy Short - Sell Long
+                    // If > 0, we pay. If < 0, we receive.
+                    // The function returns a "Price" that is multiplied by -quantity (for short pos).
+                    // For a sold spread (Credit Spread), we are Short 1 unit.
+                    // Value = -1 * Price.
+                    // Position PnL = (Entry Credit - Exit Cost).
+                    // Initial Cash += Entry Credit.
+                    // Current Mtm = -Exit Cost.
+                    // Exit Cost = Short_Ask - Long_Bid.
+                    return short_price - long_price;
+                }
+            }
         }
         0.0
     }
@@ -1064,7 +1093,7 @@ impl CrossMarketStrategy {
                 let price = self.get_fallback_price(opp_id, state);
                 
                 // Direction inference
-                let is_short_generated_id = opp_id.ends_with("_sell") || opp_id.contains("_spread");
+                let is_short_generated_id = opp_id.ends_with("_sell") || opp_id.ends_with("_spread");
                 // Note: We might want a more robust way to track direction if IDs change,
                 // but for now this matches rebalance_portfolio logic.
                 
@@ -1342,7 +1371,7 @@ impl CrossMarketStrategy {
                      }
                  } else {
                      // Fallback based on ID naming convention
-                     if pos.opportunity_id.ends_with("_sell") || pos.opportunity_id.contains("_spread") {
+                     if pos.opportunity_id.ends_with("_sell") || pos.opportunity_id.ends_with("_spread") {
                          1.0
                      } else {
                          -1.0
@@ -1377,7 +1406,7 @@ impl CrossMarketStrategy {
                             crate::optimizer::opportunity::TradeDirection::Sell => 1.0,
                         }
                     } else {
-                        if id.ends_with("_sell") || id.contains("_spread") {
+                if id.ends_with("_sell") || id.ends_with("_spread") {
                             1.0
                         } else {
                             -1.0
@@ -2774,4 +2803,76 @@ async fn test_repro_spread_valuation_mismatch() {
     
     // We assert the CORRECT behavior (Negative value)
     assert_eq!(value, -100.0, "Spread position should be valued as liability (negative)");
+}
+
+#[tokio::test]
+async fn test_spread_fallback_valuation() {
+    use std::sync::Arc;
+    use crate::traits::ExecutionRouter;
+    
+    let exec = Arc::new(ExecutionRouter::empty());
+    let strategy = CrossMarketStrategy::with_defaults("test_spread", exec);
+    
+    let short_inst = "BTC-20240927-60000-C";
+    let long_inst = "BTC-20240927-65000-C";
+    let spread_id = format!("{}_{}_spread", short_inst, long_inst);
+    
+    // 1. Setup Tickers
+    {
+        let mut state = strategy.state.write().await;
+        
+        // Short Leg (Legacy Short): We are Short this, need to Buy back.
+        // Current Market Ask = 110.0
+        state.derive_tickers.insert(short_inst.to_string(), DeriveTicker {
+            instrument_name: short_inst.to_string(),
+            timestamp: 0,
+            underlying_price: None,
+            mark_iv: None,
+            bid_iv: None,
+            ask_iv: None,
+            strike: 60000.0,
+            expiry_timestamp: 0,
+            best_bid: Some(100.0),
+            best_ask: Some(110.0), // Cost to Buy
+            best_bid_amount: None,
+            best_ask_amount: None,
+
+        });
+        
+        // Long Leg (Legacy Long): We are Long this, need to Sell.
+        // Current Market Bid = 95.0
+        state.derive_tickers.insert(long_inst.to_string(), DeriveTicker {
+            instrument_name: long_inst.to_string(),
+            timestamp: 0,
+            underlying_price: None,
+            mark_iv: None,
+            bid_iv: None,
+            ask_iv: None,
+            strike: 65000.0,
+            expiry_timestamp: 0,
+            best_bid: Some(95.0), // Proceeds from Sell
+            best_ask: Some(105.0),
+            best_bid_amount: None,
+            best_ask_amount: None,
+
+        });
+        
+        // 2. Setup Position
+        // We hold 1.0 unit of the Credit Spread (Short Position)
+        state.simulated_positions.insert(spread_id.clone(), 1.0);
+    }
+    
+    // 3. Calculate Value
+    let state = strategy.state.read().await;
+    let empty_opps: Vec<crate::optimizer::opportunity::Opportunity> = Vec::new();
+    
+    // Should use fallback pricing
+    let value = strategy.calculate_holdings_value(&state, &empty_opps);
+    
+    // 4. Assert
+    println!("Spread Value: {}", value);
+    
+    // Expected Cost to Close = Short_Ask (110) - Long_Bid (95) = 15.0
+    // Since we are Short the spread, value should be -15.0
+    assert!((value - (-15.0)).abs() < 1e-6, "Expected -15.0, got {}", value);
 }
