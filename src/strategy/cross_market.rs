@@ -1064,7 +1064,7 @@ impl CrossMarketStrategy {
                 let price = self.get_fallback_price(opp_id, state);
                 
                 // Direction inference
-                let is_short_generated_id = opp_id.ends_with("_sell");
+                let is_short_generated_id = opp_id.ends_with("_sell") || opp_id.contains("_spread");
                 // Note: We might want a more robust way to track direction if IDs change,
                 // but for now this matches rebalance_portfolio logic.
                 
@@ -2726,4 +2726,52 @@ mod regression_tests {
             assert_eq!(value, 0.0);
         }
     }
+}
+
+
+#[tokio::test]
+async fn test_repro_spread_valuation_mismatch() {
+    use crate::traits::ExecutionRouter;
+    use std::sync::Arc;
+    let exec = Arc::new(ExecutionRouter::empty());
+    let strategy = CrossMarketStrategy::with_defaults("test", exec);
+    
+    let ticker_id = "simulation_spread";
+    let opp_id = "simulation_spread_buy"; 
+    
+    // 1. Setup Ticker and Position
+    {
+            let mut state = strategy.state.write().await;
+            
+            // Insert Ticker
+            state.derive_tickers.insert(ticker_id.to_string(), DeriveTicker {
+            instrument_name: ticker_id.to_string(),
+            timestamp: 0,
+            underlying_price: None,
+            mark_iv: None,
+            bid_iv: None,
+            ask_iv: None,
+            strike: 0.0,
+            expiry_timestamp: 0,
+            best_bid: Some(100.0),
+            best_ask: Some(110.0),
+            best_bid_amount: None,
+            best_ask_amount: None,
+            });
+            
+            // Insert Position
+            state.simulated_positions.insert(opp_id.to_string(), 1.0); 
+    }
+    
+    // 2. Calc Holdings Value (Fallback)
+    let state = strategy.state.read().await;
+    let empty_opps: Vec<crate::optimizer::opportunity::Opportunity> = Vec::new();
+    
+    let value = strategy.calculate_holdings_value(&state, &empty_opps);
+    
+    // 3. Assert
+    println!("Calculated Value: {}", value);
+    
+    // We assert the CORRECT behavior (Negative value)
+    assert_eq!(value, -100.0, "Spread position should be valued as liability (negative)");
 }
