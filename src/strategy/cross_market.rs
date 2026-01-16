@@ -1248,6 +1248,11 @@ impl CrossMarketStrategy {
 
     /// Processes a Deribit market event.
     async fn handle_deribit_event(&self, event: &MarketEvent, instrument_name: &str) {
+        // Ignore updates with no price data
+        if event.best_bid.is_none() && event.best_ask.is_none() {
+            return;
+        }
+
         // Parse instrument for strike and expiry
         let parts: Vec<&str> = instrument_name.split('-').collect();
         if parts.len() < 4 {
@@ -1285,6 +1290,11 @@ impl CrossMarketStrategy {
 
     /// Processes a Derive market event.
     async fn handle_derive_event(&self, event: &MarketEvent, instrument_name: &str) {
+        // Ignore updates with no price data (prevents overwriting valid state with None)
+        if event.best_bid.is_none() && event.best_ask.is_none() {
+            return;
+        }
+
         // Parse instrument
         let parts: Vec<&str> = instrument_name.split('-').collect();
         if parts.len() < 4 {
