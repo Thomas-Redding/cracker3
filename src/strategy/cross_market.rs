@@ -1009,7 +1009,39 @@ impl CrossMarketStrategy {
 
     // Helper to get a fallback price for an opportunity ID when the opportunity 
     // is missing from the current scan. Returns the positive market price.
-    fn get_fallback_price(&self, opp_id: &str, state: &CrossMarketState) -> f64 {
+    // Handles expired positions by calculating intrinsic value (settlement).
+    fn get_fallback_price(&self, opp_id: &str, state: &CrossMarketState, now_ms: i64) -> f64 {
+        // Helper to calculate settlement value for Derive options
+        let get_derive_value = |inst_id: &str, is_buy_back: bool| -> f64 {
+            if let Some(ticker) = state.derive_tickers.get(inst_id) {
+                // Check if expired
+                if now_ms >= ticker.expiry_timestamp {
+                    // Settlement Logic: Intrinsic Value based on Spot
+                    let spot = state.vol_surface.spot();
+                    if spot <= 0.0 { return 0.0; } // No spot ref
+                    
+                    let intrinsic = if ticker.instrument_name.ends_with("-C") {
+                        (spot - ticker.strike).max(0.0)
+                    } else if ticker.instrument_name.ends_with("-P") {
+                        (ticker.strike - spot).max(0.0)
+                    } else {
+                        0.0
+                    };
+                    debug!("FALLBACK: {} expired (exp={}, now={}). Spot={:.2}. Settlement={:.4}", 
+                        inst_id, ticker.expiry_timestamp, now_ms, spot, intrinsic);
+                    return intrinsic;
+                }
+                
+                // Active: Use market price
+                if is_buy_back {
+                   return ticker.best_ask.unwrap_or(0.0);
+                } else {
+                   return ticker.best_bid.unwrap_or(0.0);
+                }
+            }
+            0.0
+        };
+
         if opp_id.contains("_yes") { 
             if let Some(condition_id) = opp_id.strip_suffix("_yes") {
                 if let Some(market) = state.polymarket_markets.get(condition_id) {
@@ -1024,44 +1056,26 @@ impl CrossMarketStrategy {
             }
         } else if opp_id.ends_with("_buy") {
             if let Some(inst_id) = opp_id.strip_suffix("_buy") {
-                if let Some(ticker) = state.derive_tickers.get(inst_id) {
-                    // Liquidation of Long -> Bid
-                    return ticker.best_bid.unwrap_or(0.0);
-                }
+                // Liquidation of Long -> Bid
+                return get_derive_value(inst_id, false);
             }
         } else if opp_id.ends_with("_sell") {
             if let Some(inst_id) = opp_id.strip_suffix("_sell") {
-                if let Some(ticker) = state.derive_tickers.get(inst_id) {
-                    // Closing of Short -> Ask
-                    return ticker.best_ask.unwrap_or(0.0);
-                }
+                // Closing of Short -> Ask
+                return get_derive_value(inst_id, true);
             }
         } else if opp_id.ends_with("_spread") {
             if let Some(legs_str) = opp_id.strip_suffix("_spread") {
                 // expecting "ShortInstrument_LongInstrument"
-                // Split by the middle underscore. Since tickers don't contain underscores, we can split by '_'.
                 let parts: Vec<&str> = legs_str.split('_').collect();
                 if parts.len() == 2 {
                     let short_inst = parts[0];
                     let long_inst = parts[1];
                     
-                    let short_price = state.derive_tickers.get(short_inst)
-                        .and_then(|t| t.best_ask) // Buy back short -> Ask
-                        .unwrap_or(0.0);
-                        
-                    let long_price = state.derive_tickers.get(long_inst)
-                        .and_then(|t| t.best_bid) // Sell long -> Bid
-                        .unwrap_or(0.0);
+                    let short_price = get_derive_value(short_inst, true); // Buy back short
+                    let long_price = get_derive_value(long_inst, false); // Sell long
                         
                     // Cost to close = Buy Short - Sell Long
-                    // If > 0, we pay. If < 0, we receive.
-                    // The function returns a "Price" that is multiplied by -quantity (for short pos).
-                    // For a sold spread (Credit Spread), we are Short 1 unit.
-                    // Value = -1 * Price.
-                    // Position PnL = (Entry Credit - Exit Cost).
-                    // Initial Cash += Entry Credit.
-                    // Current Mtm = -Exit Cost.
-                    // Exit Cost = Short_Ask - Long_Bid.
                     return short_price - long_price;
                 }
             }
@@ -1073,7 +1087,7 @@ impl CrossMarketStrategy {
     /// 
     /// Assets (Long positions) add to value.
     /// Liabilities (Short positions) subtract from value.
-    fn calculate_holdings_value(&self, state: &CrossMarketState, opportunities: &[Opportunity]) -> f64 {
+    fn calculate_holdings_value(&self, state: &CrossMarketState, opportunities: &[Opportunity], now_ms: i64) -> f64 {
         let opp_map: HashMap<&String, &Opportunity> = opportunities.iter()
             .map(|o| (&o.id, o))
             .collect();
@@ -1090,7 +1104,7 @@ impl CrossMarketStrategy {
                 }
             } else {
                 // Fallback pricing
-                let price = self.get_fallback_price(opp_id, state);
+                let price = self.get_fallback_price(opp_id, state, now_ms);
                 
                 // Direction inference
                 let is_short_generated_id = opp_id.ends_with("_sell") || opp_id.ends_with("_spread");
@@ -1143,7 +1157,7 @@ impl CrossMarketStrategy {
         let (_current_equity, optimizer, opportunities, distribution) = {
             let state = self.state.read().await;
             
-            let holdings_value = self.calculate_holdings_value(&state, &state.opportunities);
+            let holdings_value = self.calculate_holdings_value(&state, &state.opportunities, now_ms);
             
             let equity = state.simulated_cash + holdings_value;
             
@@ -1179,14 +1193,14 @@ impl CrossMarketStrategy {
         
         {
             let mut state = self.state.write().await;
-            self.rebalance_portfolio(&mut state, &portfolio.positions, &opportunities);
+            self.rebalance_portfolio(&mut state, &portfolio.positions, &opportunities, now_ms);
             
             state.portfolio = Some(portfolio);
 
             // 4. Calculate Final Stats (inside lock)
             // Re-build price map for valuation
             let n_positions = state.simulated_positions.len();
-            let final_holdings_value = self.calculate_holdings_value(&state, &opportunities);
+            let final_holdings_value = self.calculate_holdings_value(&state, &opportunities, now_ms);
             let final_equity = state.simulated_cash + final_holdings_value;
             let initial_wealth = self.config.kelly_config.initial_wealth;
         
@@ -1344,6 +1358,7 @@ impl CrossMarketStrategy {
         state: &mut CrossMarketState,
         positions: &[crate::optimizer::kelly::PositionAllocation],
         opportunities: &[Opportunity],
+        now_ms: i64,
     ) {
         // Build map of ID -> Opportunity for direction lookup
         let opp_map: HashMap<&String, &Opportunity> = opportunities.iter()
@@ -1396,7 +1411,7 @@ impl CrossMarketStrategy {
                 let old_qty = state.simulated_positions.get(&id).copied().unwrap_or(0.0);
                 if old_qty.abs() > 1e-6 {
                     let price = price_map.get(&id).copied().unwrap_or_else(|| {
-                        self.get_fallback_price(&id, state)
+                        self.get_fallback_price(&id, state, now_ms)
                     });
                     
                     // Determine flow direction
