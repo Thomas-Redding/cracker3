@@ -1007,6 +1007,39 @@ impl CrossMarketStrategy {
         state.opportunities = opportunities;
     }
 
+    // Helper to get a fallback price for an opportunity ID when the opportunity 
+    // is missing from the current scan. Returns the positive market price.
+    fn get_fallback_price(&self, opp_id: &str, state: &CrossMarketState) -> f64 {
+        if opp_id.contains("_yes") { 
+            if let Some(condition_id) = opp_id.strip_suffix("_yes") {
+                if let Some(market) = state.polymarket_markets.get(condition_id) {
+                    return market.yes_price;
+                }
+            }
+        } else if opp_id.contains("_no") {
+             if let Some(condition_id) = opp_id.strip_suffix("_no") {
+                if let Some(market) = state.polymarket_markets.get(condition_id) {
+                    return market.no_price;
+                }
+            }
+        } else if opp_id.ends_with("_buy") {
+            if let Some(inst_id) = opp_id.strip_suffix("_buy") {
+                if let Some(ticker) = state.derive_tickers.get(inst_id) {
+                    // Liquidation of Long -> Bid
+                    return ticker.best_bid.unwrap_or(0.0);
+                }
+            }
+        } else if opp_id.ends_with("_sell") {
+            if let Some(inst_id) = opp_id.strip_suffix("_sell") {
+                if let Some(ticker) = state.derive_tickers.get(inst_id) {
+                    // Closing of Short -> Ask
+                    return ticker.best_ask.unwrap_or(0.0);
+                }
+            }
+        }
+        0.0
+    }
+
     /// Optimizes the portfolio using Kelly criterion.
 
 
@@ -1060,47 +1093,18 @@ impl CrossMarketStrategy {
                     }
                 } else {
                     // Fallback: Try to look up directly from markets if opp is filtered out
-                    let mut fallback_price = 0.0;
+                    let price = self.get_fallback_price(opp_id, &state);
                     
-                    if opp_id.contains("_yes") { 
-                        if let Some(condition_id) = opp_id.strip_suffix("_yes") {
-                            if let Some(market) = state.polymarket_markets.get(condition_id) {
-                                fallback_price = market.yes_price;
-                            }
-                        }
-                    } else if opp_id.contains("_no") {
-                         if let Some(condition_id) = opp_id.strip_suffix("_no") {
-                            if let Some(market) = state.polymarket_markets.get(condition_id) {
-                                fallback_price = market.no_price;
-                            }
-                        }
-                    } else if opp_id.ends_with("_buy") {
-                        if let Some(inst_id) = opp_id.strip_suffix("_buy") {
-                            if let Some(ticker) = state.derive_tickers.get(inst_id) {
-                                // Value at Bid (liquidation)
-                                fallback_price = ticker.best_bid.unwrap_or(0.0);
-                            }
-                        }
-                    } else if opp_id.ends_with("_sell") {
-                        if let Some(inst_id) = opp_id.strip_suffix("_sell") {
-                            if let Some(ticker) = state.derive_tickers.get(inst_id) {
-                                // Value at Ask (cost to close), negative
-                                fallback_price = -ticker.best_ask.unwrap_or(0.0);
-                            }
-                        }
-                    }
-                    
-                    // Default to 0.0 only if all lookups fail
-                    if fallback_price == 0.0 && opp_id.contains("_spread") {
+                    if price == 0.0 && opp_id.contains("_spread") {
                         // TODO: Implement spread pricing fallback if needed
                     }
                     
-                    // For binary options (long only), price is positive so value = qty * price
-                    // For Derive fallbacks, we already set sign for generic qty multiplication?
-                    // No, fallback_price for _sell was set negative.
-                    // But _yes/_no fallbacks are positive.
-                    // So we can just satisfy: val = qty * fallback_price
-                    *qty * fallback_price
+                    // Apply direction for value calculation (Shorts have negative value)
+                    if opp_id.ends_with("_sell") {
+                        -*qty * price
+                    } else {
+                        *qty * price
+                    }
                 };
                 
                 holdings_value += val;
@@ -1364,7 +1368,9 @@ impl CrossMarketStrategy {
             if !new_pos_ids.contains(&id) {
                 let old_qty = state.simulated_positions.get(&id).copied().unwrap_or(0.0);
                 if old_qty.abs() > 1e-6 {
-                    let price = price_map.get(&id).copied().unwrap_or(0.0);
+                    let price = price_map.get(&id).copied().unwrap_or_else(|| {
+                        self.get_fallback_price(&id, state)
+                    });
                     
                     // Determine flow direction
                     let flow_mult = if let Some(opp) = opp_map.get(&id) {
@@ -2567,3 +2573,67 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use std::sync::Arc;
+    use crate::optimizer::kelly::PositionAllocation;
+    use crate::traits::ExecutionRouter;
+
+    #[tokio::test]
+    async fn test_pnl_close_missing_opportunity() {
+        let exec = Arc::new(ExecutionRouter::empty());
+        let strategy = CrossMarketStrategy::with_defaults("test", exec);
+        
+        // 1. Setup Market State (via public API)
+        let condition_id = "0x1234567890abcdef";
+        strategy.register_polymarket_market(
+            condition_id,
+            "Will BTC be > 100k?",
+            100_000.0,
+            1700000000000,
+            "yes_token",
+            "no_token",
+            None,
+            None,
+        ).await;
+        
+        // Set price to 0.50
+        strategy.update_polymarket_prices(
+            condition_id,
+            0.50, // YES price
+            0.50, // NO price
+            1000.0,
+            1000.0
+        ).await;
+        
+        // 2. Simulate holding a position
+        let opp_id = format!("{}_yes", condition_id);
+        {
+            let mut state = strategy.state.write().await;
+            state.simulated_cash = 10_000.0;
+            state.simulated_positions.insert(opp_id.clone(), 100.0); // 100 contracts
+        }
+        
+        // 3. Close position with NO opportunities present (empty scan)
+        // This simulates the case where the scanner filtered it out or data was missing
+        let positions: Vec<PositionAllocation> = Vec::new(); // Empty target portfolio
+        let opportunities = Vec::new(); // Empty scan results
+        
+        {
+            let mut state = strategy.state.write().await;
+            // Call private rebalance method
+            strategy.rebalance_portfolio(&mut state, &positions, &opportunities);
+            
+            // 4. Assert correctness
+            // Value of position = 100 contracts * $0.50 = $50.0
+            // Cash should increase from 10,000 to 10,050
+            // BUG: Without fallback, it sees 0.0 price and cash stays 10,000
+            let cash_diff = state.simulated_cash - 10_000.0;
+            assert!((state.simulated_cash - 10_050.0).abs() < 1e-6, 
+                "Cash did not increase correctly on close. Expected 10050 (+50), got {} (+{}). The position was closed at price 0.0 instead of 0.50!", 
+                state.simulated_cash, cash_diff);
+        }
+    }
+}
