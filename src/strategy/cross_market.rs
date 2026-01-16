@@ -1132,84 +1132,59 @@ impl CrossMarketStrategy {
         };
     
         // 3. Rebalance Simulated Portfolio
+        // 3. Rebalance & 4. Stats
         let expected_utility = portfolio.expected_utility;
         let expected_return = portfolio.expected_return;
         let prob_loss = portfolio.prob_loss;
-        let positions = portfolio.positions.clone();
         let n_opps = opportunities.len();
         
-        let mut state = self.state.write().await;
-        
-        // Price map again for rebalancing execution
-        let price_map: HashMap<&String, f64> = opportunities.iter()
-            .map(|o| (&o.id, o.market_price))
-            .collect();
+        {
+            let mut state = self.state.write().await;
+            self.rebalance_portfolio(&mut state, &portfolio.positions, &opportunities);
             
-        // Execute buys/sells for target positions
-        for pos in &positions {
-            let old_qty = state.simulated_positions.get(&pos.opportunity_id).copied().unwrap_or(0.0);
-            let needed = pos.size - old_qty;
+            state.portfolio = Some(portfolio);
+
+            // 4. Calculate Final Stats (inside lock)
+            // Re-build price map for valuation
+            let price_map: HashMap<&String, f64> = opportunities.iter()
+                .map(|o| (&o.id, o.market_price))
+                .collect();
+
+            let mut final_holdings_value = 0.0;
+            let n_positions = state.simulated_positions.len();
+            for (id, qty) in &state.simulated_positions {
+                let price = price_map.get(id).copied().unwrap_or(0.0);
+                final_holdings_value += qty * price;
+            }
+            let final_equity = state.simulated_cash + final_holdings_value;
+            let initial_wealth = self.config.kelly_config.initial_wealth;
+        
+            state.last_recalc = now_ms;
+            state.history.push(HistoryPoint {
+                timestamp: now_ms,
+                expected_utility,
+                expected_return,
+                prob_loss,
+                total_positions: n_positions,
+                total_value: final_holdings_value,
+                realized_pnl: final_equity - initial_wealth,
+                total_equity: final_equity,
+            });
+        
+            let duration = start.elapsed();
+            let msg = format!(
+                "Recalc ({:?}): {} opps, {} pos, Equity=${:.2} (PnL ${:+.2})", 
+                duration, n_opps, n_positions, final_equity, final_equity - initial_wealth
+            );
             
-            if needed.abs() > 1e-6 {
-                 let price = price_map.get(&pos.opportunity_id).copied().unwrap_or(0.0);
-                 state.simulated_cash -= needed * price;
-                 state.simulated_positions.insert(pos.opportunity_id.clone(), pos.size);
+            state.log.push_back(LogEntry {
+                time: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                level: "info".to_string(),
+                message: msg,
+            });
+            if state.log.len() > MAX_LOG_ENTRIES {
+                state.log.pop_front();
             }
-        }
-        
-        // Close positions not in new portfolio
-        let new_pos_ids: HashSet<&String> = positions.iter().map(|p| &p.opportunity_id).collect();
-        // Clone keys to avoid borrow check issues
-        let old_pos_ids: Vec<String> = state.simulated_positions.keys().cloned().collect();
-        
-        for id in old_pos_ids {
-            if !new_pos_ids.contains(&id) {
-                let old_qty = state.simulated_positions.get(&id).copied().unwrap_or(0.0);
-                if old_qty.abs() > 1e-6 {
-                    let price = price_map.get(&id).copied().unwrap_or(0.0);
-                    state.simulated_cash += old_qty * price;
-                    state.simulated_positions.remove(&id);
-                }
-            }
-        }
-    
-        state.portfolio = Some(portfolio);
-    
-        // 4. Calculate Final Stats
-        let mut final_holdings_value = 0.0;
-        let n_positions = state.simulated_positions.len();
-        for (id, qty) in &state.simulated_positions {
-            let price = price_map.get(id).copied().unwrap_or(0.0);
-            final_holdings_value += qty * price;
-        }
-        let final_equity = state.simulated_cash + final_holdings_value;
-        let initial_wealth = self.config.kelly_config.initial_wealth;
-    
-        state.last_recalc = now_ms;
-        state.history.push(HistoryPoint {
-            timestamp: now_ms,
-            expected_utility,
-            expected_return,
-            prob_loss,
-            total_positions: n_positions,
-            total_value: final_holdings_value,
-            realized_pnl: final_equity - initial_wealth,
-            total_equity: final_equity,
-        });
-    
-        let duration = start.elapsed();
-        let msg = format!(
-            "Recalc ({:?}): {} opps, {} pos, Equity=${:.2} (PnL ${:+.2})", 
-            duration, n_opps, n_positions, final_equity, final_equity - initial_wealth
-        );
-        // Use direct log push to avoid locking again
-        state.log.push_back(LogEntry {
-            time: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-            level: "info".to_string(),
-            message: msg,
-        });
-        if state.log.len() > MAX_LOG_ENTRIES {
-            state.log.pop_front();
         }
     }
 
@@ -1330,6 +1305,90 @@ impl CrossMarketStrategy {
         );
         state.token_to_market_key.insert(yes_token_id.to_string(), condition_id.to_string());
         state.token_to_market_key.insert(no_token_id.to_string(), condition_id.to_string());
+    }
+
+    /// Rebalances the portfolio based on optimizer target positions.
+    fn rebalance_portfolio(
+        &self,
+        state: &mut CrossMarketState,
+        positions: &[crate::optimizer::kelly::PositionAllocation],
+        opportunities: &[Opportunity],
+    ) {
+        // Build map of ID -> Opportunity for direction lookup
+        let opp_map: HashMap<&String, &Opportunity> = opportunities.iter()
+            .map(|o| (&o.id, o))
+            .collect();
+
+        // Build price map for value calculations
+        let price_map: HashMap<&String, f64> = opportunities.iter()
+            .map(|o| (&o.id, o.market_price))
+            .collect();
+            
+        // Execute buys/sells for target positions
+        for pos in positions {
+            let old_qty = state.simulated_positions.get(&pos.opportunity_id).copied().unwrap_or(0.0);
+            let needed = pos.size - old_qty;
+            
+            if needed.abs() > 1e-6 {
+                 let price = price_map.get(&pos.opportunity_id).copied().unwrap_or(0.0);
+                 
+                 // Determine flow direction (Buy = -1.0, Sell = +1.0)
+                 let flow_mult = if let Some(opp) = opp_map.get(&pos.opportunity_id) {
+                     match opp.direction {
+                         crate::optimizer::opportunity::TradeDirection::Buy => -1.0,
+                         crate::optimizer::opportunity::TradeDirection::Sell => 1.0,
+                     }
+                 } else {
+                     // Fallback based on ID naming convention
+                     if pos.opportunity_id.ends_with("_sell") || pos.opportunity_id.contains("_spread") {
+                         1.0
+                     } else {
+                         -1.0
+                     }
+                 };
+                 
+                 // cash_change = needed * price * flow_mult
+                 // If Sell (1.0): Opening (needed > 0) -> adds cash. Correct.
+                 // If Buy (-1.0): Opening (needed > 0) -> removes cash. Correct.
+                 state.simulated_cash += needed * price * flow_mult;
+                 state.simulated_positions.insert(pos.opportunity_id.clone(), pos.size);
+            }
+        }
+        
+        // Close positions not in new portfolio
+        let new_pos_ids: HashSet<&String> = positions.iter().map(|p| &p.opportunity_id).collect();
+        // Clone keys to avoid borrow check issues
+        let old_pos_ids: Vec<String> = state.simulated_positions.keys().cloned().collect();
+        
+        for id in old_pos_ids {
+            if !new_pos_ids.contains(&id) {
+                let old_qty = state.simulated_positions.get(&id).copied().unwrap_or(0.0);
+                if old_qty.abs() > 1e-6 {
+                    let price = price_map.get(&id).copied().unwrap_or(0.0);
+                    
+                    // Determine flow direction
+                    let flow_mult = if let Some(opp) = opp_map.get(&id) {
+                        match opp.direction {
+                            crate::optimizer::opportunity::TradeDirection::Buy => -1.0,
+                            crate::optimizer::opportunity::TradeDirection::Sell => 1.0,
+                        }
+                    } else {
+                        if id.ends_with("_sell") || id.contains("_spread") {
+                            1.0
+                        } else {
+                            -1.0
+                        }
+                    };
+
+                    // We are closing, so "needed" is -old_qty
+                    // cash_change = (-old_qty) * price * flow_mult
+                    // If Sell (1.0): Closing (old_qty > 0) -> removes cash. Correct (Buying back).
+                    // If Buy (-1.0): Closing (old_qty > 0) -> adds cash. Correct (Selling).
+                    state.simulated_cash += (-old_qty) * price * flow_mult;
+                    state.simulated_positions.remove(&id);
+                }
+            }
+        }
     }
 
     /// Updates Polymarket prices (called from external data source).
@@ -2430,6 +2489,81 @@ mod tests {
         assert_eq!(state.event_counter, 250);
         // Log should be capped at 200
         assert!(state.log.len() <= MAX_LOG_ENTRIES);
+    }
+
+    #[tokio::test]
+    async fn test_pnl_calculation_sell_flow() {
+        use std::collections::HashMap;
+        use crate::optimizer::opportunity::{Opportunity, OpportunityType, TradeDirection};
+        use crate::optimizer::kelly::PositionAllocation;
+        
+        // Use default execution router mock/dummy if possible or existing one
+        use crate::traits::ExecutionRouter;
+        let exec = Arc::new(ExecutionRouter::empty());
+        let strategy = CrossMarketStrategy::with_defaults("test", exec);
+        
+        // 1. Manually insert a "Sell" opportunity
+        let opp = Opportunity {
+            id: "test_sell_opp".to_string(),
+            opportunity_type: OpportunityType::VanillaCall,
+            exchange: "derive".to_string(),
+            instrument_id: "BTC-TEST-C".to_string(),
+            description: "Sell Call".to_string(),
+            strike: 100_000.0,
+            strike2: None,
+            expiry_timestamp: 1234567890000,
+            time_to_expiry: 0.1,
+            direction: TradeDirection::Sell, // SHORT position
+            market_price: 1000.0, // Selling for $1000 credit
+            fair_value: 800.0,
+            edge: 0.2,
+            max_profit: 1000.0,
+            max_loss: 10000.0,
+            liquidity: 10.0,
+            implied_probability: None,
+            model_probability: None,
+            model_iv: None,
+            token_id: None,
+            minimum_order_size: None,
+            minimum_tick_size: None,
+        };
+        
+        let opportunities = vec![opp.clone()];
+        
+        // 2. Simulate rebalance to OPEN position (size 0 -> 1)
+        let positions = vec![
+            PositionAllocation {
+                opportunity_id: "test_sell_opp".to_string(),
+                size: 1.0,
+                dollar_value: 1000.0,
+                expected_profit: 200.0,
+                utility_contribution: 0.0,
+            }
+        ];
+        
+        {
+            let mut state = strategy.state.write().await;
+            state.simulated_cash = 100_000.0;
+            
+            // Call the private method (accessible in tests module)
+            strategy.rebalance_portfolio(&mut state, &positions, &opportunities);
+            
+            // Assert CORRECT behavior (Increase)
+            assert_eq!(state.simulated_cash, 101_000.0, "Cash should increase when opening a short position (receiving premium)");
+        }
+        
+        // 3. Simulate rebalance to CLOSE position (size 1 -> 0)
+        let empty_positions: Vec<PositionAllocation> = Vec::new();
+        
+        {
+            let mut state = strategy.state.write().await;
+            // State is currently 101,000 cash, 1.0 position
+            
+            strategy.rebalance_portfolio(&mut state, &empty_positions, &opportunities);
+            
+            // Assert CORRECT behavior (Decrease to close)
+            assert_eq!(state.simulated_cash, 100_000.0, "Cash should decrease when closing a short position (buying back)");
+        }
     }
 }
 
