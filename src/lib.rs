@@ -29,4 +29,11 @@ pub mod config;
 pub mod pricing;
 
 // 10. Position Optimizer (The "Optimizer")
+// 11. Simulation Framework
 pub mod optimizer;
+
+// 11. Simulation Framework
+pub mod simulation;
+
+// 12. Backtesting
+pub mod backtest;

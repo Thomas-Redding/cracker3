@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use trading_bot::catalog::{DeribitCatalog, DeriveCatalog, PolymarketCatalog, SharedRefreshable};
 use trading_bot::config::{default_config_template, Catalogs, Config};
-use trading_bot::connectors::{backtest, deribit, derive, polymarket};
+use trading_bot::connectors::{backtest as backtest_connector, deribit, derive, polymarket};
+use trading_bot::backtest; // This is the runner module
 use trading_bot::dashboard::DashboardServer;
 use trading_bot::engine::Engine;
 use trading_bot::models::{Exchange, Instrument, MarketEvent};
@@ -243,7 +244,7 @@ async fn run_live_mode(args: &Args) {
                 let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
                 let path = format!("recordings/deribit_{}.jsonl", timestamp);
                 std::fs::create_dir_all("recordings").ok();
-                match backtest::RecordingStream::new(stream, &path) {
+                match backtest_connector::RecordingStream::new(stream, &path) {
                     Ok(recording) => {
                         info!("Deribit: Recording to {}", path);
                         engine = engine.with_stream(Exchange::Deribit, Box::new(recording));
@@ -259,7 +260,7 @@ async fn run_live_mode(args: &Args) {
                 let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
                 let path = format!("recordings/derive_{}.jsonl", timestamp);
                 std::fs::create_dir_all("recordings").ok();
-                match backtest::RecordingStream::new(stream, &path) {
+                match backtest_connector::RecordingStream::new(stream, &path) {
                     Ok(recording) => {
                         info!("Derive: Recording to {}", path);
                         engine = engine.with_stream(Exchange::Derive, Box::new(recording));
@@ -274,7 +275,7 @@ async fn run_live_mode(args: &Args) {
     let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
                 let path = format!("recordings/polymarket_{}.jsonl", timestamp);
                 std::fs::create_dir_all("recordings").ok();
-                match backtest::RecordingStream::new(stream, &path) {
+                match backtest_connector::RecordingStream::new(stream, &path) {
                     Ok(recording) => {
                         info!("Polymarket: Recording to {}", path);
                         engine = engine.with_stream(Exchange::Polymarket, Box::new(recording));
@@ -301,178 +302,81 @@ async fn run_backtest_mode(args: &Args) {
         std::process::exit(1);
     }
     
-    let file_paths = &args.file;
-
-    info!("Starting Backtest from files: {:?}", file_paths);
-
-    // Create playback configuration
-    let playback_config = if args.realtime {
-        info!("Realtime playback enabled at {}x speed", args.speed);
-        backtest::PlaybackConfig::realtime(args.speed)
-    } else {
-        backtest::PlaybackConfig::instant()
+    // Config
+    let config = backtest::BacktestConfig {
+        initial_cash: 100_000.0,
+        data_paths: args.file.clone(),
+        start_time: None,
+        end_time: None,
     };
 
-    // Create the historical stream
-    let stream = match backtest::HistoricalStream::with_config(file_paths.clone(), playback_config) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Failed to open historical data file: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    // Create mock execution (keep a typed reference for reporting)
-    let mock_exec_raw = backtest::MockExec::new();
-    let mock_exec = mock_exec_raw.clone().shared(); // For engine use
-    
-    let mut exec_clients = HashMap::new();
-    exec_clients.insert(Exchange::Deribit, mock_exec.clone());
-    exec_clients.insert(Exchange::Derive, mock_exec.clone());
-    exec_clients.insert(Exchange::Polymarket, mock_exec.clone());
-    let exec_router = Arc::new(ExecutionRouter::new(exec_clients));
-
-    // Initialize catalogs to allow strategies to discover markets
-    // This uses the local cache files (e.g. cache/polymarket_markets.jsonl)
+    // Initialize Catalogs (Async setup required outside the closure)
     let mut catalogs = Catalogs::default();
+    catalogs.polymarket = Some(PolymarketCatalog::new(None, None).await);
+    catalogs.deribit = Some(DeribitCatalog::new(vec!["BTC".to_string()], None, None).await);
+    catalogs.derive = Some(DeriveCatalog::new(vec!["BTC".to_string()], None, None).await);
     
-    // We instantiate all catalogs unconditionally for backtest flexibility
-    let poly_catalog = PolymarketCatalog::new(None, None).await;
-    catalogs.polymarket = Some(poly_catalog.clone());
+    let config_path = args.config.clone();
+
+    // Run Backtest
+    let result = backtest::BacktestRunner::run(config, move |exec_router| {
+        // Strategy Factory Closure
+        if let Some(path) = &config_path {
+             match Config::from_file(path) {
+                Ok(c) => c.build_strategies_with_catalogs(exec_router, Some(&catalogs)),
+                Err(e) => {
+                    error!("Failed to load config: {}", e);
+                    default_backtest_strategies(exec_router)
+                }
+             }
+        } else {
+             default_backtest_strategies(exec_router)
+        }
+    }).await;
     
-    let deribit_catalog = DeribitCatalog::new(vec!["BTC".to_string()], None, None).await;
-    catalogs.deribit = Some(deribit_catalog.clone());
-
-    let derive_catalog = DeriveCatalog::new(vec!["BTC".to_string()], None, None).await;
-    catalogs.derive = Some(derive_catalog.clone());
-
-    // Load strategies from config or use defaults
-    let strategies: Vec<Arc<dyn Strategy>> = if let Some(config_path) = &args.config {
-        match Config::from_file(config_path) {
-            Ok(config) => config.build_strategies_with_catalogs(exec_router.clone(), Some(&catalogs)),
-            Err(e) => {
-                error!("Failed to load config: {}", e);
-                default_backtest_strategies(exec_router.clone())
-            }
-        }
-    } else {
-        default_backtest_strategies(exec_router.clone())
-    };
-
-    let strategies_clone = strategies.clone(); // Keep for reporting
-    info!("Running with {} strategies", strategies.len());
-
-    // Start dashboard if requested
-    if let Some(port) = args.dashboard {
-        start_dashboard(strategies.clone(), port);
-    }
-
-    // Build and run engine
-    let engine = Engine::new(strategies)
-        .with_stream(Exchange::Deribit, Box::new(stream))
-        .with_catalog(Exchange::Polymarket, poly_catalog as SharedRefreshable)
-        .with_catalog(Exchange::Deribit, deribit_catalog as SharedRefreshable)
-        .with_catalog(Exchange::Derive, derive_catalog as SharedRefreshable)
-        .with_exec_router(exec_router);
-    engine.run().await;
-    info!("\n=== Backtest Results ===");
-
-    // Report Strategy States (Positions & PnL)
-    for strategy in &strategies_clone {
-        info!("\nStrategy: {}", strategy.name());
-        let state = strategy.dashboard_state().await;
-        
-        if let Some(stats) = state.get("portfolio_stats") {
-            if !stats.is_null() {
-                info!("  Portfolio Stats:");
-                if let Some(ret) = stats.get("expected_return") {
-                    info!("    Expected Return: {}", ret);
-                }
-                if let Some(sharpe) = stats.get("expected_sharpe") {
-                    info!("    Expected Sharpe: {}", sharpe);
-                }
-                if let Some(prob_loss) = stats.get("prob_loss") {
-                    info!("    Prob. Loss:      {}", prob_loss);
-                }
-            }
-        }
-
-        if let Some(positions) = state.get("positions") {
-            if let Some(pos_array) = positions.as_array() {
-                if !pos_array.is_empty() {
-                    info!("  Open Positions: {}", pos_array.len());
-                    for pos in pos_array {
-                        let opp_id = pos.get("opportunity_id").and_then(|v| v.as_str()).unwrap_or("?");
-                        let size = pos.get("size").and_then(|v| v.as_str()).unwrap_or("?");
-                        let value = pos.get("dollar_value").and_then(|v| v.as_str()).unwrap_or("?");
-                        let profit = pos.get("expected_profit").and_then(|v| v.as_str()).unwrap_or("?");
+    match result {
+        Ok((res, strategies)) => {
+            info!("=== Backtest Completed ===");
+            info!("Final Equity: ${:.2}", res.final_equity);
+            info!("Total PnL:    ${:.2}", res.total_pnl);
+            info!("Trades:       {}", res.trade_count);
+            
+            // Export PnL History
+            info!("\nExporting PnL History...");
+            std::fs::create_dir_all("backtest_results").unwrap_or_default();
+            
+            for strategy in strategies {
+                let state = strategy.dashboard_state().await;
+                if let Some(history) = state.get("history").and_then(|h| h.as_array()) {
+                    if history.is_empty() { continue; }
+                    
+                    let filename = format!("backtest_results/{}_history.csv", strategy.name().replace(" ", "_"));
+                    let mut content = "timestamp,expected_utility,expected_return,prob_loss,total_positions,total_value,realized_pnl,total_equity\n".to_string();
+                    
+                    for point in history {
+                        let ts = point.get("timestamp").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(0);
+                        let util = point.get("expected_utility").and_then(|v: &serde_json::Value| v.as_f64()).unwrap_or(0.0);
+                        let ret = point.get("expected_return").and_then(|v: &serde_json::Value| v.as_f64()).unwrap_or(0.0);
+                        let prob = point.get("prob_loss").and_then(|v: &serde_json::Value| v.as_f64()).unwrap_or(0.0);
+                        let pos = point.get("total_positions").and_then(|v: &serde_json::Value| v.as_u64()).unwrap_or(0);
+                        let val = point.get("total_value").and_then(|v: &serde_json::Value| v.as_f64()).unwrap_or(0.0);
+                        let pnl = point.get("realized_pnl").and_then(|v: &serde_json::Value| v.as_f64()).unwrap_or(0.0);
+                        let equity = point.get("total_equity").and_then(|v: &serde_json::Value| v.as_f64()).unwrap_or(0.0);
                         
-                        info!("    - {} : Size {} | Val {} | E[Profit] {}", 
-                            opp_id, size, value, profit);
+                        content.push_str(&format!("{},{:.6},{:.6},{:.6},{},{:.2},{:.2},{:.2}\n", ts, util, ret, prob, pos, val, pnl, equity));
                     }
-                } else {
-                    info!("  No open positions.");
+                    
+                    if let Ok(_) = std::fs::write(&filename, content) {
+                        info!("  Saved history to: {}", filename);
+                    } else {
+                        error!("  Failed to write history to: {}", filename);
+                    }
                 }
             }
         }
-    }
-
-    // Report Execution Log
-    let fills = mock_exec_raw.get_fills().await;
-    info!("\nExecution Summary:");
-    info!("  Total Trades: {}", fills.len());
-    
-    // Aggregate volume by exchange
-    let mut volume_by_exchange: HashMap<String, f64> = HashMap::new();
-    for fill in &fills {
-        let exchange = format!("{:?}", fill.instrument.exchange());
-        let val = fill.quantity * fill.price.unwrap_or(0.0);
-        *volume_by_exchange.entry(exchange).or_default() += val;
-    }
-    
-    for (exc, vol) in volume_by_exchange {
-        info!("  {}: ${:.2} volume", exc, vol);
-    }
-
-    // Export PnL History
-    info!("\nExporting PnL History...");
-    std::fs::create_dir_all("backtest_results").unwrap_or_default();
-    
-    for strategy in strategies_clone {
-        let state = strategy.dashboard_state().await;
-        if let Some(history) = state.get("history").and_then(|h| h.as_array()) {
-            if history.is_empty() { continue; }
-            
-            let filename = format!("backtest_results/{}_history.csv", strategy.name().replace(" ", "_"));
-            // Simple CSV write without pulling in csv crate
-            let mut content = "timestamp,expected_utility,expected_return,prob_loss,total_positions,total_value,realized_pnl,total_equity\n".to_string();
-            
-            for point in history {
-                let ts = point.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
-                let util = point.get("expected_utility").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let ret = point.get("expected_return").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let prob = point.get("prob_loss").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let pos = point.get("total_positions").and_then(|v| v.as_u64()).unwrap_or(0);
-                let val = point.get("total_value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let pnl = point.get("realized_pnl").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let equity = point.get("total_equity").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                
-                content.push_str(&format!("{},{:.6},{:.6},{:.6},{},{:.2},{:.2},{:.2}\n", ts, util, ret, prob, pos, val, pnl, equity));
-            }
-            
-            if let Ok(_) = std::fs::write(&filename, content) {
-                info!("  Saved history to: {}", filename);
-            } else {
-                error!("  Failed to write history to: {}", filename);
-            }
+        Err(e) => {
+            error!("Backtest Failed: {}", e);
         }
-    }
-
-    info!("\nBacktest complete!");
-
-    // Keep dashboard alive after backtest
-    if args.dashboard.is_some() {
-        wait_for_shutdown().await;
     }
 }
 
@@ -500,8 +404,8 @@ fn default_backtest_strategies(exec_router: Arc<ExecutionRouter>) -> Vec<Arc<dyn
 async fn run_demo_mode(args: &Args) {
     info!("Starting Demo Mode with mock data...");
 
-    // Create mock execution for all exchanges
-    let mock_exec = backtest::MockExec::new().shared();
+    // Create mock execution (keep a typed reference for reporting)
+    let mock_exec = backtest_connector::MockExec::new().shared();
     let mut exec_clients = HashMap::new();
     exec_clients.insert(Exchange::Deribit, mock_exec.clone());
     exec_clients.insert(Exchange::Derive, mock_exec.clone());
@@ -607,7 +511,7 @@ async fn run_demo_mode(args: &Args) {
     }
 
     // Run with backtest stream
-    let stream = backtest::BacktestStream::new(mock_data);
+    let stream = backtest_connector::BacktestStream::new(mock_data);
     let engine = Engine::new(strategies)
         .with_stream(Exchange::Deribit, Box::new(stream))
         .with_exec_router(exec_router);

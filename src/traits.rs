@@ -1,7 +1,7 @@
 // src/traits.rs
 
 use async_trait::async_trait;
-use crate::models::{Exchange, Instrument, MarketEvent, Order, OrderId};
+use crate::models::{Exchange, Instrument, MarketEvent, Order, OrderId, Position};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -48,7 +48,10 @@ pub trait MarketStream: Send + Sync {
 #[async_trait]
 pub trait ExecutionClient: Send + Sync {
     async fn place_order(&self, order: Order) -> Result<OrderId, String>;
-    // ... cancel, get_positions, etc.
+    async fn cancel_order(&self, order_id: &OrderId, instrument: &Instrument) -> Result<(), String>;
+    async fn get_position(&self, instrument: &Instrument) -> Result<Position, String>;
+    async fn get_positions(&self) -> Result<Vec<Position>, String>;
+    async fn get_balance(&self) -> Result<f64, String>;
 }
 
 /// Wrapper to make any ExecutionClient shareable across strategies.
@@ -104,6 +107,45 @@ impl ExecutionRouter {
     /// Returns the set of exchanges this router can handle.
     pub fn exchanges(&self) -> HashSet<Exchange> {
         self.clients.keys().copied().collect()
+    }
+
+    /// Cancels an order.
+    pub async fn cancel_order(&self, order_id: &OrderId, instrument: &Instrument) -> Result<(), String> {
+        let exchange = instrument.exchange();
+        self.clients
+            .get(&exchange)
+            .ok_or_else(|| format!("No execution client for {:?}", exchange))?
+            .cancel_order(order_id, instrument)
+            .await
+    }
+
+    /// Gets current position for an instrument.
+    pub async fn get_position(&self, instrument: &Instrument) -> Result<Position, String> {
+        let exchange = instrument.exchange();
+        self.clients
+            .get(&exchange)
+            .ok_or_else(|| format!("No execution client for {:?}", exchange))?
+            .get_position(instrument)
+            .await
+    }
+
+    /// Gets account balance for an exchange.
+    pub async fn get_balance(&self, exchange: Exchange) -> Result<f64, String> {
+        self.clients
+            .get(&exchange)
+            .ok_or_else(|| format!("No execution client for {:?}", exchange))?
+            .get_balance()
+            .await
+    }
+
+    /// Gets all positions across all exchanges.
+    pub async fn get_positions(&self) -> Result<Vec<Position>, String> {
+        let mut all_positions = Vec::new();
+        for client in self.clients.values() {
+            let positions = client.get_positions().await?;
+            all_positions.extend(positions);
+        }
+        Ok(all_positions)
     }
 }
 

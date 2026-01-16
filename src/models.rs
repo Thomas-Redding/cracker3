@@ -303,3 +303,16 @@ pub struct DeriveStats {
     #[serde(alias = "oi")]
     pub open_interest: Option<f64>,
 }
+
+// =============================================================================
+// Position Types
+// =============================================================================
+
+/// A current position held on an exchange.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Position {
+    pub instrument: Instrument,
+    pub quantity: f64,
+    pub average_price: Option<f64>,
+    pub unrealized_pnl: Option<f64>,
+}
