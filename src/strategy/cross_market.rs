@@ -1014,8 +1014,8 @@ impl CrossMarketStrategy {
         // Helper to calculate settlement value for Derive options
         let get_derive_value = |inst_id: &str, is_buy_back: bool| -> f64 {
             if let Some(ticker) = state.derive_tickers.get(inst_id) {
-                // Check if expired
-                if now_ms >= ticker.expiry_timestamp {
+                // Check if expired (and has valid expiry)
+                if ticker.expiry_timestamp > 0 && now_ms >= ticker.expiry_timestamp {
                     // Settlement Logic: Intrinsic Value based on Spot
                     let spot = state.vol_surface.spot();
                     if spot <= 0.0 { return 0.0; } // No spot ref
