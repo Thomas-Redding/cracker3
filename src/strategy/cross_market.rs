@@ -146,6 +146,10 @@ struct CrossMarketState {
     history: Vec<HistoryPoint>,
     /// Event counter for throttling logs
     event_counter: usize,
+    /// Simulated cash balance
+    simulated_cash: f64,
+    /// Simulated positions (opportunity_id -> quantity)
+    simulated_positions: HashMap<String, f64>,
 }
 
 /// Point in time for PnL history.
@@ -157,6 +161,8 @@ pub struct HistoryPoint {
     pub prob_loss: f64,
     pub total_positions: usize,
     pub total_value: f64,
+    pub realized_pnl: f64,
+    pub total_equity: f64,
 }
 
 impl Default for CrossMarketState {
@@ -177,6 +183,8 @@ impl Default for CrossMarketState {
             derive_subscriptions: HashSet::new(),
             history: Vec::new(),
             event_counter: 0,
+            simulated_cash: 10_000.0, // Default start
+            simulated_positions: HashMap::new(),
         }
     }
 }
@@ -248,7 +256,7 @@ pub struct CrossMarketStrategy {
     #[allow(dead_code)]
     exec: SharedExecutionRouter,
     scanner: OpportunityScanner,
-    optimizer: KellyOptimizer,
+
     /// Polymarket catalog for market discovery (refreshed by Engine)
     polymarket_catalog: Option<Arc<PolymarketCatalog>>,
     /// Deribit catalog for instrument discovery (refreshed by Engine)
@@ -265,15 +273,17 @@ impl CrossMarketStrategy {
         exec: SharedExecutionRouter,
     ) -> Arc<Self> {
         let scanner = OpportunityScanner::new(config.scanner_config.clone());
-        let optimizer = KellyOptimizer::new(config.kelly_config.clone());
 
         Arc::new(Self {
             name: name.into(),
-            config,
-            state: RwLock::new(CrossMarketState::default()),
+            config: config.clone(), // Clone config to use it
+            state: RwLock::new({
+                let mut s = CrossMarketState::default();
+                s.simulated_cash = config.kelly_config.initial_wealth;
+                s
+            }),
             exec,
             scanner,
-            optimizer,
             polymarket_catalog: None,
             deribit_catalog: None,
             derive_catalog: None,
@@ -294,15 +304,17 @@ impl CrossMarketStrategy {
         derive_catalog: Option<Arc<DeriveCatalog>>,
     ) -> Arc<Self> {
         let scanner = OpportunityScanner::new(config.scanner_config.clone());
-        let optimizer = KellyOptimizer::new(config.kelly_config.clone());
 
         Arc::new(Self {
             name: name.into(),
-            config,
-            state: RwLock::new(CrossMarketState::default()),
+            config: config.clone(),
+            state: RwLock::new({
+                let mut s = CrossMarketState::default();
+                s.simulated_cash = config.kelly_config.initial_wealth;
+                s
+            }),
             exec,
             scanner,
-            optimizer,
             polymarket_catalog,
             deribit_catalog,
             derive_catalog,
@@ -830,6 +842,7 @@ impl CrossMarketStrategy {
 
     /// Scans for opportunities across all markets.
     async fn scan_opportunities(&self, now_ms: i64) {
+        let start = std::time::Instant::now();
         let mut state = self.state.write().await;
 
         // Diagnostic: Log vol surface state
@@ -969,8 +982,10 @@ impl CrossMarketStrategy {
             opportunities.extend(opps);
         }
 
-        // Log scan summary
-        info!("SCAN SUMMARY: PM={} Derive={} | invalid_price={} no_model={} | opportunities={}",
+        // Log scan summary with timing
+        let duration = start.elapsed();
+        info!("SCAN SUMMARY (took {:?}): PM={} Derive={} | invalid_price={} no_model={} | opportunities={}",
+            duration,
             scan_stats.polymarket_scanned,
             scan_stats.derive_scanned,
             scan_stats.invalid_prices,
@@ -993,28 +1008,12 @@ impl CrossMarketStrategy {
     }
 
     /// Optimizes the portfolio using Kelly criterion.
-    /// Optimizes the portfolio using Kelly criterion.
-    async fn optimize_portfolio(&self, now_ms: i64) {
-        let state = self.state.read().await;
 
-        let distribution = match &state.distribution {
-            Some(d) => d,
-            None => return,
-        };
-
-        if state.opportunities.is_empty() {
-            return;
-        }
-
-        let portfolio = self.optimizer.optimize(&state.opportunities, distribution, now_ms);
-        drop(state);
-
-        let mut state = self.state.write().await;
-        state.portfolio = Some(portfolio);
-    }
 
     /// Performs a full recalculation cycle.
+    /// Performs a full recalculation cycle.
     async fn recalculate(&self, now_ms: i64) {
+        let start = std::time::Instant::now();
         // Log current Polymarket prices before recalc
         {
             let state = self.state.read().await;
@@ -1031,43 +1030,185 @@ impl CrossMarketStrategy {
         }
         
         self.update_vol_surface(now_ms).await;
+        
+        info!("Recalc: Scanning opportunities...");
         self.scan_opportunities(now_ms).await;
-        self.optimize_portfolio(now_ms).await;
+        
 
-        let state = self.state.read().await;
-        let n_opps = state.opportunities.len();
-        let (n_positions, total_value, expected_return, expected_utility, prob_loss) = 
-            if let Some(p) = &state.portfolio {
-                (
-                    p.positions.len(),
-                    p.positions.iter().map(|pos| pos.dollar_value).sum(),
-                    p.expected_return,
-                    p.expected_utility,
-                    p.prob_loss
-                )
-            } else {
-                (0, 0.0, 0.0, 0.0, 0.0)
-            };
-        drop(state);
-
-        // Record history AND update last_recalc
-        {
-            let mut state = self.state.write().await;
-            state.last_recalc = now_ms; // CRITICAL: Always update this to prevent infinite loops
-            state.history.push(HistoryPoint {
-                timestamp: now_ms,
-                expected_utility,
-                expected_return,
-                prob_loss,
-                total_positions: n_positions,
-                total_value,
-            });
+        
+        // PnL Tracking & Portfolio Optimization
+        // 1. Calculate current equity and create compounding optimizer
+        let (_current_equity, optimizer, opportunities, distribution) = {
+            let state = self.state.read().await;
+            
+            // Build map of ID -> Opportunity for currently scanned opps
+            let opp_map: HashMap<&String, &Opportunity> = state.opportunities.iter()
+                .map(|o| (&o.id, o))
+                .collect();
+    
+            let mut holdings_value = 0.0;
+            for (opp_id, qty) in &state.simulated_positions {
+                if *qty == 0.0 { continue; }
+                
+                let val = if let Some(opp) = opp_map.get(opp_id) {
+                    // Start with basic Mark-to-Entry (using fresh scanner prices)
+                    // Note: Ideally we mark to Exit (Bid for Longs, Ask for Shorts),
+                    // but scanner only provides Entry prices. This is still much better than 0.0.
+                    match opp.direction {
+                        crate::optimizer::opportunity::TradeDirection::Buy => *qty * opp.market_price,
+                        crate::optimizer::opportunity::TradeDirection::Sell => -*qty * opp.market_price,
+                    }
+                } else {
+                    // Fallback: Try to look up directly from markets if opp is filtered out
+                    let mut fallback_price = 0.0;
+                    
+                    if opp_id.contains("_yes") { 
+                        if let Some(condition_id) = opp_id.strip_suffix("_yes") {
+                            if let Some(market) = state.polymarket_markets.get(condition_id) {
+                                fallback_price = market.yes_price;
+                            }
+                        }
+                    } else if opp_id.contains("_no") {
+                         if let Some(condition_id) = opp_id.strip_suffix("_no") {
+                            if let Some(market) = state.polymarket_markets.get(condition_id) {
+                                fallback_price = market.no_price;
+                            }
+                        }
+                    } else if opp_id.ends_with("_buy") {
+                        if let Some(inst_id) = opp_id.strip_suffix("_buy") {
+                            if let Some(ticker) = state.derive_tickers.get(inst_id) {
+                                // Value at Bid (liquidation)
+                                fallback_price = ticker.best_bid.unwrap_or(0.0);
+                            }
+                        }
+                    } else if opp_id.ends_with("_sell") {
+                        if let Some(inst_id) = opp_id.strip_suffix("_sell") {
+                            if let Some(ticker) = state.derive_tickers.get(inst_id) {
+                                // Value at Ask (cost to close), negative
+                                fallback_price = -ticker.best_ask.unwrap_or(0.0);
+                            }
+                        }
+                    }
+                    
+                    // Default to 0.0 only if all lookups fail
+                    if fallback_price == 0.0 && opp_id.contains("_spread") {
+                        // TODO: Implement spread pricing fallback if needed
+                    }
+                    
+                    // For binary options (long only), price is positive so value = qty * price
+                    // For Derive fallbacks, we already set sign for generic qty multiplication?
+                    // No, fallback_price for _sell was set negative.
+                    // But _yes/_no fallbacks are positive.
+                    // So we can just satisfy: val = qty * fallback_price
+                    *qty * fallback_price
+                };
+                
+                holdings_value += val;
+            }
+            
+            let equity = state.simulated_cash + holdings_value;
+            
+            // Create new optimizer with updated wealth for compounding
+            let mut kelly_config = self.config.kelly_config.clone();
+            kelly_config.initial_wealth = equity; // Compound returns
+            
+            (
+                equity, 
+                KellyOptimizer::new(kelly_config),
+                state.opportunities.clone(),
+                state.distribution.clone()
+            )
+        };
+        
+        info!("Recalc: Scan complete ({} opps). Optimizing...", opportunities.len());
+        
+        // 2. Run optimization (without lock)
+        let portfolio = if let Some(dist) = distribution {
+            optimizer.optimize(&opportunities, &dist, now_ms)
+        } else {
+            return;
+        };
+    
+        // 3. Rebalance Simulated Portfolio
+        let expected_utility = portfolio.expected_utility;
+        let expected_return = portfolio.expected_return;
+        let prob_loss = portfolio.prob_loss;
+        let positions = portfolio.positions.clone();
+        let n_opps = opportunities.len();
+        
+        let mut state = self.state.write().await;
+        
+        // Price map again for rebalancing execution
+        let price_map: HashMap<&String, f64> = opportunities.iter()
+            .map(|o| (&o.id, o.market_price))
+            .collect();
+            
+        // Execute buys/sells for target positions
+        for pos in &positions {
+            let old_qty = state.simulated_positions.get(&pos.opportunity_id).copied().unwrap_or(0.0);
+            let needed = pos.size - old_qty;
+            
+            if needed.abs() > 1e-6 {
+                 let price = price_map.get(&pos.opportunity_id).copied().unwrap_or(0.0);
+                 state.simulated_cash -= needed * price;
+                 state.simulated_positions.insert(pos.opportunity_id.clone(), pos.size);
+            }
         }
-
-        self.add_log(
-            "info",
-            format!("Recalculated: {} opportunities, {} positions", n_opps, n_positions),
-        ).await;
+        
+        // Close positions not in new portfolio
+        let new_pos_ids: HashSet<&String> = positions.iter().map(|p| &p.opportunity_id).collect();
+        // Clone keys to avoid borrow check issues
+        let old_pos_ids: Vec<String> = state.simulated_positions.keys().cloned().collect();
+        
+        for id in old_pos_ids {
+            if !new_pos_ids.contains(&id) {
+                let old_qty = state.simulated_positions.get(&id).copied().unwrap_or(0.0);
+                if old_qty.abs() > 1e-6 {
+                    let price = price_map.get(&id).copied().unwrap_or(0.0);
+                    state.simulated_cash += old_qty * price;
+                    state.simulated_positions.remove(&id);
+                }
+            }
+        }
+    
+        state.portfolio = Some(portfolio);
+    
+        // 4. Calculate Final Stats
+        let mut final_holdings_value = 0.0;
+        let n_positions = state.simulated_positions.len();
+        for (id, qty) in &state.simulated_positions {
+            let price = price_map.get(id).copied().unwrap_or(0.0);
+            final_holdings_value += qty * price;
+        }
+        let final_equity = state.simulated_cash + final_holdings_value;
+        let initial_wealth = self.config.kelly_config.initial_wealth;
+    
+        state.last_recalc = now_ms;
+        state.history.push(HistoryPoint {
+            timestamp: now_ms,
+            expected_utility,
+            expected_return,
+            prob_loss,
+            total_positions: n_positions,
+            total_value: final_holdings_value,
+            realized_pnl: final_equity - initial_wealth,
+            total_equity: final_equity,
+        });
+    
+        let duration = start.elapsed();
+        let msg = format!(
+            "Recalc ({:?}): {} opps, {} pos, Equity=${:.2} (PnL ${:+.2})", 
+            duration, n_opps, n_positions, final_equity, final_equity - initial_wealth
+        );
+        // Use direct log push to avoid locking again
+        state.log.push_back(LogEntry {
+            time: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            level: "info".to_string(),
+            message: msg,
+        });
+        if state.log.len() > MAX_LOG_ENTRIES {
+            state.log.pop_front();
+        }
     }
 
     /// Processes a Deribit market event.
@@ -1290,8 +1431,10 @@ impl Dashboard for CrossMarketStrategy {
                 "prob_loss": h.prob_loss,
                 "total_positions": h.total_positions,
                 "total_value": h.total_value,
-            }))
-            .collect();
+            "realized_pnl": h.realized_pnl,
+            "total_equity": h.total_equity,
+        }))
+        .collect();
 
         // Build IV chart data from the volatility surface
         // Each point includes strike, IV, and expiry label for multi-series display
@@ -1494,6 +1637,13 @@ impl Strategy for CrossMarketStrategy {
                             Some(e) if e > now_ms => e,
                             _ => continue,
                         };
+
+                        // Skip closed markets
+                        if let Some(closed) = market.extra.get("closed").and_then(|v| v.as_bool()) {
+                            if closed {
+                                continue;
+                            }
+                        }
 
                         // Get YES/NO tokens
                         let yes_token = match market.yes_token() {

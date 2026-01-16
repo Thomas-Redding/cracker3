@@ -162,6 +162,14 @@ pub struct CrossMarketConfigFile {
     /// Only used if vol_time_strategy is "weighted"
     #[serde(default = "default_regime_scaler")]
     pub regime_scaler: f64,
+    /// How often to recalculate opportunities (in simulated seconds)
+    /// For backtests: use 300-600 for speed. For live: use 60 for responsiveness.
+    #[serde(default = "default_recalc_interval_secs")]
+    pub recalc_interval_secs: u64,
+}
+
+fn default_recalc_interval_secs() -> u64 {
+    60
 }
 
 /// Configuration for a Polymarket market to track.
@@ -424,7 +432,7 @@ fn build_cross_market(
         kelly_config,
         scanner_config,
         polymarket_pattern: config.polymarket_pattern.clone(),
-        recalc_interval_secs: 60,
+        recalc_interval_secs: config.recalc_interval_secs,
         vol_time_strategy: config.vol_time_strategy.clone(),
         hourly_vols,
         regime_scaler: config.regime_scaler,
