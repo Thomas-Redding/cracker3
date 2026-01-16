@@ -217,8 +217,12 @@ impl<T: Serialize> BatchWriter<T> {
         })
     }
 
-    fn add(&mut self, batch_key: String, item: T) -> Result<()> {
-        self.batches.entry(batch_key).or_default().push(item);
+    fn add(&mut self, batch_key: &str, item: T) -> Result<()> {
+        if let Some(batch) = self.batches.get_mut(batch_key) {
+            batch.push(item);
+        } else {
+            self.batches.insert(batch_key.to_string(), vec![item]);
+        }
         self.num_items += 1;
         if self.num_items >= self.max_items {
             self.flush_largest_batch()?;
@@ -470,6 +474,8 @@ fn run_partition_stage(asset_id_to_condition_id: &HashMap<String, String>) -> Re
         .filter(|p| !p.to_string_lossy().contains("/."))
         .collect();
 
+    let batch_keys: Vec<String> = (0..CONFIG.num_batches).map(|i| i.to_string()).collect();
+
     for (idx, file_path) in input_files.iter().enumerate() {
         println!(
             "{} Partitioning {} / {}",
@@ -505,7 +511,7 @@ fn run_partition_stage(asset_id_to_condition_id: &HashMap<String, String>) -> Re
                 hasher.update(cond_id.as_bytes());
                 let hash = hasher.finalize();
                 let hash_val = u128::from_be_bytes(hash.into());
-                let batch_index = hash_val % (CONFIG.num_batches as u128);
+                let batch_index = (hash_val % (CONFIG.num_batches as u128)) as usize;
 
                 let row = IntermediateRow {
                     transaction_hash: item.transaction_hash.B,
@@ -526,7 +532,7 @@ fn run_partition_stage(asset_id_to_condition_id: &HashMap<String, String>) -> Re
                     condition_id: cond_id.clone(),
                 };
 
-                csv_writer.add(batch_index.to_string(), row)?;
+                csv_writer.add(&batch_keys[batch_index], row)?;
             }
         }
     }
@@ -760,16 +766,16 @@ fn process_group(
                 // Determine condition_id from the taker's outcome (asset_id)
                 // In Python: asset_id_to_condition_id[trade["taker"]["outcome"]]
                 if let Some(cond_id) = asset_map.get(&trade.taker.outcome) {
-                    writer.add(cond_id.clone(), OutputItem::Trade(trade))?;
+                    writer.add(cond_id, OutputItem::Trade(trade))?;
                 } else {
                     // Fallback if mapping missing (shouldn't happen based on prev logic)
-                    writer.add("unknown".to_string(), OutputItem::Trade(trade))?;
+                    writer.add("unknown", OutputItem::Trade(trade))?;
                 }
             }
         }
         Err(e) => {
             writer.add(
-                "error".to_string(),
+                "error",
                 OutputItem::Error(ErrorLog {
                     fills: fills.to_vec(),
                     error: e.to_string(),
