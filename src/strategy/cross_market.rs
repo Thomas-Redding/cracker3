@@ -1040,6 +1040,46 @@ impl CrossMarketStrategy {
         0.0
     }
 
+    /// Calculates the total value of current holdings, correctly accounting for position direction.
+    /// 
+    /// Assets (Long positions) add to value.
+    /// Liabilities (Short positions) subtract from value.
+    fn calculate_holdings_value(&self, state: &CrossMarketState, opportunities: &[Opportunity]) -> f64 {
+        let opp_map: HashMap<&String, &Opportunity> = opportunities.iter()
+            .map(|o| (&o.id, o))
+            .collect();
+
+        let mut holdings_value = 0.0;
+        for (opp_id, qty) in &state.simulated_positions {
+            if *qty == 0.0 { continue; }
+            
+            let val = if let Some(opp) = opp_map.get(opp_id) {
+                // Mark-to-Entry using scanner prices
+                match opp.direction {
+                    crate::optimizer::opportunity::TradeDirection::Buy => *qty * opp.market_price,
+                    crate::optimizer::opportunity::TradeDirection::Sell => -*qty * opp.market_price,
+                }
+            } else {
+                // Fallback pricing
+                let price = self.get_fallback_price(opp_id, state);
+                
+                // Direction inference
+                let is_short_generated_id = opp_id.ends_with("_sell");
+                // Note: We might want a more robust way to track direction if IDs change,
+                // but for now this matches rebalance_portfolio logic.
+                
+                if is_short_generated_id {
+                    -*qty * price
+                } else {
+                    *qty * price
+                }
+            };
+            
+            holdings_value += val;
+        }
+        holdings_value
+    }
+
     /// Optimizes the portfolio using Kelly criterion.
 
 
@@ -1074,41 +1114,7 @@ impl CrossMarketStrategy {
         let (_current_equity, optimizer, opportunities, distribution) = {
             let state = self.state.read().await;
             
-            // Build map of ID -> Opportunity for currently scanned opps
-            let opp_map: HashMap<&String, &Opportunity> = state.opportunities.iter()
-                .map(|o| (&o.id, o))
-                .collect();
-    
-            let mut holdings_value = 0.0;
-            for (opp_id, qty) in &state.simulated_positions {
-                if *qty == 0.0 { continue; }
-                
-                let val = if let Some(opp) = opp_map.get(opp_id) {
-                    // Start with basic Mark-to-Entry (using fresh scanner prices)
-                    // Note: Ideally we mark to Exit (Bid for Longs, Ask for Shorts),
-                    // but scanner only provides Entry prices. This is still much better than 0.0.
-                    match opp.direction {
-                        crate::optimizer::opportunity::TradeDirection::Buy => *qty * opp.market_price,
-                        crate::optimizer::opportunity::TradeDirection::Sell => -*qty * opp.market_price,
-                    }
-                } else {
-                    // Fallback: Try to look up directly from markets if opp is filtered out
-                    let price = self.get_fallback_price(opp_id, &state);
-                    
-                    if price == 0.0 && opp_id.contains("_spread") {
-                        // TODO: Implement spread pricing fallback if needed
-                    }
-                    
-                    // Apply direction for value calculation (Shorts have negative value)
-                    if opp_id.ends_with("_sell") {
-                        -*qty * price
-                    } else {
-                        *qty * price
-                    }
-                };
-                
-                holdings_value += val;
-            }
+            let holdings_value = self.calculate_holdings_value(&state, &state.opportunities);
             
             let equity = state.simulated_cash + holdings_value;
             
@@ -1150,16 +1156,8 @@ impl CrossMarketStrategy {
 
             // 4. Calculate Final Stats (inside lock)
             // Re-build price map for valuation
-            let price_map: HashMap<&String, f64> = opportunities.iter()
-                .map(|o| (&o.id, o.market_price))
-                .collect();
-
-            let mut final_holdings_value = 0.0;
             let n_positions = state.simulated_positions.len();
-            for (id, qty) in &state.simulated_positions {
-                let price = price_map.get(id).copied().unwrap_or(0.0);
-                final_holdings_value += qty * price;
-            }
+            let final_holdings_value = self.calculate_holdings_value(&state, &opportunities);
             let final_equity = state.simulated_cash + final_holdings_value;
             let initial_wealth = self.config.kelly_config.initial_wealth;
         
@@ -2634,6 +2632,98 @@ mod regression_tests {
             assert!((state.simulated_cash - 10_050.0).abs() < 1e-6, 
                 "Cash did not increase correctly on close. Expected 10050 (+50), got {} (+{}). The position was closed at price 0.0 instead of 0.50!", 
                 state.simulated_cash, cash_diff);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_calculate_holdings_value_logic() {
+        use crate::optimizer::opportunity::{Opportunity, OpportunityType, TradeDirection};
+        
+        let exec = Arc::new(ExecutionRouter::empty());
+        let strategy = CrossMarketStrategy::with_defaults("test", exec);
+        
+        // 1. Create Opportunities
+        let long_opp = Opportunity {
+            id: "long_opp".to_string(),
+            opportunity_type: OpportunityType::VanillaCall,
+            exchange: "derive".to_string(),
+            instrument_id: "BTC-LONG-C".to_string(),
+            description: "Long Call".to_string(),
+            strike: 100_000.0,
+            strike2: None,
+            expiry_timestamp: 1234567890000,
+            time_to_expiry: 0.1,
+            direction: TradeDirection::Buy, 
+            market_price: 50.0, // Value = +50 per unit
+            fair_value: 60.0,
+            edge: 0.2,
+            max_profit: 1000.0,
+            max_loss: 50.0,
+            liquidity: 10.0,
+            implied_probability: None,
+            model_probability: None,
+            model_iv: None,
+            token_id: None,
+            minimum_order_size: None,
+            minimum_tick_size: None,
+        };
+        
+        let short_opp = Opportunity {
+            id: "short_opp_sell".to_string(), // Suffix helps fallback inference too
+            opportunity_type: OpportunityType::VanillaCall,
+            exchange: "derive".to_string(),
+            instrument_id: "BTC-SHORT-C".to_string(),
+            description: "Short Call".to_string(),
+            strike: 110_000.0,
+            strike2: None,
+            expiry_timestamp: 1234567890000,
+            time_to_expiry: 0.1,
+            direction: TradeDirection::Sell, 
+            market_price: 20.0, // Liability = -20 per unit
+            fair_value: 10.0,
+            edge: 0.2,
+            max_profit: 20.0,
+            max_loss: 1000.0,
+            liquidity: 10.0,
+            implied_probability: None,
+            model_probability: None,
+            model_iv: None,
+            token_id: None,
+            minimum_order_size: None,
+            minimum_tick_size: None,
+        };
+        
+        let opportunities = vec![long_opp.clone(), short_opp.clone()];
+        
+        // 2. Setup Position State
+        {
+            let mut state = strategy.state.write().await;
+            state.simulated_positions.insert("long_opp".to_string(), 10.0);
+            state.simulated_positions.insert("short_opp_sell".to_string(), 5.0);
+        }
+        
+        // 3. Test Calculation (Active Scan)
+        {
+            let state = strategy.state.read().await;
+            let value = strategy.calculate_holdings_value(&state, &opportunities);
+            
+            // Expected: (10.0 * 50.0) + (5.0 * -20.0) = 500.0 - 100.0 = 400.0
+            assert!((value - 400.0).abs() < 1e-6, "Holdings value incorrect with opportunities present. Expected 400.0, got {}", value);
+        }
+        
+        // 4. Test Calculation (Fallback - No Opportunities in scan)
+        {
+            let state = strategy.state.read().await;
+            let empty_opps: Vec<Opportunity> = Vec::new();
+            
+            // Note: fallback lookup relies on internal market maps (polymarket/derive). 
+            // Since we didn't populate them, it might be 0.0 unless we mock or rely on ID inference with 0 price?
+            // Actually, if we want to test fallback logic specifically we need to populate the market maps OR the fallback mechanism.
+            // But here we are mostly testing the *direction helper* aspect.
+            // Since fallback price defaults to 0.0 if not found, we expect 0.0 value.
+            
+            let value = strategy.calculate_holdings_value(&state, &empty_opps);
+            assert_eq!(value, 0.0);
         }
     }
 }
