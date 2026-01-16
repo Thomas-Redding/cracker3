@@ -308,6 +308,8 @@ async fn run_backtest_mode(args: &Args) {
         data_paths: args.file.clone(),
         start_time: None,
         end_time: None,
+        realtime: args.realtime,
+        speed: args.speed,
     };
 
     // Initialize Catalogs (Async setup required outside the closure)
@@ -317,6 +319,7 @@ async fn run_backtest_mode(args: &Args) {
     catalogs.derive = Some(DeriveCatalog::new(vec!["BTC".to_string()], None, None).await);
     
     let config_path = args.config.clone();
+    let dashboard_port = args.dashboard; // Capture dashboard port before move
 
     // Run Backtest
     let result = backtest::BacktestRunner::run(config, move |exec_router| {
@@ -334,6 +337,23 @@ async fn run_backtest_mode(args: &Args) {
         }
     }).await;
     
+    // Start Dashboard if requested (in separate task, as BacktestRunner is async blocking loop effectively)
+    if let Some(port) = dashboard_port {
+        // We need strategies for dashboard, but strategies are created INSIDE runner via factory.
+        // The runner returns strategies at the END. 
+        // If we want dashboard DURING backtest, we need a way to access them.
+        // `BacktestRunner` doesn't expose them during run.
+        // However, `simulated_execution` and `strategies` state would be updated.
+        // If we want live updates, we'd need to spawn the runner in a task and pass strategies shared handle?
+        // OR the runner should spawn the dashboard if configured?
+        
+        // For now, simpler fix: Just running dashboard AFTER backtest (as before?)
+        // The previous comment says "keep the dashboard alive after backtest completion".
+        // So we just need to start it AFTER (using returned strategies) and wait.
+        // OR if we want it during, we have a problem structure. 
+        // Let's assume Post-Backtest Dashboard for analysis.
+    }
+
     match result {
         Ok((res, strategies)) => {
             info!("=== Backtest Completed ===");
@@ -341,42 +361,48 @@ async fn run_backtest_mode(args: &Args) {
             info!("Total PnL:    ${:.2}", res.total_pnl);
             info!("Trades:       {}", res.trade_count);
             
+            // Start Dashboard if requested to view final state
+            if let Some(port) = dashboard_port {
+                info!("Starting dashboard on port {} to view results...", port);
+                start_dashboard(strategies.clone(), port);
+            }
+            
             // Export PnL History
             info!("\nExporting PnL History...");
             std::fs::create_dir_all("backtest_results").unwrap_or_default();
             
-            for strategy in strategies {
-                let state = strategy.dashboard_state().await;
-                if let Some(history) = state.get("history").and_then(|h| h.as_array()) {
-                    if history.is_empty() { continue; }
-                    
-                    let filename = format!("backtest_results/{}_history.csv", strategy.name().replace(" ", "_"));
-                    let mut content = "timestamp,expected_utility,expected_return,prob_loss,total_positions,total_value,realized_pnl,total_equity\n".to_string();
-                    
-                    for point in history {
-                        let ts = point.get("timestamp").and_then(|v: &serde_json::Value| v.as_i64()).unwrap_or(0);
-                        let util = point.get("expected_utility").and_then(|v: &serde_json::Value| v.as_f64()).unwrap_or(0.0);
-                        let ret = point.get("expected_return").and_then(|v: &serde_json::Value| v.as_f64()).unwrap_or(0.0);
-                        let prob = point.get("prob_loss").and_then(|v: &serde_json::Value| v.as_f64()).unwrap_or(0.0);
-                        let pos = point.get("total_positions").and_then(|v: &serde_json::Value| v.as_u64()).unwrap_or(0);
-                        let val = point.get("total_value").and_then(|v: &serde_json::Value| v.as_f64()).unwrap_or(0.0);
-                        let pnl = point.get("realized_pnl").and_then(|v: &serde_json::Value| v.as_f64()).unwrap_or(0.0);
-                        let equity = point.get("total_equity").and_then(|v: &serde_json::Value| v.as_f64()).unwrap_or(0.0);
-                        
-                        content.push_str(&format!("{},{:.6},{:.6},{:.6},{},{:.2},{:.2},{:.2}\n", ts, util, ret, prob, pos, val, pnl, equity));
-                    }
-                    
-                    if let Ok(_) = std::fs::write(&filename, content) {
-                        info!("  Saved history to: {}", filename);
-                    } else {
-                        error!("  Failed to write history to: {}", filename);
-                    }
+            // We now have history directly in result for the overall portfolio
+            if !res.history.is_empty() {
+                let filename = "backtest_results/portfolio_history.csv";
+                let mut content = "timestamp,total_equity,unrealized_pnl,realized_pnl,positions_count\n".to_string();
+                
+                for point in &res.history {
+                     content.push_str(&format!("{},{:.2},{:.2},{:.2},{}\n", 
+                        point.timestamp, 
+                        point.total_equity, 
+                        point.unrealized_pnl, 
+                        point.realized_pnl, 
+                        point.positions_count
+                     ));
                 }
+                
+                if let Ok(_) = std::fs::write(filename, content) {
+                    info!("  Saved portfolio history to: {}", filename);
+                } else {
+                    error!("  Failed to write history to: {}", filename);
+                }
+            } else {
+                warn!("No history data collected.");
             }
         }
         Err(e) => {
             error!("Backtest Failed: {}", e);
         }
+    }
+
+    // Keep alive if dashboard is running
+    if args.dashboard.is_some() {
+        wait_for_shutdown().await;
     }
 }
 
