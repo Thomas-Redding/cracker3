@@ -5,7 +5,7 @@
 // Sizes positions to maximize expected utility across Monte Carlo scenarios.
 
 use super::opportunity::Opportunity;
-use super::sobol::SobolGenerator;
+use super::halton::HaltonGenerator;
 use crate::pricing::black_scholes::norm_cdf;
 use crate::pricing::distribution::PriceDistribution;
 use argmin::core::{CostFunction, Error, Executor, Gradient};
@@ -781,7 +781,7 @@ impl KellyOptimizer {
         total_utility / n_scenarios
     }
 
-    /// Generates Monte Carlo scenarios using Sobol sequences.
+    /// Generates Monte Carlo scenarios using Halton sequences.
     /// 
     /// Generates correlated price paths for all opportunity expiries, including
     /// Polymarket expiries that may not have exact matches in the Deribit-based
@@ -819,9 +819,9 @@ impl KellyOptimizer {
             })
             .collect();
 
-        // Generate Sobol normal samples
-        let mut sobol = SobolGenerator::new(n_expiries.min(21));
-        let z_samples = sobol.generate_normal(self.config.n_scenarios);
+        // Generate Halton normal samples
+        let mut halton = HaltonGenerator::new(n_expiries.min(21));
+        let z_samples = halton.generate_normal(self.config.n_scenarios);
 
         let mut scenarios = Vec::with_capacity(self.config.n_scenarios);
 

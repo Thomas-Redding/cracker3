@@ -279,8 +279,9 @@ Unit tests cover:
 * **Strategy-Centric:** Strategies declare exchanges they need; engine auto-connects.
 * **Multi-Exchange:** Run strategies across Deribit, Derive, and Polymarket simultaneously.
 * **Typed Instruments:** `Instrument::Deribit("BTC-29MAR24-60000-C")` prevents exchange mix-ups.
-* **Execution Router:** Place orders on any exchange via `ExecutionRouter::place_order()`.
-* **Polymarket SDK:** Native order placement via [rs-clob-client](https://github.com/Polymarket/rs-clob-client).
+* **Execution Router:** 
+    * **Polymarket:** Live order placement (Limit/Market) via `rs-clob-client` SDK.
+    * **Deribit/Derive:** Simulated execution (logs orders, returns mock IDs) - actual trading logic pending.
 * **Historical Catalogs:** Time-travel support with `as_of(timestamp)` for backtests.
 * **TOML Config:** Define strategies in config files, not code.
 * **Dynamic Subscriptions:** Engine-coordinated catalog refresh + `discover_subscriptions()` for live market discovery.
@@ -512,17 +513,23 @@ src/
 │   ├── mod.rs           # Module exports
 │   ├── opportunity.rs   # Opportunity, OpportunityScanner
 │   ├── kelly.rs         # KellyOptimizer, CRRA utility
-│   └── sobol.rs         # Halton sequence for quasi-random MC
+│   └── halton.rs        # Halton sequence for quasi-random MC
 ├── strategy/
 │   ├── mod.rs           # Strategy exports
 │   ├── cross_market.rs  # CrossMarketStrategy (main strategy!)
 │   ├── gamma_scalp.rs   # Delta-based hedging strategy
 │   └── momentum.rs      # Price momentum strategy
-└── connectors/
-    ├── deribit.rs       # Deribit WebSocket + IV normalization
-    ├── derive.rs        # Derive (Lyra) WebSocket + REST
-    ├── polymarket.rs    # Polymarket CLOB WebSocket + order book
-    └── backtest.rs      # BacktestStream, HistoricalStream, RecordingStream
+├── connectors/
+│   ├── deribit.rs       # Deribit WebSocket + IV normalization
+│   ├── derive.rs        # Derive (Lyra) WebSocket + REST
+│   ├── polymarket.rs    # Polymarket CLOB WebSocket + order book
+│   └── backtest.rs      # BacktestStream, HistoricalStream, RecordingStream
+├── backtest/
+│   ├── mod.rs           # Backtest runner module
+│   └── runner.rs        # BacktestRunner implementation
+└── simulation/
+    ├── mod.rs           # Simulation module
+    └── execution.rs     # Simulated execution logic
 ```
 
 ## 📊 Web Dashboard
