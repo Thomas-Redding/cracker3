@@ -1212,9 +1212,9 @@ impl CrossMarketStrategy {
         };
     
         // 3. Rebalance Portfolio
-        let expected_utility = portfolio.expected_utility;
-        let expected_return = portfolio.expected_return;
-        let prob_loss = portfolio.prob_loss;
+        let _expected_utility = portfolio.expected_utility;
+        let _expected_return = portfolio.expected_return;
+        let _prob_loss = portfolio.prob_loss;
         let n_opps = opportunities.len();
         
         // Rebalance
@@ -2044,6 +2044,15 @@ impl Strategy for CrossMarketStrategy {
 
     async fn initialize(&self) {
         self.initialize_subscriptions(self.config.max_expiry_days).await;
+    }
+
+    async fn get_portfolio_metrics(&self) -> Option<crate::traits::PortfolioMetrics> {
+        let state = self.state.read().await;
+        state.portfolio.as_ref().map(|p| crate::traits::PortfolioMetrics {
+            expected_utility: p.expected_utility,
+            expected_return: p.expected_return,
+            prob_loss: p.prob_loss,
+        })
     }
 }
 

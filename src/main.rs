@@ -375,15 +375,18 @@ async fn run_backtest_mode(args: &Args) {
             // We now have history directly in result for the overall portfolio
             if !res.history.is_empty() {
                 let filename = "backtest_results/portfolio_history.csv";
-                let mut content = "timestamp,total_equity,unrealized_pnl,realized_pnl,positions_count\n".to_string();
+                let mut content = "timestamp,total_equity,unrealized_pnl,realized_pnl,positions_count,expected_utility,expected_return,prob_loss\n".to_string();
                 
                 for point in &res.history {
-                     content.push_str(&format!("{},{:.2},{:.2},{:.2},{}\n", 
+                     content.push_str(&format!("{},{:.2},{:.2},{:.2},{},{},{},{}\n", 
                         point.timestamp, 
                         point.total_equity, 
                         point.unrealized_pnl, 
                         point.realized_pnl, 
-                        point.positions_count
+                        point.positions_count,
+                        point.expected_utility.map(|v| format!("{:.6}", v)).unwrap_or_default(),
+                        point.expected_return.map(|v| format!("{:.6}", v)).unwrap_or_default(),
+                        point.prob_loss.map(|v| format!("{:.6}", v)).unwrap_or_default()
                      ));
                 }
                 

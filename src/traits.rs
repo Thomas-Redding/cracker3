@@ -156,6 +156,14 @@ pub type SharedExecutionRouter = Arc<ExecutionRouter>;
 // Strategy Trait
 // =============================================================================
 
+/// Portfolio metrics that strategies can optionally expose for tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortfolioMetrics {
+    pub expected_utility: f64,
+    pub expected_return: f64,
+    pub prob_loss: f64,
+}
+
 /// The core Strategy trait for the multi-strategy engine.
 /// 
 /// Strategies declare which exchanges they need (statically) and which instruments
@@ -189,6 +197,12 @@ pub trait Strategy: Dashboard + Send + Sync {
     /// Called by the engine/runner before trading starts.
     /// Useful for initial catalog discovery or pre-computation.
     async fn initialize(&self) {}
+
+    /// Optional: Get current portfolio metrics for tracking/visualization.
+    /// Returns None if the strategy doesn't calculate these metrics.
+    async fn get_portfolio_metrics(&self) -> Option<PortfolioMetrics> {
+        None
+    }
 }
 
 // =============================================================================

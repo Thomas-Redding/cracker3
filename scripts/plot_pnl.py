@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as pd_plt
 import matplotlib.pyplot as plt
 import argparse
@@ -27,6 +28,58 @@ def plot_pnl(csv_file):
     # Create a figure with 3 subplots
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
     
+    # --- Calculate Metrics (on Total Equity if available) ---
+    metrics_text = ""
+    if 'total_equity' in df.columns:
+        equity = df['total_equity']
+        if len(equity) > 1:
+            initial_equity = equity.iloc[0]
+            final_equity = equity.iloc[-1]
+            
+            # Total Return
+            if initial_equity > 0:
+                total_return = (final_equity / initial_equity) - 1
+            else:
+                total_return = 0.0
+
+            # Time duration
+            start_time = df['datetime'].iloc[0]
+            end_time = df['datetime'].iloc[-1]
+            duration_days = (end_time - start_time).total_seconds() / (24 * 3600)
+            years = duration_days / 365.25
+
+            # Annualized Return (CAGR)
+            if years > 0 and initial_equity > 0:
+                ann_return = (final_equity / initial_equity) ** (1 / years) - 1
+            else:
+                ann_return = 0.0
+
+            # Volatility (Annualized from log returns)
+            log_returns = np.log(equity / equity.shift(1)).dropna()
+            std_log_return = log_returns.std()
+            
+            # Estimate periods per year based on avg interval
+            avg_interval_sec = df['datetime'].diff().dt.total_seconds().mean()
+            if avg_interval_sec > 0:
+                periods_per_year = (365.25 * 24 * 3600) / avg_interval_sec
+                ann_volatility = std_log_return * np.sqrt(periods_per_year)
+            else:
+                ann_volatility = 0.0
+            
+            # Sharpe Ratio (assuming Rf=0)
+            if ann_volatility > 0:
+                sharpe_ratio = ann_return / ann_volatility
+            else:
+                sharpe_ratio = 0.0
+                
+            metrics_text = (
+                f"Total Return: {total_return:.2%}\n"
+                f"Ann. Return: {ann_return:.2%}\n"
+                f"Ann. Volatility: {ann_volatility:.2%}\n"
+                f"Sharpe Ratio: {sharpe_ratio:.2f}"
+            )
+
+    
     # --- Plot 1: Total Equity ---
     # Primary Axis: Total Equity ($)
     if 'total_equity' in df.columns:
@@ -52,7 +105,14 @@ def plot_pnl(csv_file):
         lines = l1
 
     labels = [l.get_label() for l in lines]
-    ax1.legend(lines, labels, loc='upper left')
+    ax1.legend(lines, labels, loc='upper right')
+    
+    # Display Metrics on Plot 1
+    if metrics_text:
+        ax1.text(0.02, 0.95, metrics_text, transform=ax1.transAxes, 
+                 fontsize=10, verticalalignment='top', 
+                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
     ax1.set_title(f'Backtest Analysis - {os.path.basename(csv_file)}')
 
     # --- Plot 2: Risk / Return Stats ---
@@ -82,16 +142,16 @@ def plot_pnl(csv_file):
         ax2.legend(lines_2, labels_2, loc='upper left')
 
     # --- Plot 3: Positions & Exposure ---
-    # Primary Axis: Position Count
+    # Primary Axis: Cumulative Instruments Traded
     if 'positions_count' in df.columns:
-        l5 = ax3.plot(df['datetime'], df['positions_count'], label='Positions Count', color='purple')
+        l5 = ax3.plot(df['datetime'], df['positions_count'], label='Cumulative Instruments Traded', color='purple')
     elif 'total_positions' in df.columns: # fallback for old schema
-        l5 = ax3.plot(df['datetime'], df['total_positions'], label='Positions Count', color='purple')
+        l5 = ax3.plot(df['datetime'], df['total_positions'], label='Cumulative Instruments Traded', color='purple')
     else:
         l5 = []
         
     if l5:
-        ax3.set_ylabel('Position Count', color='purple')
+        ax3.set_ylabel('Cumulative Instruments Traded', color='purple')
         ax3.tick_params(axis='y', labelcolor='purple')
     
     # Secondary Axis: Total Value ($)

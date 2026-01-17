@@ -1,4 +1,4 @@
-use crate::models::{MarketEvent, Position, Instrument, Exchange};
+use crate::models::Exchange;
 use crate::simulation::execution::SimulatedExecutionClient;
 use crate::traits::{ExecutionClient, MarketStream, Strategy};
 use crate::connectors::backtest::HistoricalStream;
@@ -81,8 +81,8 @@ impl BacktestRunner {
             .map_err(|e| format!("Failed to create historical stream: {}", e))?;
             
         // 4. Run Event Loop
-        let mut trade_count = 0;
-        let mut max_drawdown = 0.0;
+        let trade_count = 0;
+        let max_drawdown = 0.0;
         let mut history: Vec<HistoryPoint> = Vec::new();
         let mut last_history_ts = 0;
         let history_interval_ms = 60_000; // 1 minute snapshots
@@ -143,6 +143,33 @@ impl BacktestRunner {
                          let balance = sim_client.get_balance().await.unwrap_or(0.0);
                          let positions = sim_client.get_positions().await.unwrap_or_default();
                          
+                         // Collect portfolio metrics from strategies
+                         let mut expected_utility = None;
+                         let mut expected_return = None;
+                         let mut prob_loss = None;
+                         
+                         // Aggregate metrics from all strategies
+                         // For now, use simple averaging if multiple strategies have metrics
+                         let mut metrics_count = 0;
+                         let mut util_sum = 0.0;
+                         let mut ret_sum = 0.0;
+                         let mut loss_sum = 0.0;
+                         
+                         for strategy in &strategies {
+                             if let Some(metrics) = strategy.get_portfolio_metrics().await {
+                                 util_sum += metrics.expected_utility;
+                                 ret_sum += metrics.expected_return;
+                                 loss_sum += metrics.prob_loss;
+                                 metrics_count += 1;
+                             }
+                         }
+                         
+                         if metrics_count > 0 {
+                             expected_utility = Some(util_sum / metrics_count as f64);
+                             expected_return = Some(ret_sum / metrics_count as f64);
+                             prob_loss = Some(loss_sum / metrics_count as f64);
+                         }
+                         
                          // Calculate max drawdown
                          // (Simplified: we need peak tracking to do this properly, omitted for brevity but should be added)
                          
@@ -152,9 +179,9 @@ impl BacktestRunner {
                             unrealized_pnl: equity - balance, // heuristic
                             realized_pnl: balance - config.initial_cash,
                             positions_count: positions.len(),
-                            expected_utility: None, // Strategy specific, hard to aggregate generic
-                            expected_return: None,
-                            prob_loss: None,
+                            expected_utility,
+                            expected_return,
+                            prob_loss,
                          });
                          last_history_ts = event.timestamp;
                     }
