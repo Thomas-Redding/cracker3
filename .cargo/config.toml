@@ -1,0 +1,5 @@
+[target.aarch64-unknown-linux-gnu]
+# Reduce peak memory during linking on Raspberry Pi (GNU ld).
+rustflags = ["-C", "link-arg=-Wl,--no-keep-memory"]
+
+

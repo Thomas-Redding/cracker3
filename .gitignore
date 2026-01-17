@@ -1,0 +1,28 @@
+# System
+.DS_Store
+**/.DS_Store
+
+# Rust
+target/
+**/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+# Keeping .cursorignore tracked as it is project-specific
+
+# Project Data & Logs
+build.log
+*.log
+cache/
+recordings/
+backtest_results/
+test_output/
+
+# Misc
+parse_goldsky/orig.py
