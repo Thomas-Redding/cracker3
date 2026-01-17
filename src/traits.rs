@@ -184,6 +184,11 @@ pub trait Strategy: Dashboard + Send + Sync {
     /// Called by the engine when a market event arrives for an instrument
     /// this strategy is subscribed to.
     async fn on_event(&self, event: MarketEvent);
+
+    /// Optional initialization step.
+    /// Called by the engine/runner before trading starts.
+    /// Useful for initial catalog discovery or pre-computation.
+    async fn initialize(&self) {}
 }
 
 // =============================================================================

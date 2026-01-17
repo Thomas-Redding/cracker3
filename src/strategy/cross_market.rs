@@ -1290,11 +1290,6 @@ impl CrossMarketStrategy {
 
     /// Processes a Derive market event.
     async fn handle_derive_event(&self, event: &MarketEvent, instrument_name: &str) {
-        // Ignore updates with no price data (prevents overwriting valid state with None)
-        if event.best_bid.is_none() && event.best_ask.is_none() {
-            return;
-        }
-
         // Parse instrument
         let parts: Vec<&str> = instrument_name.split('-').collect();
         if parts.len() < 4 {
@@ -1321,6 +1316,21 @@ impl CrossMarketStrategy {
             0
         };
 
+        let mut state = self.state.write().await;
+        
+        // If we already have this ticker and the new event has NO price data,
+        // we should PRESERVE the old price data to avoid zeroing out liquidity during data gaps.
+        // If it's a new ticker, we insert it anyway to register it.
+        let preserve_prices = if let Some(old) = state.derive_tickers.get(instrument_name) {
+             event.best_bid.is_none() && event.best_ask.is_none() && (old.best_bid.is_some() || old.best_ask.is_some())
+        } else {
+             false
+        };
+
+        if preserve_prices {
+            return;
+        }
+
         let ticker = DeriveTicker {
             instrument_name: instrument_name.to_string(),
             timestamp: event.timestamp,
@@ -1336,7 +1346,6 @@ impl CrossMarketStrategy {
             best_ask_amount: None,
         };
 
-        let mut state = self.state.write().await;
         state.derive_tickers.insert(instrument_name.to_string(), ticker);
     }
 
@@ -2031,6 +2040,10 @@ impl Strategy for CrossMarketStrategy {
         if should_recalc {
             self.recalculate(now_ms).await;
         }
+    }
+
+    async fn initialize(&self) {
+        self.initialize_subscriptions(self.config.max_expiry_days).await;
     }
 }
 

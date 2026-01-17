@@ -324,7 +324,7 @@ async fn run_backtest_mode(args: &Args) {
     // Run Backtest
     let result = backtest::BacktestRunner::run(config, move |exec_router| {
         // Strategy Factory Closure
-        if let Some(path) = &config_path {
+        let strategies = if let Some(path) = &config_path {
              match Config::from_file(path) {
                 Ok(c) => c.build_strategies_with_catalogs(exec_router, Some(&catalogs)),
                 Err(e) => {
@@ -334,7 +334,8 @@ async fn run_backtest_mode(args: &Args) {
              }
         } else {
              default_backtest_strategies(exec_router)
-        }
+        };
+        strategies
     }).await;
     
     // Start Dashboard if requested (in separate task, as BacktestRunner is async blocking loop effectively)
