@@ -21,6 +21,14 @@ SCAN SUMMARY: PM=55 Derive=512 | opportunities=36
   OPPORTUNITY: polymarket | edge=53.0% | fair=0.078 vs market=0.051 | BTC above $94k Jan 2 - YES
 ```
 
+
+## 🔑 Key Concepts
+
+There is an important distinction between **Backtest** and **Simulation** in this engine:
+
+*   **Backtest (Data Driver)**: This is the **Time Machine**. It reads historical data files (`.jsonl`) and feeds them into the engine, controlling the clock. It determines *when* things happen.
+*   **Simulation (Execution Environment)**: This is the **Virtual Exchange**. It receives orders from the strategy and decides if they get filled based on the current market price. It determines *what* happens to your orders.
+
 ## Building & Running
 
 ```bash
@@ -289,7 +297,7 @@ Unit tests cover:
 
 ## 🏗 Architecture
 
-The system uses a unified **Engine** to manage multiple strategies across multiple exchanges:
+The system uses a unified **Engine** to manage multiple strategies across multiple exchanges. It cleanly separates the **Data Driver** (Live WebSocket or Historical Backtest) from the **Execution Venue** (Live Exchange API or Simulated Matching Engine):
 
 ```mermaid
 graph TD
