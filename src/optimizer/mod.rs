@@ -5,9 +5,9 @@
 
 pub mod kelly;
 pub mod opportunity;
-pub mod sobol;
+pub mod halton;
 
 pub use kelly::{KellyOptimizer, KellyConfig, OptimizedPortfolio, UtilityFunction};
 pub use opportunity::{Opportunity, OpportunityScanner, OpportunityType, ScannerConfig, TradeDirection};
-pub use sobol::SobolGenerator;
+pub use halton::HaltonGenerator;
 
